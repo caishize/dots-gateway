@@ -213,23 +213,48 @@ cmd_sync_ip() {
   cmd_status
 }
 
-usage() {
-  cat <<'EOF'
-Usage: ./gateway.sh <command> [options]
+PROG_NAME="$(basename "$0")"
 
-Commands:
-  start            Start dots-gateway.service and verify /v1/health
-  stop             Stop dots-gateway.service
-  restart          Restart dots-gateway.service and verify /v1/health
-  status           Display service, port, public IP, TLS cert & workspace jail status
-  logs [-f | N]    Show recent logs (default 50 lines) or follow live with -f
-  config           Print Remote MCP endpoint URL & Bearer Token configuration
-  sync-ip [IP]     Auto-detect public IP, issue/renew Let's Encrypt IP cert & restart
+usage() {
+  cat <<EOF
+Dots Gateway 运维管理命令行 (${PROG_NAME})
+
+用法:
+  ${PROG_NAME} <command> [options]
+
+核心命令:
+  start              启动后台服务 (dots-gateway.service) 并执行 /v1/health 健康检查
+  stop               停止后台服务
+  restart            重启后台服务并验证健康状态 (别名: reload)
+  status             查看运行状态、PID/内存、公网 IP、Let's Encrypt 证书及工作区隔离状态 (无参数时默认执行)
+  logs [-f | N]      查看服务日志 (默认最近 50 行；加 -f 实时追踪；传数字 N 查看最近 N 行)
+  config             打印供 dots 直接配置的远程 MCP URL 与 Bearer Token (别名: mcp-config)
+  sync-ip [IP]       自动探测当前公网 IP，签发/续期 Let's Encrypt 官方公信 IP 证书并重启 (别名: renew-cert)
+  help               显示本帮助信息 (同 -h / --help)
+
+常用示例:
+  ${PROG_NAME} status          # 查看当前网关与证书状态
+  ${PROG_NAME} restart         # 重启网关服务
+  ${PROG_NAME} logs -f         # 实时滚动查看请求与执行日志
+  ${PROG_NAME} config          # 查看远程 MCP 接入地址与密钥
+  ${PROG_NAME} sync-ip         # 云主机重启公网 IP 变动后一键重签证书并切换
+
+底层守护进程参数说明可执行:
+  python3 ${GATEWAY_DIR}/main.py --help
 EOF
 }
 
 ACTION="${1:-status}"
 shift || true
+
+if [[ "${ACTION}" != "-h" && "${ACTION}" != "--help" && "${ACTION}" != "help" ]]; then
+  for arg in "$@"; do
+    if [[ "${arg}" == "-h" || "${arg}" == "--help" ]]; then
+      usage
+      exit 0
+    fi
+  done
+fi
 
 case "${ACTION}" in
   start)
