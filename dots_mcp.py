@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -293,6 +294,8 @@ class StdioMCPBridge:
 
     async def run(self) -> int:
         loop = asyncio.get_running_loop()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="mcp-rpc")
+        loop.set_default_executor(executor)
         line_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
 
         def _stdin_reader() -> None:

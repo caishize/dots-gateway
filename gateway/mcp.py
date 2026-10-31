@@ -852,7 +852,7 @@ class MCPHandler:
             if ev is None:
                 await emit_event(None)
                 continue
-            if progress_token is not None and ev.type in ("stdout", "stderr", "agy_event", "started"):
+            if progress_token is not None and ev.type in ("queued", "stdout", "stderr", "agy_event", "started"):
                 step += 1
                 snippet = (
                     ev.data if isinstance(ev.data, str) else json.dumps(ev.data, ensure_ascii=False)
@@ -897,6 +897,9 @@ class MCPHandler:
                     "version": __version__,
                     "uptime_seconds": round(time.time() - self._started_at, 2),
                     "active_sessions": self.sessions.active_count(),
+                    "active_agy_sessions": self.sessions.active_agy_count(),
+                    "queued_agy_sessions": self.sessions.queued_agy_count(),
+                    "max_concurrent_agy": self.config.max_concurrent_agy,
                     "default_workdir": self.config.default_workdir,
                     "allowed_workdirs": self.config.allowed_workdirs,
                     "enforce_allowlist": self.config.enforce_allowlist,
@@ -1027,7 +1030,7 @@ class MCPHandler:
                 wait_seconds = min(max(0.0, float(args.get("wait_seconds") or 0.0)), 60.0)
                 wait_for_exit = bool(args.get("wait_for_exit", False))
 
-                if wait_seconds > 0 and session.status in ("starting", "running"):
+                if wait_seconds > 0 and session.status in ("queued", "starting", "running"):
                     deadline = time.monotonic() + wait_seconds
                     async for ev in session.subscribe_with_heartbeat(
                         after_seq=after_seq,
@@ -1159,6 +1162,9 @@ class MCPHandler:
                     "version": __version__,
                     "uptime_seconds": round(time.time() - self._started_at, 2),
                     "active_sessions": self.sessions.active_count(),
+                    "active_agy_sessions": self.sessions.active_agy_count(),
+                    "queued_agy_sessions": self.sessions.queued_agy_count(),
+                    "max_concurrent_agy": self.config.max_concurrent_agy,
                     "default_workdir": self.config.default_workdir,
                 },
                 indent=2,

@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--password", default=None, help="Basic auth plaintext password")
     parser.add_argument("--hmac-secret", default=None, help="HMAC-SHA256 shared secret")
     parser.add_argument("--workdir", default=None, help="Default working directory")
+    parser.add_argument(
+        "--max-agy",
+        type=int,
+        default=None,
+        help="Max concurrent `agy` processes before queueing (auto-detected from RAM+Swap)",
+    )
     parser.add_argument("--tls-cert", default=None, help="TLS certificate PEM file path")
     parser.add_argument("--tls-key", default=None, help="TLS private key PEM file path")
     parser.add_argument("--tls-ca", default=None, help="TLS Root CA PEM file path (for mTLS)")
@@ -106,6 +112,9 @@ async def async_main() -> int:
     if args.workdir:
         cfg.default_workdir = args.workdir
         dirty = True
+    if args.max_agy is not None:
+        cfg.max_concurrent_agy = max(1, int(args.max_agy))
+        dirty = True
     if args.tls_cert:
         cfg.tls_certfile = args.tls_cert
         dirty = True
@@ -165,7 +174,10 @@ async def async_main() -> int:
         print(f"  TLS SHA256 Pin      : {cert_fp}")
     print(f"  Client IP Allowlist : {cfg.allowed_client_ips or 'ALL (authenticated)'}")
     print(f"  Default Workdir     : {cfg.default_workdir}")
-    print(f"  Agy Binary          : {cfg.agy_binary} (skip_permissions={cfg.agy_default_skip_permissions})")
+    print(
+        f"  Agy Binary          : {cfg.agy_binary} "
+        f"(skip_permissions={cfg.agy_default_skip_permissions}, max_concurrent_agy={cfg.max_concurrent_agy})"
+    )
     print("-" * 76)
     print(f"  Bearer API Token    : {cfg.api_tokens[0]}")
     print(f"  HMAC-SHA256 Secret  : {cfg.hmac_secret}")

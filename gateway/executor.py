@@ -86,6 +86,9 @@ class ExecutionSession:
         timeout: Optional[float] = None,
         max_buffer_events: int = 5000,
         max_output_bytes: int = 32 * 1024 * 1024,
+        slot_sem: Optional[asyncio.Semaphore] = None,
+        queue_timeout: float = 1800.0,
+        is_agy: bool = False,
     ) -> None:
         self.session_id = session_id
         self.argv = argv
@@ -97,6 +100,7 @@ class ExecutionSession:
         self.timeout = timeout
         self.max_buffer_events = max_buffer_events
         self.max_output_bytes = max_output_bytes
+        self.is_agy = is_agy
 
         self.status: str = "starting"
         self.pid: Optional[int] = None
@@ -104,6 +108,10 @@ class ExecutionSession:
         self.started_at: float = time.time()
         self.ended_at: Optional[float] = None
 
+        self._slot_sem = slot_sem
+        self._queue_timeout = queue_timeout
+        self._slot_acquired = False
+        self._pending_stdin: List[Tuple[bytes, bool]] = []
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._pty_master_fd: Optional[int] = None
         self._seq: int = 0
@@ -155,6 +163,109 @@ class ExecutionSession:
         return ev
 
     async def start(self, initial_stdin: Optional[str] = None, close_stdin: bool = False) -> None:
+        """Acquire concurrency slot (queueing asynchronously if busy) and spawn the child process."""
+        if self._slot_sem is not None and self._slot_sem.locked():
+            self.status = "queued"
+            if initial_stdin is not None:
+                self._pending_stdin.append((initial_stdin.encode("utf-8"), close_stdin))
+            self._emit(
+                "queued",
+                {"message": "Waiting for available agy concurrency slot", "cwd": self.cwd},
+            )
+            self._watch_tasks.append(
+                asyncio.create_task(self._queued_start_loop(close_stdin=close_stdin))
+            )
+            return
+
+        if self._slot_sem is not None:
+            await self._slot_sem.acquire()
+            self._slot_acquired = True
+
+        try:
+            await self._spawn_process(initial_stdin=initial_stdin, close_stdin=close_stdin)
+        except Exception:
+            self._release_slot()
+            raise
+
+    def _release_slot(self) -> None:
+        if self._slot_acquired and self._slot_sem is not None:
+            self._slot_acquired = False
+            self._slot_sem.release()
+
+    async def _queued_start_loop(self, close_stdin: bool = False) -> None:
+        assert self._slot_sem is not None
+        try:
+            await asyncio.wait_for(self._slot_sem.acquire(), timeout=self._queue_timeout)
+            self._slot_acquired = True
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            self.ended_at = time.time()
+            self.returncode = -9
+            if self.status != "killed":
+                self.status = "timeout"
+            self._emit(
+                "exit",
+                {
+                    "returncode": self.returncode,
+                    "status": self.status,
+                    "duration_seconds": round(self.ended_at - self.started_at, 4),
+                },
+            )
+            self._done_event.set()
+            for q in list(self._subscribers):
+                try:
+                    q.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
+            return
+
+        if self.status == "killed":
+            self._release_slot()
+            self.ended_at = time.time()
+            self.returncode = -9
+            self._emit(
+                "exit",
+                {
+                    "returncode": self.returncode,
+                    "status": "killed",
+                    "duration_seconds": round(self.ended_at - self.started_at, 4),
+                },
+            )
+            self._done_event.set()
+            for q in list(self._subscribers):
+                try:
+                    q.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
+            return
+
+        try:
+            self.started_at = time.time()
+            await self._spawn_process(initial_stdin=None, close_stdin=False)
+            should_close = close_stdin
+            pending = list(self._pending_stdin)
+            self._pending_stdin.clear()
+            for chunk, ca in pending:
+                should_close = should_close or ca
+                await self.write_stdin(chunk, close_after=False)
+            if should_close and not self.use_pty and self._proc and self._proc.stdin:
+                self._proc.stdin.close()
+        except Exception as exc:
+            self._release_slot()
+            self.ended_at = time.time()
+            self.returncode = -1
+            self.status = "failed"
+            self._emit("error", str(exc))
+            self._emit("exit", {"returncode": -1, "status": "failed", "duration_seconds": 0.0})
+            self._done_event.set()
+            for q in list(self._subscribers):
+                try:
+                    q.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
+
+    async def _spawn_process(
+        self, initial_stdin: Optional[str] = None, close_stdin: bool = False
+    ) -> None:
         """Spawn the child process and begin streaming stdout/stderr."""
         if self.use_pty:
             master_fd, slave_fd = pty.openpty()
@@ -313,6 +424,8 @@ class ExecutionSession:
             timed_out = True
             await self.send_signal("SIGKILL")
             await self._proc.wait()
+        finally:
+            self._release_slot()
 
         for t in self._watch_tasks:
             if t is not asyncio.current_task():
@@ -358,11 +471,15 @@ class ExecutionSession:
         fcntl.ioctl(self._pty_master_fd, termios.TIOCSWINSZ, winsize)
 
     async def write_stdin(self, data: Union[str, bytes], close_after: bool = False) -> None:
-        """Write raw bytes or text to the running process's stdin."""
+        """Write raw bytes or text to the running (or queued) process's stdin."""
+        raw = data.encode("utf-8") if isinstance(data, str) else data
+        if self.status == "queued":
+            self._pending_stdin.append((raw, close_after))
+            self._emit("stdin", {"bytes_written": len(raw), "closed": close_after, "queued": True})
+            return
+
         if self.status != "running" or self._proc is None:
             raise RuntimeError(f"Session {self.session_id} is not running (status={self.status})")
-
-        raw = data.encode("utf-8") if isinstance(data, str) else data
         if self.use_pty and self._pty_master_fd is not None:
             os.write(self._pty_master_fd, raw)
         elif self._proc.stdin is not None:
@@ -391,7 +508,12 @@ class ExecutionSession:
             await self.write_stdin(line, close_after=close_after)
 
     async def send_signal(self, sig_name: str = "SIGTERM") -> None:
-        """Send a POSIX signal to the process group."""
+        """Send a POSIX signal to the process group (or cancel a queued session)."""
+        if self.status == "queued":
+            self.status = "killed"
+            for t in list(self._watch_tasks):
+                t.cancel()
+            return
         if self._proc is None or self._proc.returncode is not None:
             return
         sig_map = {
@@ -495,6 +617,7 @@ class SessionManager:
         self.config = config
         self.policy = policy
         self._sessions: Dict[str, ExecutionSession] = {}
+        self._agy_sem = asyncio.Semaphore(max(1, config.max_concurrent_agy))
 
     def _prepare_env(self, extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         env = {
@@ -515,7 +638,7 @@ class SessionManager:
         if len(self._sessions) <= 100:
             return
         completed = [
-            s for s in self._sessions.values() if s.status not in ("starting", "running")
+            s for s in self._sessions.values() if s.status not in ("queued", "starting", "running")
         ]
         completed.sort(key=lambda s: s.ended_at or 0.0)
         for s in completed[: len(self._sessions) - 100]:
@@ -523,7 +646,17 @@ class SessionManager:
 
     def active_count(self) -> int:
         return sum(
-            1 for s in self._sessions.values() if s.status in ("starting", "running")
+            1 for s in self._sessions.values() if s.status in ("queued", "starting", "running")
+        )
+
+    def active_agy_count(self) -> int:
+        return sum(
+            1 for s in self._sessions.values() if s.is_agy and s.status in ("starting", "running")
+        )
+
+    def queued_agy_count(self) -> int:
+        return sum(
+            1 for s in self._sessions.values() if s.is_agy and s.status == "queued"
         )
 
     async def create_session(
@@ -537,6 +670,9 @@ class SessionManager:
         timeout: Optional[float] = None,
         initial_stdin: Optional[str] = None,
         close_stdin: bool = False,
+        slot_sem: Optional[asyncio.Semaphore] = None,
+        queue_timeout: Optional[float] = None,
+        is_agy: bool = False,
     ) -> ExecutionSession:
         """Validate command against security policy and start an ExecutionSession."""
         if self.active_count() >= self.config.max_concurrent_sessions:
@@ -580,6 +716,13 @@ class SessionManager:
             timeout=effective_timeout,
             max_buffer_events=self.config.max_output_buffer_events,
             max_output_bytes=self.config.max_output_bytes,
+            slot_sem=slot_sem,
+            queue_timeout=(
+                self.config.agy_queue_timeout_seconds
+                if queue_timeout is None
+                else float(queue_timeout)
+            ),
+            is_agy=is_agy,
         )
         self._sessions[session_id] = session
         await session.start(initial_stdin=initial_stdin, close_stdin=close_stdin)
@@ -632,6 +775,9 @@ class SessionManager:
             timeout=timeout,
             initial_stdin=initial_stdin,
             close_stdin=close_stdin,
+            slot_sem=self._agy_sem,
+            queue_timeout=self.config.agy_queue_timeout_seconds,
+            is_agy=True,
         )
 
     def get_session(self, session_id: str) -> Optional[ExecutionSession]:

@@ -238,6 +238,27 @@ DEFAULT_PROTECTED_PATHS: List[str] = [
 ]
 
 
+def detect_recommended_max_agy() -> int:
+    """Auto-tune default concurrent `agy` limit (~270 MiB RSS each) based on host MemTotal + SwapTotal."""
+    try:
+        mem_kib = 0
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith(("MemTotal:", "SwapTotal:")):
+                parts = line.split()
+                if len(parts) >= 2:
+                    mem_kib += int(parts[1])
+        total_mib = mem_kib // 1024
+        if total_mib < 2048:
+            return 1
+        if total_mib < 4096:
+            return 2
+        if total_mib < 8192:
+            return 4
+        return 8
+    except Exception:
+        return 2
+
+
 def hash_password_pbkdf2(password: str, salt: Optional[str] = None) -> str:
     """Create a PBKDF2-HMAC-SHA256 hash string in format 'pbkdf2_sha256$<salt>$<hex>'."""
     if salt is None:
@@ -287,6 +308,8 @@ class GatewayConfig:
     # Antigravity (agy) specific settings
     agy_binary: str = DEFAULT_AGY_BIN
     agy_default_skip_permissions: bool = True
+    max_concurrent_agy: int = field(default_factory=detect_recommended_max_agy)
+    agy_queue_timeout_seconds: float = 1800.0
     # Execution, connection & memory limits
     default_timeout_seconds: float = 600.0
     max_timeout_seconds: float = 7200.0
@@ -339,6 +362,8 @@ class GatewayConfig:
             cfg.default_workdir = os.environ["GATEWAY_WORKDIR"]
         if os.environ.get("GATEWAY_AGY_BIN"):
             cfg.agy_binary = os.environ["GATEWAY_AGY_BIN"]
+        if os.environ.get("GATEWAY_MAX_AGY"):
+            cfg.max_concurrent_agy = max(1, int(os.environ["GATEWAY_MAX_AGY"]))
         if os.environ.get("GATEWAY_TLS_CERT"):
             cfg.tls_certfile = os.environ["GATEWAY_TLS_CERT"]
         if os.environ.get("GATEWAY_TLS_KEY"):

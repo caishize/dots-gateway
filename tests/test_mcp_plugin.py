@@ -390,6 +390,71 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             proc.stdin.close()
             await asyncio.wait_for(proc.wait(), timeout=5.0)
 
+    async def test_parallel_run_agy_and_slot_queueing(self) -> None:
+        mock_agy = Path(self.tmpdir) / "mock_agy.py"
+        mock_agy.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, time\n"
+            "time.sleep(0.25)\n"
+            "print('MOCK_AGY_DONE:' + ' '.join(sys.argv[1:]))\n",
+            encoding="utf-8",
+        )
+        mock_agy.chmod(0o755)
+
+        par_cfg = GatewayConfig(
+            host="127.0.0.1",
+            port=0,
+            api_tokens=["par-tok"],
+            allowed_workdirs=["/tmp"],
+            default_workdir=self.tmpdir,
+            agy_binary=str(mock_agy),
+            allowed_commands=["python3", str(mock_agy)],
+            max_concurrent_agy=2,
+        )
+        par_srv = GatewayServer(par_cfg)
+        h, p = await par_srv.start()
+        try:
+            client = DotsGatewayClient(base_url=f"http://{h}:{p}", token="par-tok")
+            seen_notifs: List[Dict[str, Any]] = []
+
+            async def _call_one(idx: int) -> Dict[str, Any]:
+                resp, _ = await asyncio.to_thread(
+                    client.mcp_request,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": f"par-{idx}",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "run_agy",
+                            "arguments": {"prompt": f"TASK_{idx}", "cwd": self.tmpdir},
+                            "_meta": {"progressToken": f"pt-{idx}"},
+                        },
+                    },
+                    None,
+                    seen_notifs.append,
+                )
+                assert resp is not None
+                return resp
+
+            t0 = asyncio.get_running_loop().time()
+            results = await asyncio.gather(*(_call_one(i) for i in range(4)))
+            elapsed = asyncio.get_running_loop().time() - t0
+
+            for idx, r in enumerate(results):
+                self.assertFalse(r["result"]["isError"])
+                self.assertIn(
+                    f"TASK_{idx}",
+                    r["result"]["structuredContent"]["stdout"],
+                )
+            # 4 tasks x 0.25s with max_concurrent_agy=2 takes ~0.5s (2 waves), proving both parallelism & queueing
+            self.assertLess(elapsed, 0.95)
+            self.assertTrue(
+                any("[queued]" in n.get("params", {}).get("message", "") for n in seen_notifs),
+                f"Expected queued progress notification in {seen_notifs}",
+            )
+        finally:
+            await par_srv.stop()
+
 
 if __name__ == "__main__":
     unittest.main()
