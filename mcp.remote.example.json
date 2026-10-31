@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "dots-gateway": {
+      "type": "streamable-http",
+      "url": "https://<YOUR_PUBLIC_IP_OR_DOMAIN>:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer <YOUR_GATEWAY_BEARER_TOKEN>"
+      }
+    }
+  }
+}

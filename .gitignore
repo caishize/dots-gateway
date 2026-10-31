@@ -1,5 +1,6 @@
 # Runtime secrets & auto-generated TLS/mTLS certificates (NEVER COMMIT)
 config.json
+client.json
 certs/
 *.key
 *.pem

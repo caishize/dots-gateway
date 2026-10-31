@@ -29,7 +29,30 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+
+
+def load_client_config_file(explicit_path: Optional[str] = None) -> Dict[str, Any]:
+    """Load optional client credentials JSON from DOTS_GATEWAY_CLIENT_CONFIG, PLUGIN_DATA, or ~/.config."""
+    candidates: List[Path] = []
+    if explicit_path:
+        candidates.append(Path(explicit_path).expanduser())
+    if os.environ.get("DOTS_GATEWAY_CLIENT_CONFIG"):
+        candidates.append(Path(os.environ["DOTS_GATEWAY_CLIENT_CONFIG"]).expanduser())
+    if os.environ.get("PLUGIN_DATA"):
+        candidates.append(Path(os.environ["PLUGIN_DATA"]).expanduser() / "client.json")
+    candidates.append(Path.home() / ".config" / "dots-gateway" / "client.json")
+    candidates.append(Path(__file__).resolve().parent / "client.json")
+
+    for p in candidates:
+        try:
+            if p.is_file():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            continue
+    return {}
 
 
 def _normalize_fingerprint(fp: Optional[str]) -> Optional[str]:
@@ -93,20 +116,48 @@ class DotsGatewayClient:
         client_cert: Optional[str] = None,
         client_key: Optional[str] = None,
         verify_tls: bool = True,
+        load_config_file: bool = False,
+        config_file_path: Optional[str] = None,
     ) -> None:
-        raw_url = base_url or os.environ.get("GATEWAY_URL", "https://127.0.0.1:8765")
-        self.base_url = raw_url.rstrip("/")
-        self.token = token or os.environ.get("GATEWAY_TOKEN")
-        self.username = username or os.environ.get("GATEWAY_USER")
-        self.password = password or os.environ.get("GATEWAY_PASSWORD")
-        self.hmac_secret = hmac_secret or os.environ.get("GATEWAY_HMAC_SECRET")
-        self.tls_fingerprint = _normalize_fingerprint(
-            tls_fingerprint or os.environ.get("GATEWAY_TLS_FINGERPRINT")
+        file_cfg = load_client_config_file(config_file_path) if load_config_file else {}
+        explicit_url = (
+            base_url
+            or os.environ.get("GATEWAY_URL")
+            or file_cfg.get("url")
+            or file_cfg.get("base_url")
         )
-        self.ca_cert = ca_cert or os.environ.get("GATEWAY_CA_CERT")
-        self.client_cert = client_cert or os.environ.get("GATEWAY_CLIENT_CERT")
-        self.client_key = client_key or os.environ.get("GATEWAY_CLIENT_KEY")
-        self.verify_tls = verify_tls
+        self._explicitly_configured = bool(explicit_url)
+        raw_url = str(explicit_url or "https://127.0.0.1:8765")
+        self.base_url = raw_url.rstrip("/")
+        self.token = token or os.environ.get("GATEWAY_TOKEN") or file_cfg.get("token")
+        self.username = username or os.environ.get("GATEWAY_USER") or file_cfg.get("username")
+        self.password = password or os.environ.get("GATEWAY_PASSWORD") or file_cfg.get("password")
+        self.hmac_secret = (
+            hmac_secret or os.environ.get("GATEWAY_HMAC_SECRET") or file_cfg.get("hmac_secret")
+        )
+        self.tls_fingerprint = _normalize_fingerprint(
+            tls_fingerprint
+            or os.environ.get("GATEWAY_TLS_FINGERPRINT")
+            or file_cfg.get("tls_fingerprint")
+        )
+        self.ca_cert = ca_cert or os.environ.get("GATEWAY_CA_CERT") or file_cfg.get("ca_cert")
+        self.client_cert = (
+            client_cert or os.environ.get("GATEWAY_CLIENT_CERT") or file_cfg.get("client_cert")
+        )
+        self.client_key = (
+            client_key or os.environ.get("GATEWAY_CLIENT_KEY") or file_cfg.get("client_key")
+        )
+        self.verify_tls = (
+            bool(file_cfg["verify_tls"])
+            if ("verify_tls" in file_cfg and verify_tls is True)
+            else verify_tls
+        )
+
+    def has_credentials(self) -> bool:
+        return bool(self.hmac_secret or self.token or (self.username and self.password is not None))
+
+    def is_configured(self) -> bool:
+        return self._explicitly_configured and self.has_credentials()
 
     def _ssl_context(self) -> Optional[ssl.SSLContext]:
         if not self.base_url.lower().startswith(("https://", "wss://")):
@@ -257,6 +308,85 @@ class DotsGatewayClient:
 
     def policy(self) -> Dict[str, Any]:
         return self._request_json("GET", "/v1/policy", timeout=10.0)
+
+    def mcp_request(
+        self,
+        payload: Any,
+        session_id: Optional[str] = None,
+        on_notification: Optional[Callable[[Dict[str, Any]], None]] = None,
+        timeout: float = 3600.0,
+    ) -> Tuple[Optional[Any], Optional[str]]:
+        """Send a JSON-RPC 2.0 request/notification to `POST /mcp` over Streamable HTTP.
+
+        Automatically handles:
+        - TLS SHA-256 certificate pinning + HMAC-SHA256 / Bearer / Basic / mTLS auth
+        - HTTP `202 Accepted` empty responses for notifications
+        - Both `application/json` and SSE `text/event-stream` responses (forwarding live
+          `notifications/progress` to `on_notification` while ignoring `: keepalive` comments)
+        """
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        path = "/mcp"
+        headers = self._build_auth_headers("POST", path, body)
+        headers["Content-Type"] = "application/json; charset=utf-8"
+        headers["Accept"] = "application/json, text/event-stream"
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
+
+        req = urllib.request.Request(
+            url=f"{self.base_url}{path}",
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with self._open_url(req, timeout=timeout) as resp:
+                resp_sid = resp.headers.get("Mcp-Session-Id") or session_id
+                status = getattr(resp, "status", 200)
+                if status in (202, 204):
+                    return None, resp_sid
+
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                if "text/event-stream" in ctype:
+                    responses: List[Any] = []
+                    data_lines: List[str] = []
+                    for raw_line in resp:
+                        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                        if line.startswith(":"):
+                            continue
+                        if not line:
+                            if data_lines:
+                                raw_data = "\n".join(data_lines)
+                                data_lines.clear()
+                                msg = json.loads(raw_data)
+                                if isinstance(msg, dict) and "method" in msg and "id" not in msg:
+                                    if on_notification is not None:
+                                        on_notification(msg)
+                                else:
+                                    responses.append(msg)
+                        elif line.startswith("data:"):
+                            data_lines.append(line[5:].lstrip(" "))
+
+                    if data_lines:
+                        msg = json.loads("\n".join(data_lines))
+                        if isinstance(msg, dict) and "method" in msg and "id" not in msg:
+                            if on_notification is not None:
+                                on_notification(msg)
+                        else:
+                            responses.append(msg)
+
+                    if not responses:
+                        return None, resp_sid
+                    if isinstance(payload, list):
+                        return responses, resp_sid
+                    return responses[-1], resp_sid
+
+                raw_bytes = resp.read()
+                if not raw_bytes:
+                    return None, resp_sid
+                return json.loads(raw_bytes.decode("utf-8")), resp_sid
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Gateway MCP HTTP {exc.code}: {err_body}") from exc
 
     # ------------------------------------------------------------------
     # Command & Antigravity (`agy`) Execution
@@ -706,8 +836,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Dots Remote Client for Local Gateway")
     parser.add_argument(
         "--url",
-        default=os.environ.get("GATEWAY_URL", "https://127.0.0.1:8765"),
-        help="Gateway base URL (default: https://127.0.0.1:8765)",
+        default=None,
+        help="Gateway base URL (default: GATEWAY_URL or client.json or https://127.0.0.1:8765)",
     )
     parser.add_argument("--token", default=os.environ.get("GATEWAY_TOKEN"), help="Bearer Token")
     parser.add_argument("--user", default=os.environ.get("GATEWAY_USER"), help="Basic Auth username")
@@ -779,6 +909,7 @@ def main() -> int:
         ca_cert=args.ca_cert,
         client_cert=args.client_cert,
         client_key=args.client_key,
+        load_config_file=True,
     )
 
     if args.cmd == "health":

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dots-gateway",
+  "version": "1.2.0",
+  "description": "Remote development & Antigravity (agy) MCP plugin enabling OpenAI dots to inspect/edit local files, execute allowlisted dev commands, and run agy --dangerously-skip-permissions.",
+  "author": {
+    "name": "caishize",
+    "url": "https://github.com/caishize/dots-gateway"
+  },
+  "homepage": "https://github.com/caishize/dots-gateway",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/caishize/dots-gateway.git"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./mcp.json",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Dots Remote Dev Gateway",
+        "shortDescription": "Run local dev commands, edit workspace files, and invoke agy via MCP",
+        "longDescription": "Bridges OpenAI dots to your remote development machine over a hardened TLS 1.3 + HMAC-SHA256 gateway via the Model Context Protocol (MCP). Provides atomic workspace file operations (fs_read, fs_write, fs_patch, fs_list), allowlisted shell/build/test execution (exec_command), multi-turn background sessions (session_*), and unattended Antigravity (agy --dangerously-skip-permissions) delegation (run_agy).",
+        "developerName": "caishize",
+        "category": "Development",
+        "capabilities": ["Read", "Write"],
+        "websiteURL": "https://github.com/caishize/dots-gateway",
+        "defaultPrompt": [
+          "Check remote gateway status and list projects in the default workspace.",
+          "Delegate feature implementation on my remote repo to run_agy and verify with pytest.",
+          "Inspect git status and run the test suite on my remote machine via dots-gateway."
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "url": "https://<YOUR_PUBLIC_IP>:8765",
+  "hmac_secret": "<YOUR_HMAC_SECRET>",
+  "tls_fingerprint": "<SERVER_CERT_SHA256_FINGERPRINT>"
+}

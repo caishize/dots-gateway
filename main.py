@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 from pathlib import Path
 
@@ -59,6 +60,11 @@ def parse_args() -> argparse.Namespace:
         "--init-only",
         action="store_true",
         help="Generate config.json & TLS certificates and exit without starting server",
+    )
+    parser.add_argument(
+        "--print-plugin-config",
+        action="store_true",
+        help="Print ready-to-use OpenAI dots Plugin / MCP configuration snippets and exit",
     )
     return parser.parse_args()
 
@@ -147,10 +153,11 @@ async def async_main() -> int:
     display_host = cfg.public_ip or cfg.host
 
     print("=" * 76)
-    print("  Dots <-> Local Dev & Antigravity (agy) Hardened Gateway")
+    print("  Dots <-> Local Dev & Antigravity (agy) Hardened Gateway + MCP Server")
     print("=" * 76)
     print(f"  Config File         : {cfg_path}")
     print(f"  HTTPS/SSE Endpoint  : {scheme}://{display_host}:{cfg.port}")
+    print(f"  MCP Endpoint (HTTP) : {scheme}://{display_host}:{cfg.port}/mcp")
     print(f"  WebSocket (Duplex)  : {ws_scheme}://{display_host}:{cfg.port}/v1/ws")
     print(f"  TLS Encryption      : {'ENABLED (TLS 1.2/1.3)' if use_tls else 'DISABLED (Plaintext)'}")
     if use_tls:
@@ -168,6 +175,33 @@ async def async_main() -> int:
     else:
         print(f"  Basic Auth Users    : {', '.join(cfg.users.keys())}")
     print("=" * 76)
+
+    if args.print_plugin_config:
+        target_host = cfg.public_ip or "<YOUR_PUBLIC_IP>"
+        base_url = f"{scheme}://{target_host}:{cfg.port}"
+        client_json = {
+            "url": base_url,
+            "hmac_secret": cfg.hmac_secret,
+        }
+        if use_tls and cert_fp:
+            client_json["tls_fingerprint"] = cert_fp
+        remote_mcp_json = {
+            "mcpServers": {
+                "dots-gateway": {
+                    "type": "streamable-http",
+                    "url": f"{base_url}/mcp",
+                    "headers": {
+                        "Authorization": f"Bearer {cfg.api_tokens[0]}",
+                    },
+                }
+            }
+        }
+        print("\n[Option A] Bundled Plugin (`stdio` Bridge with TLS SHA-256 Pinning + HMAC)")
+        print("Save on the OpenAI `dots` machine as `~/.config/dots-gateway/client.json`:")
+        print(json.dumps(client_json, indent=2, ensure_ascii=False))
+        print("\n[Option B] Direct Remote Streamable HTTP MCP Connector (`/mcp`)")
+        print(json.dumps(remote_mcp_json, indent=2, ensure_ascii=False))
+        return 0
 
     if args.init_only:
         return 0

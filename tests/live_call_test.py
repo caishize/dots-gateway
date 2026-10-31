@@ -236,7 +236,87 @@ async def run_live_tests(base_url: str, config_path: Path) -> None:
         assert turn2_resp is not None and "ORBIT_99" in turn2_resp
         assert exit_rc == 0
 
-    banner("ALL 6 HARDENED HTTPS/WSS LIVE INTEGRATION TESTS PASSED!")
+    # ------------------------------------------------------------------
+    # 7. MCP Plugin Verification: Streamable HTTP (`/mcp`) + `./dots_mcp.py` Stdio Bridge + `run_agy`
+    # ------------------------------------------------------------------
+    banner("7. Testing MCP Plugin (`/mcp` Streamable HTTP + `./dots_mcp.py` Stdio Bridge)")
+    mcp_init, mcp_sid = token_client.mcp_request(
+        {
+            "jsonrpc": "2.0",
+            "id": "m-init",
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"},
+        }
+    )
+    assert mcp_sid and mcp_init["result"]["serverInfo"]["name"] == "dots-gateway"
+    notif_out, _ = token_client.mcp_request(
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        session_id=mcp_sid,
+    )
+    assert notif_out is None
+    print(f"[PASS] Remote Streamable HTTP `/mcp` initialized (Mcp-Session-Id={mcp_sid})")
+
+    # Spawn `./dots_mcp.py` stdio bridge just as OpenAI `dots` loads the plugin via `mcp.json`
+    bridge_env = {k: v for k, v in os.environ.items() if not k.startswith("GATEWAY_")}
+    bridge_env["GATEWAY_URL"] = base_url
+    bridge_env["GATEWAY_HMAC_SECRET"] = hmac_secret
+    bridge_env["GATEWAY_TLS_FINGERPRINT"] = tls_fp
+
+    proc = await asyncio.create_subprocess_exec(
+        str(ROOT_DIR / "dots_mcp.py"),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(ROOT_DIR),
+        env=bridge_env,
+    )
+    assert proc.stdin is not None and proc.stdout is not None
+    try:
+        async def _stdio_rpc(req_obj: dict) -> dict:
+            proc.stdin.write((json.dumps(req_obj, ensure_ascii=False) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+            while True:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=120.0)
+                assert line, "Unexpected EOF from dots_mcp.py"
+                msg_obj = json.loads(line.decode("utf-8"))
+                if msg_obj.get("method") == "notifications/progress":
+                    print(f"  [mcp progress] {msg_obj['params'].get('message', '')[:90]}")
+                    continue
+                if msg_obj.get("id") == req_obj["id"]:
+                    return msg_obj
+
+        b_init = await _stdio_rpc(
+            {"jsonrpc": "2.0", "id": 101, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}
+        )
+        assert b_init["result"]["serverInfo"]["name"] == "dots-gateway"
+
+        b_agy = await _stdio_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 102,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_agy",
+                    "arguments": {
+                        "prompt": "不要调用任何工具，直接回复 MCP_PLUGIN_AGY_OK。",
+                        "cwd": DEMO_WORKDIR,
+                        "model": "gemini-2.5-flash",
+                        "skip_permissions": True,
+                    },
+                    "_meta": {"progressToken": "live-agy-prog"},
+                },
+            }
+        )
+        assert b_agy["result"]["isError"] is False
+        agy_out = b_agy["result"]["structuredContent"]["stdout"]
+        print(f"  [mcp run_agy output] {agy_out.strip()!r}")
+        assert "MCP_PLUGIN_AGY_OK" in agy_out
+        print("[PASS] `./dots_mcp.py` plugin bridge invoked `run_agy` end-to-end over TLS 1.3 + HMAC!")
+    finally:
+        proc.stdin.close()
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+
+    banner("ALL 7 HARDENED HTTPS/WSS + MCP PLUGIN LIVE INTEGRATION TESTS PASSED!")
 
 
 if __name__ == "__main__":

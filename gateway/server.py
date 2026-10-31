@@ -16,12 +16,14 @@ from .auth import Authenticator
 from .config import GatewayConfig
 from .executor import ExecutionSession, SessionManager
 from .files import FileService
+from .mcp import MCPHandler
 from .policy import CommandPolicy
 from .protocol import (
     HTTPRequest,
     SSEWriter,
     WebSocketConnection,
     read_http_request,
+    send_empty_response,
     send_json_response,
 )
 from .tls import build_server_ssl_context
@@ -45,6 +47,13 @@ class GatewayServer:
         self._server: Optional[asyncio.AbstractServer] = None
         self._conn_sem = asyncio.Semaphore(max(1, config.max_concurrent_connections))
         self._started_at = time.time()
+        self.mcp = MCPHandler(
+            config=self.config,
+            policy=self.policy,
+            files=self.files,
+            sessions=self.sessions,
+            started_at=self._started_at,
+        )
 
     async def start(self) -> Tuple[str, int]:
         ssl_ctx: Optional[ssl.SSLContext] = None
@@ -126,6 +135,23 @@ class GatewayServer:
                 path = parsed.path
                 query = parse_qs(parsed.query)
 
+                # CORS / preflight on MCP endpoint
+                if req.method == "OPTIONS" and path in ("/mcp", "/v1/mcp"):
+                    await send_empty_response(
+                        writer,
+                        204,
+                        extra_headers={
+                            "Allow": "POST, DELETE, OPTIONS",
+                            "Access-Control-Allow-Methods": "POST, DELETE, OPTIONS",
+                            "Access-Control-Allow-Headers": (
+                                "Authorization, Content-Type, Accept, Mcp-Session-Id, "
+                                "MCP-Protocol-Version, X-API-Token, X-Timestamp, X-Nonce, X-Signature"
+                            ),
+                            "Access-Control-Expose-Headers": "Mcp-Session-Id, MCP-Protocol-Version",
+                        },
+                    )
+                    return
+
                 # Liveness probe on /v1/health (minimal when unauthenticated to prevent fingerprinting)
                 if req.method == "GET" and path == "/v1/health":
                     has_creds = any(
@@ -155,6 +181,7 @@ class GatewayServer:
                                 "version": __version__,
                                 "uptime_seconds": round(time.time() - self._started_at, 2),
                                 "active_sessions": self.sessions.active_count(),
+                                "mcp_endpoint": "/mcp",
                                 "tls_enabled": bool(
                                     self.config.tls_certfile and self.config.tls_keyfile
                                 ),
@@ -193,6 +220,8 @@ class GatewayServer:
                     return
 
                 await self._route_http(req, path, query, writer)
+            except (ConnectionError, ssl.SSLError, asyncio.IncompleteReadError) as conn_exc:
+                logger.debug("Client connection closed (%s): %s", client_ip, conn_exc)
             except Exception:
                 logger.exception("Unhandled error handling request from %s", client_ip)
                 try:
@@ -223,6 +252,10 @@ class GatewayServer:
         query: Dict[str, list[str]],
         writer: asyncio.StreamWriter,
     ) -> None:
+        if path in ("/mcp", "/v1/mcp"):
+            await self._handle_http_mcp(req, writer)
+            return
+
         if req.method == "GET" and path == "/v1/policy":
             await send_json_response(
                 writer,
@@ -342,6 +375,82 @@ class GatewayServer:
         await send_json_response(
             writer, 404, {"ok": False, "error": f"Route not found: {req.method} {path}"}
         )
+
+    async def _handle_http_mcp(
+        self, req: HTTPRequest, writer: asyncio.StreamWriter
+    ) -> None:
+        """Serve MCP Streamable HTTP (`POST /mcp`, `DELETE /mcp`, `GET /mcp -> 405`)."""
+        mcp_sid = req.headers.get("mcp-session-id")
+
+        if req.method == "GET":
+            await send_json_response(
+                writer,
+                405,
+                {"ok": False, "error": "Method Not Allowed: use POST /mcp for Streamable HTTP"},
+                extra_headers={"Allow": "POST, DELETE, OPTIONS"},
+            )
+            return
+
+        if req.method == "DELETE":
+            self.mcp.delete_session(mcp_sid)
+            await send_empty_response(writer, 204)
+            return
+
+        if req.method != "POST":
+            await send_json_response(
+                writer,
+                405,
+                {"ok": False, "error": f"Method {req.method} not allowed on /mcp"},
+                extra_headers={"Allow": "POST, DELETE, OPTIONS"},
+            )
+            return
+
+        try:
+            if not req.body:
+                raise ValueError("Empty JSON-RPC body")
+            payload = json.loads(req.body.decode("utf-8"))
+        except Exception as exc:
+            await send_json_response(
+                writer,
+                400,
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": f"Parse error: {exc}"},
+                },
+            )
+            return
+
+        accept = req.headers.get("accept", "").lower()
+        if "text/event-stream" in accept and self.mcp.should_stream_sse(payload):
+            init_hdrs = {"Mcp-Session-Id": mcp_sid} if mcp_sid else None
+            sse = SSEWriter(writer, extra_headers=init_hdrs)
+            await sse.start()
+
+            async def _emit_sse(event_obj: Optional[Dict[str, Any]]) -> None:
+                if event_obj is None:
+                    await sse.send_comment(f"keepalive {int(time.time())}")
+                else:
+                    await sse.send_event("message", event_obj)
+
+            resp_payload, _ = await self.mcp.handle_payload(
+                payload, session_id=mcp_sid, emit_event=_emit_sse
+            )
+            if resp_payload is not None:
+                if isinstance(resp_payload, list):
+                    for item in resp_payload:
+                        await sse.send_event("message", item)
+                else:
+                    await sse.send_event("message", resp_payload)
+            return
+
+        resp_payload, resp_hdrs = await self.mcp.handle_payload(
+            payload, session_id=mcp_sid, emit_event=None
+        )
+        if resp_payload is None:
+            await send_empty_response(writer, 202, extra_headers=resp_hdrs)
+        else:
+            await send_json_response(writer, 200, resp_payload, extra_headers=resp_hdrs)
 
     async def _handle_http_files(
         self,

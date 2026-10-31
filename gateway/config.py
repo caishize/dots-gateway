@@ -230,7 +230,9 @@ DEFAULT_BLOCKED_PATTERNS: List[str] = [
 
 DEFAULT_PROTECTED_PATHS: List[str] = [
     str(GATEWAY_ROOT / "config.json"),
+    str(GATEWAY_ROOT / "client.json"),
     str(GATEWAY_ROOT / "certs"),
+    str(Path.home() / ".config" / "dots-gateway"),
     str(Path.home() / ".ssh"),
     str(Path.home() / ".gnupg"),
 ]
