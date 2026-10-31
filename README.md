@@ -58,20 +58,24 @@ OpenAI Cloud Machine (`dots`)                            Local Dev Machine (`~/g
 
 ---
 
-## 1. Start the Local Gateway & Export Plugin Config
+## 1. Start, Manage & Issue Public IP TLS Certificate
 
 ```bash
 git clone https://github.com/caishize/dots-gateway.git ~/gateway
 cd ~/gateway
 
-# Install & start persistent background service
-mkdir -p ~/.config/systemd/user
-cp deploy/dots-gateway.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now dots-gateway.service
+# Start / stop / restart / inspect service & logs via unified CLI
+./gateway.sh start
+./gateway.sh status
+./gateway.sh restart
+./gateway.sh stop
+./gateway.sh logs -f
 
-# Generate ready-to-paste OpenAI `dots` Plugin & MCP configuration snippets
-python3 main.py --public-ip <YOUR_PUBLIC_IP> --print-plugin-config
+# Issue auto-renewing Let's Encrypt official bare-IP TLS certificate (requires TCP 80 open)
+./gateway.sh sync-ip
+
+# Print ready-to-paste OpenAI `dots` Remote MCP configuration snippets
+./gateway.sh config
 ```
 
 ---

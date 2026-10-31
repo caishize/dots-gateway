@@ -105,17 +105,19 @@ echo "==> [5/5] Updating ${GATEWAY_DIR}/config.json and restarting dots-gateway.
 (
   cd "${GATEWAY_DIR}"
   python3 -c '
+import sys
 from pathlib import Path
 from gateway.config import GatewayConfig
 
 cfg_path = Path("config.json")
 cfg = GatewayConfig.load(cfg_path)
+cfg.public_ip = sys.argv[1]
 cfg.tls_certfile = str(Path("certs_letsencrypt/fullchain.pem").resolve())
 cfg.tls_keyfile = str(Path("certs_letsencrypt/privkey.pem").resolve())
 cfg.tls_ca_file = None
 cfg.tls_require_client_cert = False
 cfg.save(cfg_path)
-'
+' "${TARGET_IP}"
 )
 systemctl --user restart dots-gateway.service
 sleep 1
