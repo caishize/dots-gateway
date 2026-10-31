@@ -461,7 +461,7 @@ class CommandPolicy:
                 real_base = os.path.basename(res)
                 is_allowed_toolchain_symlink = (
                     self.is_within_allowed_workdirs(lex)
-                    and res.startswith(("/usr/", "/bin/", "/opt/uv-python/"))
+                    and res.startswith(("/usr/", "/bin/", "/opt/uv-python/", "/opt/uv-tools/", "/opt/flutter/"))
                     and (
                         real_base in self._allowed_basenames
                         or bool(_VERSIONED_TOOL_RE.match(real_base))

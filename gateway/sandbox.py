@@ -106,7 +106,16 @@ def build_mount_ns_argv(
     sandbox_state = Path(home_dir) / ".cache" / "dots-sandbox"
     gh_cfg_dir = Path(home_dir) / ".config" / "gh"
     if not home_covered:
-        for sub in ("tmp", "cache", "npm", "local_share"):
+        for sub in (
+            "tmp",
+            "cache",
+            "npm",
+            "local_share",
+            "pub_cache",
+            "flutter_cfg",
+            "dart_tool",
+            "dart_server",
+        ):
             (sandbox_state / sub).mkdir(parents=True, exist_ok=True)
         os.chmod(sandbox_state, 0o700)
         gh_cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -151,11 +160,15 @@ def build_mount_ns_argv(
         q_mnt_home = shlex.quote(f"/mnt{home_dir}")
         lines.append(f"mkdir -p {q_mnt_home}")
 
-        # Persistent isolated caches so pip/uv/npm/go/playwright don't lose state or hit tmpfs limits
+        # Persistent isolated caches so pip/uv/npm/flutter/dart/go don't lose state or hit tmpfs limits
         for src_sub, dst_rel in (
             ("cache", ".cache"),
             ("npm", ".npm"),
             ("local_share", os.path.join(".local", "share")),
+            ("pub_cache", ".pub-cache"),
+            ("flutter_cfg", os.path.join(".config", "flutter")),
+            ("dart_tool", ".dart-tool"),
+            ("dart_server", ".dartServer"),
         ):
             q_src = shlex.quote(str(sandbox_state / src_sub))
             q_dst = shlex.quote(f"/mnt{os.path.join(home_dir, dst_rel)}")

@@ -78,6 +78,11 @@ DEFAULT_ALLOWED_COMMANDS: List[str] = [
     "vitest",
     "jest",
     "playwright",
+    # Flutter / Dart / Mobile & Infra tools
+    "flutter",
+    "dart",
+    "terraform",
+    "trivy",
     # Rust / Go / C / C++ / Build tools
     "cargo",
     "rustc",
