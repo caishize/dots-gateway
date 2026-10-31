@@ -56,6 +56,7 @@ class GatewayServer:
         )
 
     async def start(self) -> Tuple[str, int]:
+        self.config.ensure_workdirs()
         ssl_ctx: Optional[ssl.SSLContext] = None
         if self.config.tls_certfile and self.config.tls_keyfile:
             ssl_ctx = build_server_ssl_context(
@@ -268,8 +269,10 @@ class GatewayServer:
                     "allowed_workdirs": self.config.allowed_workdirs,
                     "protected_paths": self.config.protected_paths,
                     "default_workdir": self.config.default_workdir,
+                    "isolate_mount_namespace": self.config.isolate_mount_namespace,
                     "agy_binary": self.config.agy_binary,
                     "agy_default_skip_permissions": self.config.agy_default_skip_permissions,
+                    "agy_default_sandbox": self.config.agy_default_sandbox,
                 },
             )
             return

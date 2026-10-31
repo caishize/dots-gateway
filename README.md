@@ -34,6 +34,7 @@ OpenAI Cloud Machine (`dots`)                            Local Dev Machine (`~/g
 - `gateway/`
   - `mcp.py` — Full MCP JSON-RPC 2.0 dispatcher (`2024-11-05` / `2025-03-26` / `2025-06-18` / `2026-07-28`)
   - `server.py` — Streamable HTTP `/mcp`, REST/SSE `/v1/*`, and full-duplex WebSocket `/v1/ws` router
+  - `sandbox.py` — Unprivileged Linux User + Mount Namespace (`unshare` + `pivot_root` + `setpriv`) VFS workspace jail confining child processes strictly to `~/workspaces`
   - `tls.py`, `auth.py`, `policy.py`, `files.py`, `executor.py`, `protocol.py`, `config.py`
 
 ---

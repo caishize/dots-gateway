@@ -44,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hmac-secret", default=None, help="HMAC-SHA256 shared secret")
     parser.add_argument("--workdir", default=None, help="Default working directory")
     parser.add_argument(
+        "--allow-dir",
+        action="append",
+        default=None,
+        help="Allowed workspace root directory (repeatable; replaces defaults when provided)",
+    )
+    parser.add_argument(
         "--max-agy",
         type=int,
         default=None,
@@ -112,6 +118,9 @@ async def async_main() -> int:
     if args.workdir:
         cfg.default_workdir = args.workdir
         dirty = True
+    if args.allow_dir:
+        cfg.allowed_workdirs = [str(Path(d).expanduser()) for d in args.allow_dir if d.strip()]
+        dirty = True
     if args.max_agy is not None:
         cfg.max_concurrent_agy = max(1, int(args.max_agy))
         dirty = True
@@ -153,6 +162,7 @@ async def async_main() -> int:
             else:
                 cert_fp = compute_cert_sha256(cfg.tls_certfile)
 
+    cfg.ensure_workdirs()
     if dirty:
         cfg.save(cfg_path)
 
@@ -174,9 +184,10 @@ async def async_main() -> int:
         print(f"  TLS SHA256 Pin      : {cert_fp}")
     print(f"  Client IP Allowlist : {cfg.allowed_client_ips or 'ALL (authenticated)'}")
     print(f"  Default Workdir     : {cfg.default_workdir}")
+    print(f"  Allowed Workdirs    : {cfg.allowed_workdirs} (mount_ns={cfg.isolate_mount_namespace})")
     print(
         f"  Agy Binary          : {cfg.agy_binary} "
-        f"(skip_permissions={cfg.agy_default_skip_permissions}, max_concurrent_agy={cfg.max_concurrent_agy})"
+        f"(skip_permissions={cfg.agy_default_skip_permissions}, sandbox={cfg.agy_default_sandbox}, max_concurrent_agy={cfg.max_concurrent_agy})"
     )
     print("-" * 76)
     print(f"  Bearer API Token    : {cfg.api_tokens[0]}")

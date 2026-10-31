@@ -12,7 +12,13 @@ import unittest
 from pathlib import Path
 
 from dots_client import DotsGatewayClient
-from gateway.config import GATEWAY_ROOT, HOME_DIR, GatewayConfig, hash_password_pbkdf2
+from gateway.config import (
+    DEFAULT_WORKSPACE_DIR,
+    GATEWAY_ROOT,
+    HOME_DIR,
+    GatewayConfig,
+    hash_password_pbkdf2,
+)
 from gateway.server import GatewayServer
 from gateway.tls import ensure_tls_pki
 
@@ -28,7 +34,7 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
             hmac_secret="super-hmac-secret-key-abcdef",
             rate_limit_max_failures=5,
             rate_limit_window_seconds=60,
-            allowed_workdirs=[HOME_DIR, "/tmp"],
+            allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
         )
         self.server = GatewayServer(self.cfg)
@@ -352,6 +358,7 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(agy_res["returncode"], 0)
         self.assertIn("--dangerously-skip-permissions", agy_res["argv"])
+        self.assertIn("--sandbox", agy_res["argv"])
 
         async with client.connect_websocket() as ws:
             self.assertEqual(ws.welcome.get("type"), "connected")
@@ -414,6 +421,95 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn("ECHO:QUIT", collected_stdout)
             self.assertEqual(exit_code, 0)
+
+    async def test_workspace_jail_add_dirs_and_mount_namespace_isolation(self) -> None:
+        # 1. Verify hardened defaults confine gateway strictly to ~/workspaces
+        default_cfg = GatewayConfig()
+        self.assertEqual(default_cfg.default_workdir, DEFAULT_WORKSPACE_DIR)
+        self.assertEqual(default_cfg.allowed_workdirs, [DEFAULT_WORKSPACE_DIR])
+        self.assertTrue(default_cfg.isolate_mount_namespace)
+        self.assertTrue(default_cfg.agy_default_sandbox)
+        self.assertIn(str(GATEWAY_ROOT), default_cfg.protected_paths)
+
+        client = DotsGatewayClient(
+            base_url=self.base_url, token="test-secret-token-12345"
+        )
+
+        # 2. Validate add_dirs and raw args bypass blocking in run_agy
+        for bad_add_dir in [HOME_DIR, "/tmp", "/etc", str(GATEWAY_ROOT)]:
+            with self.assertRaises(RuntimeError) as ctx:
+                await asyncio.to_thread(
+                    client.run_agy,
+                    prompt=None,
+                    args=["--help"],
+                    add_dirs=[bad_add_dir],
+                )
+            self.assertIn("403", str(ctx.exception))
+
+        for bad_raw_arg in [
+            f"--add-dir={HOME_DIR}",
+            "--no-sandbox",
+            "--sandbox=false",
+            "--settings={}",
+            "--remote-control",
+        ]:
+            with self.assertRaises(RuntimeError) as ctx:
+                await asyncio.to_thread(
+                    client.run_agy,
+                    prompt=None,
+                    args=[bad_raw_arg, "--help"],
+                )
+            self.assertIn("403", str(ctx.exception))
+
+        extra_ws = Path(self.tmpdir) / "extra_ws"
+        extra_ws.mkdir()
+        ok_agy = await asyncio.to_thread(
+            client.run_agy,
+            prompt=None,
+            args=["--help"],
+            add_dirs=[str(extra_ws)],
+        )
+        self.assertEqual(ok_agy["returncode"], 0)
+        self.assertIn(str(extra_ws.resolve()), ok_agy["argv"])
+
+        # 3. CLI path arguments escaping allowed_workdirs or hitting gateway source are rejected (403)
+        for escape_cmd in [
+            f"cat {GATEWAY_ROOT / 'main.py'}",
+            "ls ~",
+            "ls /home",
+            "ls ..",
+            "cat ~/.bashrc",
+        ]:
+            with self.assertRaises(RuntimeError) as ctx:
+                await asyncio.to_thread(client.exec_command, escape_cmd, cwd=self.tmpdir)
+            self.assertIn("403", str(ctx.exception), f"Expected 403 for {escape_cmd}")
+
+        # 4. Kernel mount-namespace VFS jail hides ~/gateway, ~/.ssh, ~/.gemini, ~/.config from inline Python
+        probe_code = (
+            "import json, os\n"
+            "cap_eff = ''\n"
+            "for line in open('/proc/self/status'):\n"
+            "    if line.startswith('CapEff:'):\n"
+            "        cap_eff = line.split()[1]\n"
+            f"gw_exists = os.path.exists({str(GATEWAY_ROOT)!r})\n"
+            "ssh_exists = os.path.exists(os.path.expanduser('~/.ssh'))\n"
+            "gem_exists = os.path.exists(os.path.expanduser('~/.gemini'))\n"
+            "cfg_exists = os.path.exists(os.path.expanduser('~/.config/dots-gateway'))\n"
+            f"ws_exists = os.path.isdir({self.tmpdir!r})\n"
+            "print(json.dumps({'cap_eff': cap_eff, 'gw': gw_exists, 'ssh': ssh_exists, "
+            "'gem': gem_exists, 'cfg': cfg_exists, 'ws': ws_exists}))\n"
+        )
+        ns_res = await asyncio.to_thread(
+            client.exec_command, ["python3", "-c", probe_code], cwd=self.tmpdir
+        )
+        self.assertEqual(ns_res["returncode"], 0, ns_res["stderr"])
+        info = json.loads(ns_res["stdout"].strip())
+        self.assertEqual(info["cap_eff"], "0000000000000000")
+        self.assertFalse(info["gw"])
+        self.assertFalse(info["ssh"])
+        self.assertFalse(info["gem"])
+        self.assertFalse(info["cfg"])
+        self.assertTrue(info["ws"])
 
 
 if __name__ == "__main__":

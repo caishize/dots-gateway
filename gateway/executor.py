@@ -19,6 +19,7 @@ from typing import Any, AsyncIterator, Deque, Dict, List, Optional, Sequence, Tu
 
 from .config import GatewayConfig
 from .policy import CommandPolicy
+from .sandbox import build_mount_ns_argv
 
 STREAM_LINE_LIMIT = 16 * 1024 * 1024  # 16 MiB asyncio StreamReader buffer limit
 _STRIPPED_ENV_KEYS = {
@@ -89,10 +90,12 @@ class ExecutionSession:
         slot_sem: Optional[asyncio.Semaphore] = None,
         queue_timeout: float = 1800.0,
         is_agy: bool = False,
+        spawn_argv: Optional[List[str]] = None,
     ) -> None:
         self.session_id = session_id
         self.argv = argv
         self.shell_cmd = shell_cmd
+        self._spawn_argv = spawn_argv
         self.cwd = cwd
         self.env = env
         self.use_pty = use_pty
@@ -280,7 +283,18 @@ class ExecutionSession:
             stderr_arg = asyncio.subprocess.PIPE
 
         try:
-            if self.shell_cmd is not None:
+            if self._spawn_argv is not None:
+                self._proc = await asyncio.create_subprocess_exec(
+                    *self._spawn_argv,
+                    stdin=stdin_arg,
+                    stdout=stdout_arg,
+                    stderr=stderr_arg,
+                    cwd="/",
+                    env=self.env,
+                    start_new_session=True,
+                    limit=STREAM_LINE_LIMIT,
+                )
+            elif self.shell_cmd is not None:
                 bash_exe = "/bin/bash" if os.path.exists("/bin/bash") else None
                 self._proc = await asyncio.create_subprocess_shell(
                     self.shell_cmd,
@@ -703,6 +717,21 @@ class SessionManager:
             else:
                 shell_cmd = " ".join(shlex.quote(x) for x in decision.normalized_argv)
 
+        spawn_argv: Optional[List[str]] = None
+        if self.config.isolate_mount_namespace:
+            target_exec = (
+                ["/bin/bash", "-c", shell_cmd]
+                if shell_cmd is not None
+                else list(decision.normalized_argv)
+            )
+            spawn_argv = build_mount_ns_argv(
+                target_argv=target_exec,
+                cwd=decision.resolved_cwd,
+                allowed_workdirs=self.config.allowed_workdirs,
+                protected_paths=self.config.protected_paths,
+                is_agy=is_agy,
+            )
+
         self._cleanup_old_sessions()
         session_id = f"sess_{uuid.uuid4().hex[:16]}"
         session = ExecutionSession(
@@ -723,6 +752,7 @@ class SessionManager:
                 else float(queue_timeout)
             ),
             is_agy=is_agy,
+            spawn_argv=spawn_argv,
         )
         self._sessions[session_id] = session
         await session.start(initial_stdin=initial_stdin, close_stdin=close_stdin)

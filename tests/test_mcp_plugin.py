@@ -29,7 +29,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             port=0,
             api_tokens=["mcp-bearer-token-999"],
             hmac_secret="mcp-hmac-secret-888",
-            allowed_workdirs=[HOME_DIR, "/tmp"],
+            allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
             tls_certfile=self.pki["server_cert"],
             tls_keyfile=self.pki["server_key"],
@@ -394,9 +394,11 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         mock_agy = Path(self.tmpdir) / "mock_agy.py"
         mock_agy.write_text(
             "#!/usr/bin/env python3\n"
-            "import sys, time\n"
-            "time.sleep(0.25)\n"
-            "print('MOCK_AGY_DONE:' + ' '.join(sys.argv[1:]))\n",
+            "import json, sys, time\n"
+            "t0 = time.monotonic()\n"
+            "time.sleep(0.30)\n"
+            "t1 = time.monotonic()\n"
+            "print(json.dumps({'t0': t0, 't1': t1, 'argv': sys.argv[1:]}))\n",
             encoding="utf-8",
         )
         mock_agy.chmod(0o755)
@@ -405,7 +407,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             host="127.0.0.1",
             port=0,
             api_tokens=["par-tok"],
-            allowed_workdirs=["/tmp"],
+            allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
             agy_binary=str(mock_agy),
             allowed_commands=["python3", str(mock_agy)],
@@ -436,18 +438,28 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
                 assert resp is not None
                 return resp
 
-            t0 = asyncio.get_running_loop().time()
             results = await asyncio.gather(*(_call_one(i) for i in range(4)))
-            elapsed = asyncio.get_running_loop().time() - t0
 
+            spans = []
             for idx, r in enumerate(results):
                 self.assertFalse(r["result"]["isError"])
-                self.assertIn(
-                    f"TASK_{idx}",
-                    r["result"]["structuredContent"]["stdout"],
-                )
-            # 4 tasks x 0.25s with max_concurrent_agy=2 takes ~0.5s (2 waves), proving both parallelism & queueing
-            self.assertLess(elapsed, 0.95)
+                out = r["result"]["structuredContent"]["stdout"].strip()
+                self.assertIn(f"TASK_{idx}", out)
+                info = json.loads(out.splitlines()[-1])
+                spans.append((info["t0"], info["t1"]))
+
+            # Verify true overlap within a wave (>=2 concurrent) while respecting max_concurrent_agy=2 (<=2 concurrent)
+            events = []
+            for s, e in spans:
+                events.append((s, 1))
+                events.append((e, -1))
+            events.sort(key=lambda x: (x[0], x[1]))
+            cur = 0
+            peak = 0
+            for _, delta in events:
+                cur += delta
+                peak = max(peak, cur)
+            self.assertEqual(peak, 2, f"Expected peak concurrency of 2, spans={spans}")
             self.assertTrue(
                 any("[queued]" in n.get("params", {}).get("message", "") for n in seen_notifs),
                 f"Expected queued progress notification in {seen_notifs}",

@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 
 GATEWAY_ROOT: Path = Path(__file__).resolve().parent.parent
 HOME_DIR: str = str(Path.home())
+DEFAULT_WORKSPACE_DIR: str = str(Path.home() / "workspaces")
 DEFAULT_AGY_BIN: str = shutil.which("agy") or str(Path.home() / ".local" / "bin" / "agy")
 
 
@@ -229,12 +230,19 @@ DEFAULT_BLOCKED_PATTERNS: List[str] = [
 ]
 
 DEFAULT_PROTECTED_PATHS: List[str] = [
+    str(GATEWAY_ROOT),
     str(GATEWAY_ROOT / "config.json"),
     str(GATEWAY_ROOT / "client.json"),
     str(GATEWAY_ROOT / "certs"),
-    str(Path.home() / ".config" / "dots-gateway"),
+    str(Path.home() / "oh-my-agents"),
+    str(Path.home() / ".config"),
+    str(Path.home() / ".gemini"),
     str(Path.home() / ".ssh"),
     str(Path.home() / ".gnupg"),
+    str(Path.home() / ".local"),
+    str(Path.home() / ".bashrc"),
+    str(Path.home() / ".profile"),
+    str(Path.home() / ".bash_profile"),
 ]
 
 
@@ -302,12 +310,14 @@ class GatewayConfig:
     allowed_commands: List[str] = field(default_factory=lambda: list(DEFAULT_ALLOWED_COMMANDS))
     blocked_commands: List[str] = field(default_factory=lambda: list(DEFAULT_BLOCKED_COMMANDS))
     blocked_patterns: List[str] = field(default_factory=lambda: list(DEFAULT_BLOCKED_PATTERNS))
-    allowed_workdirs: List[str] = field(default_factory=lambda: [HOME_DIR, "/tmp"])
+    allowed_workdirs: List[str] = field(default_factory=lambda: [DEFAULT_WORKSPACE_DIR])
     protected_paths: List[str] = field(default_factory=lambda: list(DEFAULT_PROTECTED_PATHS))
-    default_workdir: str = HOME_DIR
+    default_workdir: str = DEFAULT_WORKSPACE_DIR
+    isolate_mount_namespace: bool = True
     # Antigravity (agy) specific settings
     agy_binary: str = DEFAULT_AGY_BIN
     agy_default_skip_permissions: bool = True
+    agy_default_sandbox: bool = True
     max_concurrent_agy: int = field(default_factory=detect_recommended_max_agy)
     agy_queue_timeout_seconds: float = 1800.0
     # Execution, connection & memory limits
@@ -360,8 +370,24 @@ class GatewayConfig:
             ]
         if os.environ.get("GATEWAY_WORKDIR"):
             cfg.default_workdir = os.environ["GATEWAY_WORKDIR"]
+        if os.environ.get("GATEWAY_ALLOW_DIRS"):
+            cfg.allowed_workdirs = [
+                x.strip() for x in os.environ["GATEWAY_ALLOW_DIRS"].split(",") if x.strip()
+            ]
+        if os.environ.get("GATEWAY_MOUNT_NS"):
+            cfg.isolate_mount_namespace = os.environ["GATEWAY_MOUNT_NS"].strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
         if os.environ.get("GATEWAY_AGY_BIN"):
             cfg.agy_binary = os.environ["GATEWAY_AGY_BIN"]
+        if os.environ.get("GATEWAY_AGY_SANDBOX"):
+            cfg.agy_default_sandbox = os.environ["GATEWAY_AGY_SANDBOX"].strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
         if os.environ.get("GATEWAY_MAX_AGY"):
             cfg.max_concurrent_agy = max(1, int(os.environ["GATEWAY_MAX_AGY"]))
         if os.environ.get("GATEWAY_TLS_CERT"):
@@ -374,6 +400,14 @@ class GatewayConfig:
             cfg.tls_require_client_cert = True
 
         return cfg
+
+    def ensure_workdirs(self) -> None:
+        """Ensure configured workspace root directories exist on disk."""
+        for raw_dir in self.allowed_workdirs:
+            p = Path(raw_dir).expanduser()
+            p.mkdir(parents=True, exist_ok=True)
+        def_p = Path(self.default_workdir).expanduser()
+        def_p.mkdir(parents=True, exist_ok=True)
 
     def save(self, save_path: Path) -> None:
         """Persist configuration JSON atomically with 0600 permissions."""

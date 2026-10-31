@@ -309,8 +309,6 @@ class CommandPolicy:
             if not cand.is_absolute():
                 cand = Path(resolved_cwd) / cand
             lex_abs = os.path.abspath(str(cand))
-            if self.is_protected_path(lex_abs):
-                return False, f"Executable '{exe}' resides in a protected path"
 
             try:
                 real_str = str(cand.resolve())
@@ -321,11 +319,12 @@ class CommandPolicy:
 
             if real_base in self._blocked_basenames or real_str in self.config.blocked_commands:
                 return False, f"Executable '{exe}' resolves to blocked binary '{real_base}'"
-            if self.is_protected_path(real_str):
-                return False, f"Executable '{exe}' resolves to a protected path"
 
             if exe in self._allowed_fullpaths or real_str in self._allowed_fullpaths:
                 return True, ""
+
+            if self.is_protected_path(lex_abs) or self.is_protected_path(real_str):
+                return False, f"Executable '{exe}' resides in a protected path"
 
             # Workspace-local script, compiled binary, or virtualenv entrypoint
             if self.is_within_allowed_workdirs(lex_abs):
@@ -383,8 +382,25 @@ class CommandPolicy:
     def _check_protected_arguments(
         self, tokens: Sequence[str], resolved_cwd: str
     ) -> Tuple[bool, str]:
-        """Block direct CLI arguments targeting protected paths (e.g. gateway config/keys or ~/.ssh)."""
-        for tok in tokens[1:]:
+        """Block CLI arguments targeting protected paths or escaping allowed_workdirs."""
+        tok_list = list(tokens)
+        for idx, tok in enumerate(tok_list[1:], start=1):
+            if tok in ("--no-sandbox", "--sandbox=false", "--sandbox=0", "--remote-control") or tok.startswith(
+                ("--settings=", "--remote-control=")
+            ) or tok == "--settings":
+                return False, f"Flag '{tok}' is forbidden in command execution"
+            if tok == "--add-dir":
+                if idx + 1 >= len(tok_list):
+                    return False, "Missing directory path after '--add-dir'"
+                ok_ad, err_ad, _ = self.validate_workdir(tok_list[idx + 1])
+                if not ok_ad:
+                    return False, err_ad
+                continue
+            if tok.startswith("--add-dir="):
+                ok_ad, err_ad, _ = self.validate_workdir(tok.split("=", 1)[1])
+                if not ok_ad:
+                    return False, err_ad
+                continue
             candidates = [tok]
             if tok.startswith("-") and "=" in tok:
                 candidates = [tok.split("=", 1)[1]]
@@ -392,25 +408,64 @@ class CommandPolicy:
                 continue
 
             for val in candidates:
-                if not val:
+                if not val or "://" in val or val.startswith("git@"):
                     continue
-                if any(
-                    marker in val
-                    for marker in ("config.json", "/certs", ".ssh", ".gnupg")
+                looks_like_path = (
+                    "/" in val
+                    or val.startswith("~")
+                    or val in ("..", ".")
+                    or any(
+                        marker in val
+                        for marker in (
+                            "config.json",
+                            "client.json",
+                            "/certs",
+                            ".ssh",
+                            ".gnupg",
+                            ".gemini",
+                            ".config",
+                            ".bashrc",
+                            ".profile",
+                        )
+                    )
+                )
+                if not looks_like_path:
+                    continue
+                try:
+                    p = Path(val).expanduser()
+                    if not p.is_absolute():
+                        p = Path(resolved_cwd) / p
+                    lex = os.path.abspath(str(p))
+                    res = str(p.resolve())
+                except Exception:
+                    continue
+
+                if self.is_protected_path(lex) or self.is_protected_path(res):
+                    return (
+                        False,
+                        f"Argument '{val}' targets a protected gateway/credential path",
+                    )
+
+                # Block home-directory, /root, or parent-traversal ('..') escapes outside allowed_workdirs
+                is_escape_target = (
+                    val == "~"
+                    or val.startswith("~/")
+                    or val.startswith("/home/")
+                    or val == "/home"
+                    or val.startswith("/root")
+                    or val == ".."
+                    or val.startswith("../")
+                    or "/../" in val
+                    or val.endswith("/..")
+                )
+                if is_escape_target and (
+                    not self.is_within_allowed_workdirs(lex)
+                    or not self.is_within_allowed_workdirs(res)
                 ):
-                    try:
-                        p = Path(val).expanduser()
-                        if not p.is_absolute():
-                            p = Path(resolved_cwd) / p
-                        lex = os.path.abspath(str(p))
-                        res = str(p.resolve())
-                        if self.is_protected_path(lex) or self.is_protected_path(res):
-                            return (
-                                False,
-                                f"Argument '{val}' targets a protected gateway/credential path",
-                            )
-                    except Exception:
-                        pass
+                    return (
+                        False,
+                        f"Argument '{val}' resolves outside allowed workspace roots {self.config.allowed_workdirs}",
+                    )
         return True, ""
 
     def validate_command(
@@ -539,6 +594,7 @@ class CommandPolicy:
         prompt: Optional[str] = None,
         args: Optional[Sequence[str]] = None,
         skip_permissions: Optional[bool] = None,
+        sandbox: Optional[bool] = None,
         print_mode: bool = True,
         output_format: Optional[str] = None,
         input_format: Optional[str] = None,
@@ -549,7 +605,7 @@ class CommandPolicy:
         continue_last: bool = False,
         add_dirs: Optional[Sequence[str]] = None,
     ) -> List[str]:
-        """Construct a validated `agy` CLI invocation list."""
+        """Construct a validated `agy` CLI invocation list confined to allowed_workdirs."""
         agy_bin = (
             self.config.agy_binary
             if os.path.exists(self.config.agy_binary)
@@ -562,10 +618,33 @@ class CommandPolicy:
             if skip_permissions is None
             else skip_permissions
         )
+        use_sandbox = (
+            self.config.agy_default_sandbox if sandbox is None else bool(sandbox)
+        )
         extra = [str(a) for a in (args or [])]
+
+        for raw_arg in extra:
+            if raw_arg == "--add-dir" or raw_arg.startswith("--add-dir="):
+                raise PermissionError(
+                    "Raw '--add-dir' in args is forbidden; pass 'add_dirs' for workspace validation"
+                )
+            if raw_arg == "--settings" or raw_arg.startswith("--settings="):
+                raise PermissionError(
+                    "Raw '--settings' override in args is forbidden by gateway security policy"
+                )
+            if raw_arg == "--remote-control" or raw_arg.startswith("--remote-control="):
+                raise PermissionError(
+                    "Raw '--remote-control' flag in args is forbidden by gateway security policy"
+                )
+            if raw_arg in ("--no-sandbox", "--sandbox=false", "--sandbox=0"):
+                raise PermissionError(
+                    "Disabling '--sandbox' via raw args is forbidden by gateway security policy"
+                )
 
         if use_skip and "--dangerously-skip-permissions" not in extra:
             argv.append("--dangerously-skip-permissions")
+        if use_sandbox and "--sandbox" not in extra:
+            argv.append("--sandbox")
 
         if model and "--model" not in extra:
             argv.extend(["--model", model])
@@ -580,7 +659,10 @@ class CommandPolicy:
 
         if add_dirs:
             for d in add_dirs:
-                argv.extend(["--add-dir", str(d)])
+                ok_dir, dir_err, resolved_dir = self.validate_workdir(str(d))
+                if not ok_dir:
+                    raise PermissionError(dir_err)
+                argv.extend(["--add-dir", resolved_dir])
 
         if input_format and "--input-format" not in extra:
             argv.extend(["--input-format", input_format])

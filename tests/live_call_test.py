@@ -27,7 +27,7 @@ if str(ROOT_DIR) not in sys.path:
 from dots_client import DotsGatewayClient
 from gateway.tls import compute_cert_sha256
 
-DEMO_WORKDIR = "/tmp/dots_live_demo"
+DEMO_WORKDIR = str(Path.home() / "workspaces" / ".live_demo")
 
 
 def banner(title: str) -> None:
