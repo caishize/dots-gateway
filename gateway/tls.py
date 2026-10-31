@@ -46,7 +46,7 @@ def compute_cert_sha256(cert_pem_path: str | Path) -> str:
 
 
 def _cert_contains_all_targets(cert_path: Path, targets: Sequence[str]) -> bool:
-    """Check whether an existing certificate's text representation already includes all SAN targets."""
+    """Check whether an existing certificate's X.509 SAN already includes all DNS/IP targets."""
     if not cert_path.exists():
         return False
     try:
@@ -57,10 +57,27 @@ def _cert_contains_all_targets(cert_path: Path, targets: Sequence[str]) -> bool:
             timeout=5.0,
             check=True,
         )
-        san_out = proc.stdout
+        present_dns: set[str] = set()
+        present_ips: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+        for line in proc.stdout.splitlines():
+            for entry in line.split(","):
+                item = entry.strip()
+                if item.startswith("DNS:"):
+                    present_dns.add(item[4:].strip().lower())
+                elif item.startswith("IP Address:"):
+                    raw_ip = item[11:].strip()
+                    try:
+                        present_ips.add(ipaddress.ip_address(raw_ip))
+                    except ValueError:
+                        pass
+
         for t in targets:
-            if t not in san_out:
-                return False
+            try:
+                if ipaddress.ip_address(t) not in present_ips:
+                    return False
+            except ValueError:
+                if t.strip().lower() not in present_dns:
+                    return False
         return True
     except Exception:
         return False
@@ -162,8 +179,10 @@ def ensure_tls_pki(
 
         san_entries = [f"DNS:{d}" for d in dns_names] + [f"IP:{i}" for i in ip_addrs]
         san_line = ",".join(san_entries)
-        csr_path = cdir / "server.csr"
-        ext_path = cdir / "server_ext.cnf"
+        pid_tag = f"{os.getpid()}"
+        csr_path = cdir / f"server.{pid_tag}.csr"
+        ext_path = cdir / f"server_ext.{pid_tag}.cnf"
+        tmp_crt = cdir / f"server.{pid_tag}.crt"
         ext_path.write_text(
             f"basicConstraints = critical, CA:FALSE\n"
             f"keyUsage = critical, digitalSignature, keyEncipherment\n"
@@ -199,15 +218,17 @@ def ensure_tls_pki(
                     str(ca_key),
                     "-CAcreateserial",
                     "-out",
-                    str(server_crt),
+                    str(tmp_crt),
                     "-extfile",
                     str(ext_path),
                 ]
             )
-            os.chmod(server_crt, 0o644)
+            os.chmod(tmp_crt, 0o644)
+            os.replace(tmp_crt, server_crt)
         finally:
             csr_path.unlink(missing_ok=True)
             ext_path.unlink(missing_ok=True)
+            tmp_crt.unlink(missing_ok=True)
 
     # 3. Client mTLS certificate (ready for `tls_require_client_cert: true`)
     if not client_key.exists() or not client_crt.exists():
