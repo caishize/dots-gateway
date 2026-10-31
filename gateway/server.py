@@ -143,6 +143,7 @@ class GatewayServer:
                         204,
                         extra_headers={
                             "Allow": "POST, DELETE, OPTIONS",
+                            "Access-Control-Allow-Origin": "*",
                             "Access-Control-Allow-Methods": "POST, DELETE, OPTIONS",
                             "Access-Control-Allow-Headers": (
                                 "Authorization, Content-Type, Accept, Mcp-Session-Id, "

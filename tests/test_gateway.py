@@ -511,6 +511,74 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(info["cfg"])
         self.assertTrue(info["ws"])
 
+    async def test_fullchain_fingerprint_and_tls_hot_reload(self) -> None:
+        import time
+        from gateway.tls import compute_cert_sha256
+
+        pki_dir1 = Path(self.tmpdir) / "pki_1"
+        pki_dir2 = Path(self.tmpdir) / "pki_2"
+        pki1 = ensure_tls_pki(pki_dir1, extra_hosts=["127.0.0.1"])
+        pki2 = ensure_tls_pki(pki_dir2, extra_hosts=["127.0.0.1"])
+        self.assertNotEqual(pki1["server_fingerprint_sha256"], pki2["server_fingerprint_sha256"])
+
+        live_dir = Path(self.tmpdir) / "live_cert"
+        live_dir.mkdir(parents=True, exist_ok=True)
+        fullchain = live_dir / "fullchain.pem"
+        privkey = live_dir / "privkey.pem"
+
+        # Multi-PEM bundle (leaf + CA cert), matching Let's Encrypt fullchain.pem layout
+        fullchain.write_text(
+            Path(pki1["server_cert"]).read_text(encoding="utf-8")
+            + "\n"
+            + Path(pki1["ca_cert"]).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        privkey.write_text(Path(pki1["server_key"]).read_text(encoding="utf-8"), encoding="utf-8")
+        self.assertEqual(compute_cert_sha256(fullchain), pki1["server_fingerprint_sha256"])
+
+        rot_cfg = GatewayConfig(
+            host="127.0.0.1",
+            port=0,
+            api_tokens=["rot-tok"],
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            tls_certfile=str(fullchain),
+            tls_keyfile=str(privkey),
+        )
+        rot_srv = GatewayServer(rot_cfg)
+        h, p = await rot_srv.start()
+        try:
+            c1 = DotsGatewayClient(
+                base_url=f"https://{h}:{p}",
+                token="rot-tok",
+                tls_fingerprint=pki1["server_fingerprint_sha256"],
+            )
+            r1 = await asyncio.to_thread(c1.health)
+            self.assertTrue(r1["ok"])
+
+            # Rotate cert & key on disk without restarting GatewayServer
+            fullchain.write_text(
+                Path(pki2["server_cert"]).read_text(encoding="utf-8")
+                + "\n"
+                + Path(pki2["ca_cert"]).read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            privkey.write_text(
+                Path(pki2["server_key"]).read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            os.utime(fullchain, (time.time() + 5, time.time() + 5))
+            os.utime(privkey, (time.time() + 5, time.time() + 5))
+
+            c2 = DotsGatewayClient(
+                base_url=f"https://{h}:{p}",
+                token="rot-tok",
+                tls_fingerprint=pki2["server_fingerprint_sha256"],
+            )
+            r2 = await asyncio.to_thread(c2.health)
+            self.assertTrue(r2["ok"])
+        finally:
+            await rot_srv.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

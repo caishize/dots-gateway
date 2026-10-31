@@ -38,9 +38,22 @@ def discover_local_ips() -> List[str]:
     return ips
 
 
+def _extract_leaf_pem(pem_text: str) -> str:
+    """Extract the first X.509 certificate PEM block (supports multi-cert fullchain.pem)."""
+    begin_marker = "-----BEGIN CERTIFICATE-----"
+    end_marker = "-----END CERTIFICATE-----"
+    start = pem_text.find(begin_marker)
+    if start == -1:
+        return pem_text
+    end = pem_text.find(end_marker, start)
+    if end == -1:
+        return pem_text
+    return pem_text[start : end + len(end_marker)] + "\n"
+
+
 def compute_cert_sha256(cert_pem_path: str | Path) -> str:
-    """Return lowercase hex SHA-256 fingerprint of the DER-encoded X.509 certificate."""
-    pem_text = Path(cert_pem_path).read_text(encoding="utf-8")
+    """Return lowercase hex SHA-256 fingerprint of the leaf DER-encoded X.509 certificate."""
+    pem_text = _extract_leaf_pem(Path(cert_pem_path).read_text(encoding="utf-8"))
     der_bytes = ssl.PEM_cert_to_DER_cert(pem_text)
     return hashlib.sha256(der_bytes).hexdigest()
 
@@ -294,13 +307,12 @@ def ensure_tls_pki(
     }
 
 
-def build_server_ssl_context(
+def _create_single_server_ssl_context(
     certfile: str,
     keyfile: str,
     cafile: Optional[str] = None,
     require_client_cert: bool = False,
 ) -> ssl.SSLContext:
-    """Create a hardened TLS 1.2+/1.3 server SSLContext, optionally enforcing mTLS."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.options |= ssl.OP_NO_COMPRESSION
@@ -313,3 +325,55 @@ def build_server_ssl_context(
     else:
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
+
+def build_server_ssl_context(
+    certfile: str,
+    keyfile: str,
+    cafile: Optional[str] = None,
+    require_client_cert: bool = False,
+) -> ssl.SSLContext:
+    """Create a hardened TLS 1.2+/1.3 server SSLContext with automatic cert hot-reload on renewal."""
+    primary_ctx = _create_single_server_ssl_context(
+        certfile=certfile,
+        keyfile=keyfile,
+        cafile=cafile,
+        require_client_cert=require_client_cert,
+    )
+
+    def _stat_pair() -> Tuple[int, int]:
+        return (os.stat(certfile).st_mtime_ns, os.stat(keyfile).st_mtime_ns)
+
+    state: Dict[str, object] = {
+        "mtimes": _stat_pair(),
+        "active_ctx": primary_ctx,
+    }
+
+    def _sni_hot_reload(
+        ssl_sock: ssl.SSLSocket, _server_name: Optional[str], _initial_ctx: ssl.SSLContext
+    ) -> None:
+        try:
+            cur_mtimes = _stat_pair()
+            if cur_mtimes != state["mtimes"]:
+                fresh_ctx = _create_single_server_ssl_context(
+                    certfile=certfile,
+                    keyfile=keyfile,
+                    cafile=cafile,
+                    require_client_cert=require_client_cert,
+                )
+                state["active_ctx"] = fresh_ctx
+                state["mtimes"] = cur_mtimes
+            active = state["active_ctx"]
+            if active is not primary_ctx and isinstance(active, ssl.SSLContext):
+                ssl_sock.context = active
+        except Exception:
+            # Keep serving with last known-good SSLContext if renewal write is mid-flight
+            active = state["active_ctx"]
+            if active is not primary_ctx and isinstance(active, ssl.SSLContext):
+                try:
+                    ssl_sock.context = active
+                except Exception:
+                    pass
+
+    primary_ctx.sni_callback = _sni_hot_reload
+    return primary_ctx

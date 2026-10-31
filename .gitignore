@@ -2,6 +2,7 @@
 config.json
 client.json
 certs/
+certs_letsencrypt/
 *.key
 *.pem
 *.csr
