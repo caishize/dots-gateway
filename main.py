@@ -201,7 +201,13 @@ async def async_main() -> int:
 
     if args.print_plugin_config:
         target_host = cfg.public_ip or "<YOUR_PUBLIC_IP>"
+        sslip_host = (
+            f"{cfg.public_ip.replace('.', '-')}.sslip.io"
+            if cfg.public_ip and cfg.public_ip.count(".") == 3
+            else target_host
+        )
         base_url = f"{scheme}://{target_host}:{cfg.port}"
+        dns_base_url = f"{scheme}://{sslip_host}:{cfg.port}"
         client_json = {
             "url": base_url,
             "hmac_secret": cfg.hmac_secret,
@@ -212,18 +218,18 @@ async def async_main() -> int:
             "mcpServers": {
                 "dots-gateway": {
                     "type": "streamable-http",
-                    "url": f"{base_url}/mcp",
+                    "url": f"{dns_base_url}/mcp",
                     "headers": {
                         "Authorization": f"Bearer {cfg.api_tokens[0]}",
                     },
                 }
             }
         }
-        print("\n[方式 1 · 推荐] dots 选择「OAuth」认证:")
-        print(f"  MCP Server URL : {base_url}/mcp")
-        print("  (Client ID / Client Secret 可留空自动注册；浏览器弹窗时粘贴上方 Bearer API Token 一次即可自动续期)")
-        print("\n[方式 2 · 免弹窗一键直连] dots 选择「无需身份认证」(内置 256 位加密路径密钥保护):")
-        print(f"  MCP Server URL : {base_url}/mcp/{cfg.api_tokens[0]}")
+        print("\n[方式 1 · 推荐] dots 选择「OAuth」认证 (使用域名避免云端拦截裸 IP):")
+        print(f"  MCP Server URL    : {dns_base_url}/mcp")
+        print(f"  (如提示手动输入 OAuth 设置: Authorization URL = {dns_base_url}/oauth/authorize , Token URL = {dns_base_url}/oauth/token , Client ID = dots-client , Scope = mcp)")
+        print("\n[方式 2 · 最稳免弹窗一键直连] dots 选择「无需身份认证」(内置 256 位加密路径密钥保护):")
+        print(f"  MCP Server URL    : {dns_base_url}/mcp/{cfg.api_tokens[0]}")
         print("\n[方式 3] 标准 Streamable HTTP MCP JSON (支持自定义 Header 的客户端):")
         print(json.dumps(remote_mcp_json, indent=2, ensure_ascii=False))
         print("\n[方式 4] 本地 stdio 桥接插件配置 (`~/.config/dots-gateway/client.json`):")

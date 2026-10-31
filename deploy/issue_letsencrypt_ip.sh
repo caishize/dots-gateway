@@ -20,7 +20,9 @@ if [[ -z "${TARGET_IP}" ]]; then
   exit 1
 fi
 
-echo "==> [1/5] Preparing acme.sh for IP ${TARGET_IP} ..."
+SSLIP_DOMAIN="${TARGET_IP//./-}.sslip.io"
+
+echo "==> [1/5] Preparing acme.sh for ${SSLIP_DOMAIN} & ${TARGET_IP} ..."
 sudo env -u SUDO_USER -u SUDO_UID -u SUDO_GID -u SUDO_COMMAND bash -c '
   set -euo pipefail
   if [[ ! -x "'"${ACME_HOME}"'/acme.sh" ]]; then
@@ -35,18 +37,18 @@ echo "==> [2/5] Running Let'\''s Encrypt Staging preflight check on TCP port 80 
 sudo env -u SUDO_USER -u SUDO_UID -u SUDO_GID -u SUDO_COMMAND \
   "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" \
   --issue --server letsencrypt_test \
-  -d "${TARGET_IP}" \
+  -d "${SSLIP_DOMAIN}" -d "${TARGET_IP}" \
   --standalone \
   --cert-profile shortlived \
   --keylength ec-256 \
   --days 3 \
   --force
 
-echo "==> [3/5] Staging check succeeded! Issuing Production Let'\''s Encrypt IP certificate ..."
+echo "==> [3/5] Staging check succeeded! Issuing Production Let'\''s Encrypt certificate (${SSLIP_DOMAIN} + ${TARGET_IP}) ..."
 sudo env -u SUDO_USER -u SUDO_UID -u SUDO_GID -u SUDO_COMMAND \
   "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" \
   --issue --server letsencrypt \
-  -d "${TARGET_IP}" \
+  -d "${SSLIP_DOMAIN}" -d "${TARGET_IP}" \
   --standalone \
   --cert-profile shortlived \
   --keylength ec-256 \
@@ -69,7 +71,7 @@ chmod 755 "${RELOAD_SCRIPT}"
 
 sudo env -u SUDO_USER -u SUDO_UID -u SUDO_GID -u SUDO_COMMAND \
   "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" \
-  --install-cert -d "${TARGET_IP}" --ecc \
+  --install-cert -d "${SSLIP_DOMAIN}" --ecc \
   --fullchain-file "${CERT_OUT_DIR}/fullchain.pem" \
   --key-file "${CERT_OUT_DIR}/privkey.pem" \
   --reloadcmd "${RELOAD_SCRIPT}"

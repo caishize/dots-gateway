@@ -111,13 +111,17 @@ cmd_status() {
   local scheme="http"
   [[ -n "${cert}" ]] && scheme="https"
   local display_ip="${cfg_ip:-${live_ip:-127.0.0.1}}"
+  local display_host="${display_ip}"
+  if [[ "${display_ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "${display_ip}" != "127.0.0.1" ]]; then
+    display_host="${display_ip//./-}.sslip.io"
+  fi
 
   echo "============================================================================"
   echo "  Dots Gateway Service Status"
   echo "============================================================================"
   echo "  Service Unit     : ${SERVICE_NAME} (${state})"
   echo "  Main PID / RAM   : ${pid} (${mem_mib})"
-  echo "  Remote MCP URL   : ${scheme}://${display_ip}:${port}/mcp"
+  echo "  Remote MCP URL   : ${scheme}://${display_host}:${port}/mcp"
   echo "  Public IP        : configured=${cfg_ip:-<unset>} | live=${live_ip:-<unknown>}"
   echo "  Workspace Jail   : ${wdir} (mount_ns=${mns}, agy_sandbox=${sbx})"
 

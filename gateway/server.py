@@ -138,6 +138,16 @@ class GatewayServer:
                 parsed = urlparse(req.path)
                 path = parsed.path
                 query = parse_qs(parsed.query)
+                safe_path = "/mcp/<redacted>" if extract_mcp_path_token(path) else path
+                if path != "/v1/health":
+                    logger.info(
+                        "HTTP %s %s from %s (Host=%s, UA=%s)",
+                        req.method,
+                        safe_path,
+                        client_ip,
+                        req.headers.get("host", "-"),
+                        req.headers.get("user-agent", "-")[:80],
+                    )
 
                 # CORS / preflight on MCP and OAuth discovery/token endpoints
                 if req.method == "OPTIONS" and (
