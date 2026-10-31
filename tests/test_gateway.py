@@ -484,7 +484,8 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.to_thread(client.exec_command, escape_cmd, cwd=self.tmpdir)
             self.assertIn("403", str(ctx.exception), f"Expected 403 for {escape_cmd}")
 
-        # 4. Kernel mount-namespace VFS jail hides ~/gateway, ~/.ssh, ~/.gemini, ~/.config from inline Python
+        # 4. Kernel mount-namespace VFS jail hides ~/gateway, ~/.ssh, ~/.gemini, ~/.config/dots-gateway
+        #    while preserving ~/.config/gh and persistent sandbox ~/.cache across separate commands
         probe_code = (
             "import json, os\n"
             "cap_eff = ''\n"
@@ -495,9 +496,12 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
             "ssh_exists = os.path.exists(os.path.expanduser('~/.ssh'))\n"
             "gem_exists = os.path.exists(os.path.expanduser('~/.gemini'))\n"
             "cfg_exists = os.path.exists(os.path.expanduser('~/.config/dots-gateway'))\n"
+            "gh_exists = os.path.isdir(os.path.expanduser('~/.config/gh'))\n"
             f"ws_exists = os.path.isdir({self.tmpdir!r})\n"
+            "marker = os.path.expanduser('~/.cache/_unit_persist_probe')\n"
+            "open(marker, 'w').write('ok123')\n"
             "print(json.dumps({'cap_eff': cap_eff, 'gw': gw_exists, 'ssh': ssh_exists, "
-            "'gem': gem_exists, 'cfg': cfg_exists, 'ws': ws_exists}))\n"
+            "'gem': gem_exists, 'cfg': cfg_exists, 'gh': gh_exists, 'ws': ws_exists}))\n"
         )
         ns_res = await asyncio.to_thread(
             client.exec_command, ["python3", "-c", probe_code], cwd=self.tmpdir
@@ -509,7 +513,21 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(info["ssh"])
         self.assertFalse(info["gem"])
         self.assertFalse(info["cfg"])
+        self.assertTrue(info["gh"])
         self.assertTrue(info["ws"])
+
+        # Second separate command verifies sandbox ~/.cache persisted across VFS invocations
+        ns_res2 = await asyncio.to_thread(
+            client.exec_command,
+            [
+                "python3",
+                "-c",
+                "import os; m=os.path.expanduser('~/.cache/_unit_persist_probe'); print(open(m).read()); os.remove(m)",
+            ],
+            cwd=self.tmpdir,
+        )
+        self.assertEqual(ns_res2["returncode"], 0, ns_res2["stderr"])
+        self.assertEqual(ns_res2["stdout"].strip(), "ok123")
 
     async def test_fullchain_fingerprint_and_tls_hot_reload(self) -> None:
         import time

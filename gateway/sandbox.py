@@ -2,8 +2,10 @@
 
 Isolates `exec_command` and `run_agy` child processes at the kernel VFS layer so that
 directories outside `allowed_workdirs` (such as `~/gateway`, `~/.ssh`, `~/.gnupg`,
-`~/.config/dots-gateway`, `~/.config/systemd`, `~/.config/gh`, `~/oh-my-agents`, and
-host `/tmp`) do not exist inside the child process's filesystem tree.
+`~/.aliyun`, `~/.config/dots-gateway`, `~/.config/tunnel-client`, `~/.config/systemd`,
+`~/oh-my-agents`, and host `/tmp`) do not exist inside the child process's filesystem tree,
+while selectively exposing `~/.config/gh`, read-only `~/.gitconfig` & `~/.local/bin`, and
+persistent isolated sandbox caches (`~/.cache/dots-sandbox`).
 """
 
 from __future__ import annotations
@@ -101,8 +103,15 @@ def build_mount_ns_argv(
     home_dir = str(Path.home().resolve())
     home_covered = _is_covered_by_roots(home_dir, allowed_roots)
 
-    if is_agy and not home_covered:
-        (Path(home_dir) / ".config" / "antigravity").mkdir(parents=True, exist_ok=True)
+    sandbox_state = Path(home_dir) / ".cache" / "dots-sandbox"
+    gh_cfg_dir = Path(home_dir) / ".config" / "gh"
+    if not home_covered:
+        for sub in ("tmp", "cache", "npm", "local_share"):
+            (sandbox_state / sub).mkdir(parents=True, exist_ok=True)
+        os.chmod(sandbox_state, 0o700)
+        gh_cfg_dir.mkdir(parents=True, exist_ok=True)
+        if is_agy:
+            (Path(home_dir) / ".config" / "antigravity").mkdir(parents=True, exist_ok=True)
 
     q_mount = shlex.quote(mount_bin)
     q_umount = shlex.quote(umount_bin)
@@ -124,6 +133,13 @@ def build_mount_ns_argv(
         "chmod 1777 /mnt/tmp",
     ]
 
+    # Back /tmp by persistent isolated disk dir when allowed_roots are outside /tmp
+    # (prevents 64m tmpfs ENOSPC on large pip/npm/cargo builds while hiding host /tmp)
+    if not home_covered and not any(w == "/tmp" or w.startswith("/tmp/") for w in allowed_roots):
+        q_sb_tmp = shlex.quote(str(sandbox_state / "tmp"))
+        lines.append(f"{q_mount} --rbind {q_sb_tmp} /mnt/tmp")
+        lines.append("chmod 1777 /mnt/tmp 2>/dev/null || true")
+
     # Bind-mount each explicitly allowed workspace directory read-write
     for wdir in allowed_roots:
         q_wdir = shlex.quote(wdir)
@@ -134,6 +150,21 @@ def build_mount_ns_argv(
     if not home_covered:
         q_mnt_home = shlex.quote(f"/mnt{home_dir}")
         lines.append(f"mkdir -p {q_mnt_home}")
+
+        # Persistent isolated caches so pip/uv/npm/go/playwright don't lose state or hit tmpfs limits
+        for src_sub, dst_rel in (
+            ("cache", ".cache"),
+            ("npm", ".npm"),
+            ("local_share", os.path.join(".local", "share")),
+        ):
+            q_src = shlex.quote(str(sandbox_state / src_sub))
+            q_dst = shlex.quote(f"/mnt{os.path.join(home_dir, dst_rel)}")
+            lines.extend(
+                [
+                    f"mkdir -p {q_dst}",
+                    f"{q_mount} --rbind {q_src} {q_dst}",
+                ]
+            )
 
         # Read-only ~/.local/bin so user-installed developer CLIs & agy can execute safely
         local_bin = os.path.join(home_dir, ".local", "bin")
@@ -148,7 +179,7 @@ def build_mount_ns_argv(
                 ]
             )
 
-        # Read-only ~/.gitconfig so `git commit` inside workspaces preserves author metadata
+        # Read-only ~/.gitconfig so `git` credential helper & author settings work inside workspaces
         gitconfig = os.path.join(home_dir, ".gitconfig")
         if os.path.isfile(gitconfig):
             q_gc = shlex.quote(gitconfig)
@@ -160,6 +191,17 @@ def build_mount_ns_argv(
                     f"{q_mount} -o remount,bind,ro {q_dst_gc} 2>/dev/null || {q_mount} -o bind,remount,ro {q_dst_gc}",
                 ]
             )
+
+        # Persistent ~/.config/gh so `gh` CLI and `gh auth git-credential` work & persist across commands
+        # while ~/.config/dots-gateway, ~/.config/tunnel-client, and ~/.config/systemd remain invisible
+        q_gh = shlex.quote(str(gh_cfg_dir))
+        q_dst_gh = shlex.quote(f"/mnt{gh_cfg_dir}")
+        lines.extend(
+            [
+                f"mkdir -p {q_dst_gh}",
+                f"{q_mount} --rbind {q_gh} {q_dst_gh}",
+            ]
+        )
 
         if is_agy:
             # Antigravity CLI requires ~/.gemini (for OAuth & trajectory store) and ~/.config/antigravity,
