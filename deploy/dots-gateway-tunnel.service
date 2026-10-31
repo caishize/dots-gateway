@@ -6,6 +6,7 @@ Wants=network-online.target dots-gateway.service
 [Service]
 Type=simple
 WorkingDirectory=%h/gateway
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=%h/.config/dots-gateway/tunnel.env
 ExecStart=/usr/local/bin/tunnel-client run --profile dots-gateway
 Restart=always

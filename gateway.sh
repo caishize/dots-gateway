@@ -331,6 +331,8 @@ cmd_tunnel_setup() {
   } > "${TUNNEL_ENV_FILE}"
   chmod 600 "${TUNNEL_ENV_FILE}"
 
+  local py_bin="/usr/local/bin/python3"
+  [[ ! -x "${py_bin}" ]] && py_bin="/usr/bin/python3"
   echo "==> Generating tunnel-client profile (dots-gateway) ..."
   /usr/local/bin/tunnel-client init \
     --force \
@@ -338,7 +340,7 @@ cmd_tunnel_setup() {
     --profile dots-gateway \
     --tunnel-id "${tunnel_id}" \
     --health-listen-addr "127.0.0.1:18766" \
-    --mcp-command "/usr/bin/python3 ${GATEWAY_DIR}/dots_mcp.py"
+    --mcp-command "${py_bin} ${GATEWAY_DIR}/dots_mcp.py"
 
   echo "==> Validating tunnel configuration with 'tunnel-client doctor' ..."
   set -a

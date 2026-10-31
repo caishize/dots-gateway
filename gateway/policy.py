@@ -458,9 +458,22 @@ class CommandPolicy:
                     or "/../" in val
                     or val.endswith("/..")
                 )
-                if is_escape_target and (
-                    not self.is_within_allowed_workdirs(lex)
-                    or not self.is_within_allowed_workdirs(res)
+                real_base = os.path.basename(res)
+                is_allowed_toolchain_symlink = (
+                    self.is_within_allowed_workdirs(lex)
+                    and res.startswith(("/usr/", "/bin/", "/opt/uv-python/"))
+                    and (
+                        real_base in self._allowed_basenames
+                        or bool(_VERSIONED_TOOL_RE.match(real_base))
+                    )
+                )
+                if (
+                    is_escape_target
+                    and not is_allowed_toolchain_symlink
+                    and (
+                        not self.is_within_allowed_workdirs(lex)
+                        or not self.is_within_allowed_workdirs(res)
+                    )
                 ):
                     return (
                         False,

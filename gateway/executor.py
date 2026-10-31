@@ -641,8 +641,11 @@ class SessionManager:
         }
         local_bin = str(os.path.expanduser("~/.local/bin"))
         current_path = env.get("PATH", "/usr/local/bin:/usr/bin:/bin")
-        if local_bin not in current_path.split(os.pathsep):
-            env["PATH"] = f"{local_bin}{os.pathsep}{current_path}"
+        parts = [p for p in current_path.split(os.pathsep) if p]
+        for required_dir in ("/usr/local/bin", local_bin):
+            if required_dir not in parts:
+                parts.insert(0, required_dir)
+        env["PATH"] = os.pathsep.join(parts)
         if extra_env:
             for k, v in extra_env.items():
                 env[str(k)] = str(v)
