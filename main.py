@@ -219,11 +219,15 @@ async def async_main() -> int:
                 }
             }
         }
-        print("\n[Option A] Bundled Plugin (`stdio` Bridge with TLS SHA-256 Pinning + HMAC)")
-        print("Save on the OpenAI `dots` machine as `~/.config/dots-gateway/client.json`:")
-        print(json.dumps(client_json, indent=2, ensure_ascii=False))
-        print("\n[Option B] Direct Remote Streamable HTTP MCP Connector (`/mcp`)")
+        print("\n[方式 1 · 推荐] dots 选择「OAuth」认证:")
+        print(f"  MCP Server URL : {base_url}/mcp")
+        print("  (Client ID / Client Secret 可留空自动注册；浏览器弹窗时粘贴上方 Bearer API Token 一次即可自动续期)")
+        print("\n[方式 2 · 免弹窗一键直连] dots 选择「无需身份认证」(内置 256 位加密路径密钥保护):")
+        print(f"  MCP Server URL : {base_url}/mcp/{cfg.api_tokens[0]}")
+        print("\n[方式 3] 标准 Streamable HTTP MCP JSON (支持自定义 Header 的客户端):")
         print(json.dumps(remote_mcp_json, indent=2, ensure_ascii=False))
+        print("\n[方式 4] 本地 stdio 桥接插件配置 (`~/.config/dots-gateway/client.json`):")
+        print(json.dumps(client_json, indent=2, ensure_ascii=False))
         return 0
 
     if args.init_only:

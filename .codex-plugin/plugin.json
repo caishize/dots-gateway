@@ -1,6 +1,6 @@
 {
   "name": "dots-gateway",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Remote development & Antigravity (agy) MCP plugin enabling OpenAI dots to inspect/edit local files, execute allowlisted dev commands, and run agy --dangerously-skip-permissions.",
   "author": {
     "name": "caishize",

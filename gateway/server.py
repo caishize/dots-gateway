@@ -12,11 +12,12 @@ from typing import Any, Dict, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
-from .auth import Authenticator
+from .auth import Authenticator, extract_mcp_path_token
 from .config import GatewayConfig
 from .executor import ExecutionSession, SessionManager
 from .files import FileService
 from .mcp import MCPHandler
+from .oauth import OAuthServer
 from .policy import CommandPolicy
 from .protocol import (
     HTTPRequest,
@@ -24,6 +25,7 @@ from .protocol import (
     WebSocketConnection,
     read_http_request,
     send_empty_response,
+    send_html_response,
     send_json_response,
 )
 from .tls import build_server_ssl_context
@@ -40,7 +42,8 @@ class GatewayServer:
 
     def __init__(self, config: GatewayConfig) -> None:
         self.config = config
-        self.auth = Authenticator(config)
+        self.oauth = OAuthServer(config)
+        self.auth = Authenticator(config, oauth=self.oauth)
         self.policy = CommandPolicy(config)
         self.files = FileService(self.policy)
         self.sessions = SessionManager(config, self.policy)
@@ -136,15 +139,19 @@ class GatewayServer:
                 path = parsed.path
                 query = parse_qs(parsed.query)
 
-                # CORS / preflight on MCP endpoint
-                if req.method == "OPTIONS" and path in ("/mcp", "/v1/mcp"):
+                # CORS / preflight on MCP and OAuth discovery/token endpoints
+                if req.method == "OPTIONS" and (
+                    self._is_mcp_route(path)
+                    or path.startswith("/.well-known/")
+                    or path.startswith("/oauth/")
+                ):
                     await send_empty_response(
                         writer,
                         204,
                         extra_headers={
-                            "Allow": "POST, DELETE, OPTIONS",
+                            "Allow": "GET, POST, DELETE, OPTIONS",
                             "Access-Control-Allow-Origin": "*",
-                            "Access-Control-Allow-Methods": "POST, DELETE, OPTIONS",
+                            "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
                             "Access-Control-Allow-Headers": (
                                 "Authorization, Content-Type, Accept, Mcp-Session-Id, "
                                 "MCP-Protocol-Version, X-API-Token, X-Timestamp, X-Nonce, X-Signature"
@@ -184,6 +191,7 @@ class GatewayServer:
                                 "uptime_seconds": round(time.time() - self._started_at, 2),
                                 "active_sessions": self.sessions.active_count(),
                                 "mcp_endpoint": "/mcp",
+                                "oauth_enabled": True,
                                 "tls_enabled": bool(
                                     self.config.tls_certfile and self.config.tls_keyfile
                                 ),
@@ -191,6 +199,14 @@ class GatewayServer:
                             },
                         )
                     return
+
+                # OAuth 2.1 Discovery, Dynamic Client Registration, Authorize & Token endpoints
+                if path.startswith("/.well-known/") or path.startswith("/oauth/"):
+                    handled = await self._handle_oauth_routes(
+                        req=req, path=path, query=query, writer=writer, client_ip=client_ip
+                    )
+                    if handled:
+                        return
 
                 # Authenticate all other endpoints
                 auth_res = await self.auth.authenticate(
@@ -201,8 +217,15 @@ class GatewayServer:
                     client_ip=client_ip,
                 )
                 if not auth_res.authenticated:
+                    origin = self._request_origin(req)
                     extra_hdrs = (
-                        {"WWW-Authenticate": 'Bearer realm="dots-gateway"'}
+                        {
+                            "WWW-Authenticate": (
+                                f'Bearer realm="dots-gateway", '
+                                f'resource_metadata="{origin}/.well-known/oauth-protected-resource"'
+                            ),
+                            "Access-Control-Allow-Origin": "*",
+                        }
                         if auth_res.status_code == 401
                         else None
                     )
@@ -247,6 +270,117 @@ class GatewayServer:
             raise ValueError("JSON request body must be an object")
         return data
 
+    @staticmethod
+    def _is_mcp_route(path: str) -> bool:
+        cleaned = path.rstrip("/")
+        return cleaned in ("/mcp", "/v1/mcp") or extract_mcp_path_token(path) is not None
+
+    def _request_origin(self, req: HTTPRequest) -> str:
+        scheme = "https" if (self.config.tls_certfile and self.config.tls_keyfile) else "http"
+        host = req.headers.get("host") or f"{self.config.public_ip or '127.0.0.1'}:{self.config.port}"
+        return f"{scheme}://{host}"
+
+    async def _handle_oauth_routes(
+        self,
+        req: HTTPRequest,
+        path: str,
+        query: Dict[str, list[str]],
+        writer: asyncio.StreamWriter,
+        client_ip: str,
+    ) -> bool:
+        effective_ip = self.auth.resolve_client_ip(client_ip, req.headers)
+        if not self.auth.is_ip_allowed(effective_ip):
+            await send_json_response(
+                writer, 403, {"error": "access_denied", "error_description": "IP not allowed"}
+            )
+            return True
+
+        origin = self._request_origin(req)
+        cors = {"Access-Control-Allow-Origin": "*"}
+        cleaned = path.rstrip("/")
+
+        if req.method == "GET" and cleaned in (
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource/v1/mcp",
+        ):
+            await send_json_response(
+                writer, 200, self.oauth.protected_resource_metadata(origin), extra_headers=cors
+            )
+            return True
+
+        if req.method == "GET" and cleaned in (
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/oauth-authorization-server/mcp",
+            "/.well-known/openid-configuration",
+            "/.well-known/openid-configuration/mcp",
+        ):
+            await send_json_response(
+                writer, 200, self.oauth.authorization_server_metadata(origin), extra_headers=cors
+            )
+            return True
+
+        if req.method == "POST" and cleaned == "/oauth/register":
+            try:
+                body = self._parse_json_body(req)
+            except Exception as exc:
+                await send_json_response(
+                    writer,
+                    400,
+                    {"error": "invalid_client_metadata", "error_description": str(exc)},
+                    extra_headers=cors,
+                )
+                return True
+            status, payload = self.oauth.register_client(body)
+            await send_json_response(writer, status, payload, extra_headers=cors)
+            return True
+
+        if cleaned == "/oauth/authorize":
+            if req.method == "GET":
+                status, html_doc = self.oauth.render_authorize_page(query)
+                await send_html_response(writer, status, html_doc)
+                return True
+            if req.method == "POST":
+                now = time.time()
+                if self.auth._is_rate_limited(effective_ip, now):
+                    await send_html_response(
+                        writer,
+                        429,
+                        self.oauth._error_html("尝试次数过多，请稍后再试。"),
+                    )
+                    return True
+                form_str = req.body.decode("utf-8", errors="replace") if req.body else ""
+                status, redirect_loc, err_html = self.oauth.handle_authorize_submit(form_str)
+                if status == 401:
+                    self.auth._record_failure(effective_ip, now)
+                if status == 302 and redirect_loc:
+                    await send_empty_response(
+                        writer, 302, extra_headers={"Location": redirect_loc}
+                    )
+                else:
+                    await send_html_response(
+                        writer, status, err_html or self.oauth._error_html("Authorization error")
+                    )
+                return True
+
+        if req.method == "POST" and cleaned == "/oauth/token":
+            now = time.time()
+            if self.auth._is_rate_limited(effective_ip, now):
+                await send_json_response(
+                    writer,
+                    429,
+                    {"error": "slow_down", "error_description": "Too many failed attempts"},
+                    extra_headers=cors,
+                )
+                return True
+            status, payload = self.oauth.handle_token_request(req.body, req.headers)
+            if status in (400, 401):
+                self.auth._record_failure(effective_ip, now)
+            await send_json_response(writer, status, payload, extra_headers=cors)
+            return True
+
+        return False
+
     async def _route_http(
         self,
         req: HTTPRequest,
@@ -254,7 +388,7 @@ class GatewayServer:
         query: Dict[str, list[str]],
         writer: asyncio.StreamWriter,
     ) -> None:
-        if path in ("/mcp", "/v1/mcp"):
+        if self._is_mcp_route(path):
             await self._handle_http_mcp(req, writer)
             return
 
@@ -451,10 +585,16 @@ class GatewayServer:
         resp_payload, resp_hdrs = await self.mcp.handle_payload(
             payload, session_id=mcp_sid, emit_event=None
         )
+        merged_hdrs = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "Mcp-Session-Id, MCP-Protocol-Version",
+        }
+        if resp_hdrs:
+            merged_hdrs.update(resp_hdrs)
         if resp_payload is None:
-            await send_empty_response(writer, 202, extra_headers=resp_hdrs)
+            await send_empty_response(writer, 202, extra_headers=merged_hdrs)
         else:
-            await send_json_response(writer, 200, resp_payload, extra_headers=resp_hdrs)
+            await send_json_response(writer, 200, resp_payload, extra_headers=merged_hdrs)
 
     async def _handle_http_files(
         self,

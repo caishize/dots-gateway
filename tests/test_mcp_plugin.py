@@ -467,6 +467,165 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await par_srv.stop()
 
+    async def test_oauth21_dcr_pkce_flow_and_mcp_capability_path(self) -> None:
+        import base64
+        import hashlib
+        import re
+        import ssl
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        ssl_ctx = ssl.create_default_context(cafile=self.pki["ca_cert"])
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ssl_ctx), _NoRedirect
+        )
+
+        def _req(method: str, path: str, data: Any = None, headers: Optional[Dict[str, str]] = None):
+            hdrs = dict(headers or {})
+            body_bytes = None
+            if isinstance(data, dict):
+                body_bytes = json.dumps(data).encode("utf-8")
+                hdrs.setdefault("Content-Type", "application/json")
+            elif isinstance(data, str):
+                body_bytes = data.encode("utf-8")
+            r = urllib.request.Request(f"{self.https_url}{path}", data=body_bytes, headers=hdrs, method=method)
+            try:
+                resp = opener.open(r, timeout=5.0)
+                return resp.status, dict(resp.headers.items()), resp.read().decode("utf-8")
+            except urllib.error.HTTPError as e:
+                return e.code, dict(e.headers.items()), e.read().decode("utf-8")
+
+        # 1. Unauthenticated /mcp returns 401 with RFC 9728 resource_metadata
+        st, hdrs, _ = await asyncio.to_thread(_req, "POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        self.assertEqual(st, 401)
+        www_auth = hdrs.get("WWW-Authenticate", "")
+        self.assertIn("resource_metadata=", www_auth)
+
+        # 2. Protected Resource & Authorization Server Discovery
+        st, _, prm_raw = await asyncio.to_thread(_req, "GET", "/.well-known/oauth-protected-resource")
+        self.assertEqual(st, 200)
+        prm = json.loads(prm_raw)
+        self.assertEqual(prm["resource"], f"{self.https_url}/mcp")
+
+        st, _, asm_raw = await asyncio.to_thread(_req, "GET", "/.well-known/oauth-authorization-server")
+        self.assertEqual(st, 200)
+        asm = json.loads(asm_raw)
+        self.assertIn("S256", asm["code_challenge_methods_supported"])
+
+        # 3. Dynamic Client Registration (RFC 7591)
+        redirect_uri = "https://chatgpt.com/connector_platform_oauth_redirect"
+        st, _, reg_raw = await asyncio.to_thread(
+            _req,
+            "POST",
+            "/oauth/register",
+            {"client_name": "dots", "redirect_uris": [redirect_uri], "token_endpoint_auth_method": "none"},
+        )
+        self.assertEqual(st, 201)
+        client_id = json.loads(reg_raw)["client_id"]
+
+        # 4. Authorization Code + PKCE S256
+        verifier = "v" * 64
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
+        auth_qs = urllib.parse.urlencode(
+            {
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "state": "xyz123",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+            }
+        )
+        st, _, html_doc = await asyncio.to_thread(_req, "GET", f"/oauth/authorize?{auth_qs}")
+        self.assertEqual(st, 200)
+        m_csrf = re.search(r'name="csrf_token"\s+value="([^"]+)"', html_doc)
+        assert m_csrf is not None
+        csrf_val = m_csrf.group(1)
+
+        form_payload = urllib.parse.urlencode(
+            {
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "state": "xyz123",
+                "scope": "mcp",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "csrf_token": csrf_val,
+                "gateway_token": self.cfg.api_tokens[0],
+            }
+        )
+        st, redir_hdrs, _ = await asyncio.to_thread(
+            _req,
+            "POST",
+            "/oauth/authorize",
+            form_payload,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(st, 302)
+        loc = redir_hdrs.get("Location", "")
+        loc_qs = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+        self.assertEqual(loc_qs["state"][0], "xyz123")
+        auth_code = loc_qs["code"][0]
+
+        # 5. Exchange code for OAuth tokens and call /mcp with Bearer access_token
+        tok_form = urllib.parse.urlencode(
+            {
+                "grant_type": "authorization_code",
+                "code": auth_code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "code_verifier": verifier,
+            }
+        )
+        st, _, tok_raw = await asyncio.to_thread(
+            _req, "POST", "/oauth/token", tok_form, {"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        self.assertEqual(st, 200, tok_raw)
+        tok_data = json.loads(tok_raw)
+        access_token = tok_data["access_token"]
+        refresh_token = tok_data["refresh_token"]
+        self.assertTrue(access_token.startswith("dots_at."))
+
+        st, _, mcp_raw = await asyncio.to_thread(
+            _req,
+            "POST",
+            "/mcp",
+            {"jsonrpc": "2.0", "id": 10, "method": "tools/list"},
+            {"Authorization": f"Bearer {access_token}"},
+        )
+        self.assertEqual(st, 200)
+        self.assertGreaterEqual(len(json.loads(mcp_raw)["result"]["tools"]), 14)
+
+        # Refresh token rotation
+        ref_form = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": refresh_token})
+        st, _, ref_raw = await asyncio.to_thread(
+            _req, "POST", "/oauth/token", ref_form, {"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        self.assertEqual(st, 200)
+        self.assertTrue(json.loads(ref_raw)["access_token"].startswith("dots_at."))
+
+        # 6. Secret Capability Path (/mcp/<API_TOKEN>) for UIs selecting "No Authentication"
+        st_bad, _, _ = await asyncio.to_thread(
+            _req, "POST", "/mcp/wrong-secret-path", {"jsonrpc": "2.0", "id": 11, "method": "tools/list"}
+        )
+        self.assertEqual(st_bad, 401)
+
+        st_ok, _, cap_raw = await asyncio.to_thread(
+            _req,
+            "POST",
+            f"/mcp/{self.cfg.api_tokens[0]}",
+            {"jsonrpc": "2.0", "id": 12, "method": "tools/list"},
+        )
+        self.assertEqual(st_ok, 200)
+        self.assertGreaterEqual(len(json.loads(cap_raw)["result"]["tools"]), 14)
+
 
 if __name__ == "__main__":
     unittest.main()

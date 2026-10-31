@@ -15,8 +15,20 @@ from typing import Dict, List, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlparse
 
 from .config import GatewayConfig, verify_password_pbkdf2
+from .oauth import OAuthServer
 
 IPNet = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+
+
+def extract_mcp_path_token(path: str) -> Optional[str]:
+    """Extract secret capability token from `/mcp/<token>` or `/v1/mcp/<token>`."""
+    cleaned = path.rstrip("/")
+    for prefix in ("/mcp/", "/v1/mcp/"):
+        if cleaned.startswith(prefix):
+            rest = cleaned[len(prefix) :]
+            if rest and "/" not in rest:
+                return rest
+    return None
 
 
 @dataclass
@@ -63,8 +75,9 @@ class Authenticator:
     MAX_TRACKED_IPS = 4096
     MAX_SEEN_NONCES = 8192
 
-    def __init__(self, config: GatewayConfig) -> None:
+    def __init__(self, config: GatewayConfig, oauth: Optional[OAuthServer] = None) -> None:
         self.config = config
+        self.oauth = oauth
         self._allowed_nets = _parse_networks(config.allowed_client_ips)
         self._trusted_proxy_nets = _parse_networks(config.trusted_proxies)
         # ip -> list of failure timestamps (bounded OrderedDict)
@@ -129,7 +142,11 @@ class Authenticator:
         for valid_token in self.config.api_tokens:
             if secrets.compare_digest(candidate, valid_token):
                 matched = True
-        return matched
+        if matched:
+            return True
+        if self.oauth is not None and candidate.startswith("dots_at."):
+            return self.oauth.verify_signed_token(candidate, expected_type="at") is not None
+        return False
 
     def verify_user_password(self, username: str, password: str) -> bool:
         stored = self.config.users.get(username)
@@ -256,7 +273,15 @@ class Authenticator:
             self._record_failure(effective_ip, now)
             return AuthResult(False, error=err, status_code=401)
 
-        # 4. Optional query parameter ?token=... (disabled by default for security)
+        # 4. Secret capability path token (/mcp/<API_TOKEN>) for UIs without custom header fields
+        path_tok = extract_mcp_path_token(urlparse(raw_path).path)
+        if path_tok:
+            if self.verify_token(path_tok):
+                return AuthResult(True, principal="mcp-path-client", method="mcp-path-token")
+            self._record_failure(effective_ip, now)
+            return AuthResult(False, error="Invalid MCP path token", status_code=401)
+
+        # 5. Optional query parameter ?token=... (disabled by default for security)
         if self.config.allow_query_token:
             parsed = urlparse(raw_path)
             if parsed.query:

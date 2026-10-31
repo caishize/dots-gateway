@@ -212,6 +212,40 @@ async def send_empty_response(
     await writer.drain()
 
 
+async def send_html_response(
+    writer: asyncio.StreamWriter,
+    status_code: int,
+    html_text: str,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> None:
+    """Write a complete HTTP/1.1 HTML response with strict security headers."""
+    body = html_text.encode("utf-8")
+    try:
+        phrase = HTTPStatus(status_code).phrase
+    except ValueError:
+        phrase = "OK"
+
+    headers = {
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Length": str(len(body)),
+        "Connection": "close",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    header_lines = [f"HTTP/1.1 {status_code} {phrase}\r\n"]
+    for k, v in headers.items():
+        header_lines.append(f"{k}: {v}\r\n")
+    header_lines.append("\r\n")
+
+    writer.write("".join(header_lines).encode("latin-1") + body)
+    await writer.drain()
+
+
 class SSEWriter:
     """Server-Sent Events (SSE) stream writer over HTTP/1.1 with NAT keep-alive support."""
 
