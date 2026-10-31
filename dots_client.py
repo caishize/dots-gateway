@@ -34,15 +34,15 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 
 def load_client_config_file(explicit_path: Optional[str] = None) -> Dict[str, Any]:
     """Load optional client credentials JSON from DOTS_GATEWAY_CLIENT_CONFIG, PLUGIN_DATA, or ~/.config."""
-    candidates: List[Path] = []
-    if explicit_path:
-        candidates.append(Path(explicit_path).expanduser())
-    if os.environ.get("DOTS_GATEWAY_CLIENT_CONFIG"):
-        candidates.append(Path(os.environ["DOTS_GATEWAY_CLIENT_CONFIG"]).expanduser())
-    if os.environ.get("PLUGIN_DATA"):
-        candidates.append(Path(os.environ["PLUGIN_DATA"]).expanduser() / "client.json")
-    candidates.append(Path.home() / ".config" / "dots-gateway" / "client.json")
-    candidates.append(Path(__file__).resolve().parent / "client.json")
+    override = explicit_path or os.environ.get("DOTS_GATEWAY_CLIENT_CONFIG")
+    if override:
+        candidates: List[Path] = [Path(override).expanduser()]
+    else:
+        candidates = []
+        if os.environ.get("PLUGIN_DATA"):
+            candidates.append(Path(os.environ["PLUGIN_DATA"]).expanduser() / "client.json")
+        candidates.append(Path.home() / ".config" / "dots-gateway" / "client.json")
+        candidates.append(Path(__file__).resolve().parent / "client.json")
 
     for p in candidates:
         try:

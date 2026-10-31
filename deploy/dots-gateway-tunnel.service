@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenAI Secure MCP Tunnel Client for Dots Gateway
+After=network-online.target dots-gateway.service
+Wants=network-online.target dots-gateway.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/gateway
+EnvironmentFile=%h/.config/dots-gateway/tunnel.env
+ExecStart=/usr/local/bin/tunnel-client run --profile dots-gateway
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

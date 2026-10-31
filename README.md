@@ -58,60 +58,56 @@ OpenAI Cloud Machine (`dots`)                            Local Dev Machine (`~/g
 
 ---
 
-## 1. Start, Manage & Issue Public IP TLS Certificate
+## 1. Start, Manage & Configure Secure MCP Tunnel
 
 ```bash
 git clone https://github.com/caishize/dots-gateway.git ~/gateway
 cd ~/gateway
 
-# Start / stop / restart / inspect service & logs via unified CLI
-./gateway.sh start
-./gateway.sh status
-./gateway.sh restart
-./gateway.sh stop
-./gateway.sh logs -f
+# Unified CLI (also symlinked as ~/.local/bin/dots-gateway)
+dots-gateway --help
+dots-gateway start
+dots-gateway status
+dots-gateway restart
+dots-gateway stop
+dots-gateway logs -f
 
-# Issue auto-renewing Let's Encrypt official bare-IP TLS certificate (requires TCP 80 open)
-./gateway.sh sync-ip
+# Recommended: Configure & start OpenAI official Secure MCP Tunnel (outbound-only, port-free)
+dots-gateway tunnel-setup
 
-# Print ready-to-paste OpenAI `dots` Remote MCP configuration snippets
-./gateway.sh config
+# Issue auto-renewing Let's Encrypt bare-IP + sslip.io TLS certificate (optional, for direct HTTPS)
+dots-gateway sync-ip
+
+# Print direct Remote MCP URLs, OAuth 2.1 endpoints & capability path
+dots-gateway config
 ```
 
 ---
 
 ## 2. Connect from OpenAI `dots`
 
-### Option A (Recommended for Public-IP Direct Connect): Install Plugin Repo (`stdio` Bridge)
+### Option A (Recommended — Zero Inbound Ports, Zero Install in `dots`): OpenAI Secure MCP Tunnel (`tunnel-client`)
 
-Install this repository (`https://github.com/caishize/dots-gateway.git`) as a plugin in `dots` / Codex. Because `mcp.json` runs `./dots_mcp.py`, it supports **self-signed TLS SHA-256 certificate pinning** (`GATEWAY_TLS_FINGERPRINT`) and **replay-proof HMAC-SHA256 signing** over raw public IPs without needing third-party CA certificates.
+Because OpenAI's cloud connector firewall blocks non-`443` ports (`:8765`), raw IPv4 URLs, and wildcard DNS (`sslip.io`), the most reliable zero-install method is OpenAI's official **`tunnel-client`** daemon managed by `dots-gateway`:
 
-Configure credentials on the `dots` machine via environment variables:
+1. Create or copy a **Tunnel ID** (`tunnel_...`) at <https://platform.openai.com/settings/organization/tunnels> (under the same OpenAI Org/Workspace as `dots`).
+2. Create a **Runtime Credential** with **`Tunnels Read + Use`** permissions at <https://platform.openai.com/settings/organization/api-keys>.
+3. Run on this host:
+   ```bash
+   dots-gateway tunnel-setup
+   ```
+   This writes `~/.config/dots-gateway/tunnel.env` (`0600`), configures `~/.config/tunnel-client/dots-gateway.yaml` (`sample_mcp_stdio_local` -> `dots_mcp.py` -> loopback `https://127.0.0.1:8765`), runs `tunnel-client doctor`, enables `dots-gateway-tunnel.service`, and verifies `http://127.0.0.1:18766/readyz`.
+4. In `dots` / ChatGPT Connectors, select your Secure MCP Tunnel (`No authentication` / `无需身份认证`). All commands and `agy` runs remain strictly confined to `~/workspaces` via Linux User + Mount Namespace VFS jailing.
 
-```bash
-export GATEWAY_URL="https://<YOUR_PUBLIC_IP>:8765"
-export GATEWAY_HMAC_SECRET="<YOUR_HMAC_SECRET>"       # Or GATEWAY_TOKEN="<YOUR_API_TOKEN>"
-export GATEWAY_TLS_FINGERPRINT="<SERVER_CERT_SHA256>"
-```
+### Option B: Direct Remote Streamable HTTP MCP (`/mcp`, Built-in OAuth 2.1 or Capability Path)
 
-Or save `~/.config/dots-gateway/client.json` (reloaded dynamically without restarting the plugin):
+When exposed on standard HTTPS `:443` with a custom domain, `dots-gateway` natively supports:
+- **Built-in MCP OAuth 2.1 (`gateway/oauth.py`)**: RFC 9728 Protected Resource Metadata (`/.well-known/oauth-protected-resource`), RFC 8414 Authorization Server Metadata (`/.well-known/oauth-authorization-server`), RFC 7591 Dynamic Client Registration (`/oauth/register`), PKCE `S256` `/oauth/authorize`, and stateless HMAC `/oauth/token`.
+- **Zero-Header Capability Path**: `https://<YOUR_DOMAIN>/mcp/<YOUR_GATEWAY_CREDENTIAL>` (for `No authentication` mode) or `Authorization: Bearer` header on `/mcp`.
 
-```json
-{
-  "url": "https://<YOUR_PUBLIC_IP>:8765",
-  "hmac_secret": "<YOUR_HMAC_SECRET>",
-  "tls_fingerprint": "<SERVER_CERT_SHA256>"
-}
-```
+### Option C: Install Plugin Repo (`stdio` Bridge)
 
-### Option B: Direct Remote Streamable HTTP MCP Connector (`/mcp`)
-
-Point `dots` / ChatGPT Custom MCP Connector directly at the gateway's native Streamable HTTP endpoint:
-
-- **MCP Endpoint URL**: `https://<YOUR_PUBLIC_IP_OR_DOMAIN>:8765/mcp`
-- **HTTP Header**: `Authorization: Bearer <YOUR_API_TOKEN>`
-
-*(Note: Direct cloud-hosted HTTP connectors typically require a publicly trusted TLS certificate if connecting without `dots_mcp.py`'s SHA-256 cert pinning bridge).*
+Install this repository (`https://github.com/caishize/dots-gateway.git`) as a plugin in Codex / local MCP hosts (`mcp.json` runs `./dots_mcp.py` with TLS SHA-256 certificate pinning and replay-proof HMAC-SHA256 signing via `~/.config/dots-gateway/client.json`).
 
 ---
 
