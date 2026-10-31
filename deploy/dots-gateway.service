@@ -1,0 +1,16 @@
+[Unit]
+Description=Dots <-> Local Dev & Antigravity (agy) Hardened HTTPS/WSS Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/gateway
+ExecStart=/usr/bin/python3 -u %h/gateway/main.py --config %h/gateway/config.json
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=default.target

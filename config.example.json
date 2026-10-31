@@ -1,0 +1,38 @@
+{
+  "host": "0.0.0.0",
+  "port": 8765,
+  "public_ip": null,
+  "api_tokens": [
+    "dots_gw_<AUTO_GENERATED_ON_FIRST_RUN>"
+  ],
+  "users": {
+    "dots": "pbkdf2_sha256$<SALT>$<HASH>"
+  },
+  "hmac_secret": "<AUTO_GENERATED_64_HEX_SECRET>",
+  "hmac_max_skew_seconds": 300,
+  "allow_query_token": false,
+  "minimal_unauth_health": true,
+  "allowed_client_ips": [],
+  "trusted_proxies": [],
+  "rate_limit_max_failures": 10,
+  "rate_limit_window_seconds": 60,
+  "enforce_allowlist": true,
+  "allowed_workdirs": [
+    "/home/<your-user>",
+    "/tmp"
+  ],
+  "default_workdir": "/home/<your-user>",
+  "agy_binary": "/home/<your-user>/.local/bin/agy",
+  "agy_default_skip_permissions": true,
+  "default_timeout_seconds": 600.0,
+  "max_timeout_seconds": 7200.0,
+  "max_concurrent_sessions": 32,
+  "max_concurrent_connections": 128,
+  "max_output_buffer_events": 5000,
+  "max_output_bytes": 33554432,
+  "sse_keepalive_seconds": 15.0,
+  "tls_certfile": "certs/server.crt",
+  "tls_keyfile": "certs/server.key",
+  "tls_ca_file": "certs/ca.crt",
+  "tls_require_client_cert": false
+}

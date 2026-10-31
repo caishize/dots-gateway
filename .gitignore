@@ -1,0 +1,29 @@
+# Runtime secrets & auto-generated TLS/mTLS certificates (NEVER COMMIT)
+config.json
+certs/
+*.key
+*.pem
+*.csr
+*.srl
+.env
+
+# Python caches & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Virtual environments & temporary files
+.venv/
+venv/
+*.log
+*.tmp
+.DS_Store
