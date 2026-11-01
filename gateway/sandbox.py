@@ -76,6 +76,7 @@ def build_mount_ns_argv(
     allowed_workdirs: Sequence[str],
     protected_paths: Sequence[str],
     is_agy: bool = False,
+    is_codex: bool = False,
 ) -> List[str]:
     """Wrap `target_argv` in an unprivileged user+mount namespace `pivot_root` jail."""
     if not can_use_mount_namespace():
@@ -121,6 +122,13 @@ def build_mount_ns_argv(
         gh_cfg_dir.mkdir(parents=True, exist_ok=True)
         if is_agy:
             (Path(home_dir) / ".config" / "antigravity").mkdir(parents=True, exist_ok=True)
+        if is_codex:
+            codex_dir_p = Path(home_dir) / ".codex"
+            codex_dir_p.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(codex_dir_p, 0o700)
+            except OSError:
+                pass
 
     q_mount = shlex.quote(mount_bin)
     q_umount = shlex.quote(umount_bin)
@@ -250,6 +258,20 @@ def build_mount_ns_argv(
                         f"{q_mount} --rbind {q_ac} {q_dst_ac}",
                     ]
                 )
+
+        if is_codex:
+            # OpenAI Codex CLI requires ~/.codex (for auth.json, config.toml, session history &
+            # codex-linux-sandbox helper) while ~/gateway, ~/.gemini, ~/.ssh, and ~/.config/* stay hidden.
+            codex_dir = os.path.join(home_dir, ".codex")
+            if os.path.isdir(codex_dir):
+                q_cx = shlex.quote(codex_dir)
+                q_dst_cx = shlex.quote(f"/mnt{codex_dir}")
+                lines.extend(
+                    [
+                        f"mkdir -p {q_dst_cx}",
+                        f"{q_mount} --rbind {q_cx} {q_dst_cx}",
+                    ]
+                )
     else:
         # Even if an admin explicitly put $HOME in allowed_workdirs, mask protected_paths inside VFS
         for raw_prot in protected_paths:
@@ -262,6 +284,8 @@ def build_mount_ns_argv(
                 or prot == os.path.join(home_dir, ".gemini")
                 or prot == os.path.join(home_dir, ".config")
             ):
+                continue
+            if is_codex and prot == os.path.join(home_dir, ".codex"):
                 continue
             dst_prot = f"/mnt{prot}"
             if os.path.isdir(prot):
@@ -287,9 +311,9 @@ def build_mount_ns_argv(
         ]
     )
 
-    if is_agy:
+    if is_agy or is_codex:
         # Clear effective/permitted/ambient caps (CapEff=0 -> cannot unmount), while keeping
-        # unprivileged nested userns capability available for `agy --sandbox`.
+        # unprivileged nested userns capability available for `agy --sandbox` / `codex-linux-sandbox`.
         lines.append(f'exec {q_setpriv} --inh-caps=-all --ambient-caps=-all -- "$@"')
     else:
         # Drop all capabilities AND empty the capability bounding set for raw exec commands.

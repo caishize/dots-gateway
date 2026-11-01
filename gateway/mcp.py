@@ -40,8 +40,9 @@ SERVER_INSTRUCTIONS = (
     "Connected to the user's remote development machine via Dots Gateway. "
     "Prefer `fs_read`, `fs_write`, `fs_patch`, and `fs_list` for fast, atomic file operations "
     "without shell-escaping issues. Use `exec_command` for allowlisted shell commands, builds, "
-    "linters, and git workflows. Use `run_agy` to delegate multi-file feature implementation, "
-    "refactoring, or autonomous debugging to local Antigravity (`agy --dangerously-skip-permissions`). "
+    "linters, and git workflows. Use `run_agy` (local Antigravity CLI) or `run_codex` (local "
+    "OpenAI Codex CLI `codex exec`) to delegate multi-file feature implementation, refactoring, "
+    "cross-model code review, or autonomous debugging. "
     "Use `session_start`, `session_poll`, `session_input`, and `session_signal` for background "
     "tasks or interactive multi-turn processes."
 )
@@ -189,20 +190,108 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "run_codex",
+        "title": "Run Local OpenAI Codex Agent (codex)",
+        "description": (
+            "Invoke OpenAI Codex CLI (`codex -a never -s workspace-write exec`) on the remote "
+            "development machine to autonomously implement features, refactor, run code reviews, "
+            "debug, and verify tests inside the jailed workspace."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Detailed engineering or review task instruction for local `codex`.",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Target project repository / working directory on the remote host.",
+                },
+                "skip_permissions": {
+                    "type": "boolean",
+                    "description": "Pass `-a never` for unattended execution without approval prompts (default: true).",
+                    "default": True,
+                },
+                "sandbox_mode": {
+                    "type": "string",
+                    "enum": ["workspace-write", "read-only"],
+                    "default": "workspace-write",
+                    "description": "Codex sandbox policy ('workspace-write' for coding or 'read-only' for review/audit).",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model override for `codex`.",
+                },
+                "effort": {
+                    "type": "string",
+                    "enum": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                    "description": "Optional reasoning effort override.",
+                },
+                "search": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Enable Codex native web search (`--search`).",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional existing Codex session UUID/name to resume (`codex exec resume <ID>`).",
+                },
+                "continue_last": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Resume the most recent Codex session in `cwd` (`codex exec resume --last`).",
+                },
+                "review": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Run non-interactive `codex exec review` against the repository.",
+                },
+                "json_events": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Emit raw JSONL events on stdout (`--json`). Defaults to false (clean final message on stdout).",
+                },
+                "add_dirs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Additional allowed workspace directories to grant writable access to.",
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional extra validated flags passed to `codex exec` (e.g. `['--uncommitted']` with `review=true`).",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Timeout in seconds (default: 1800, max: 7200).",
+                },
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": True,
+        },
+    },
+    {
         "name": "session_start",
         "title": "Start Background or Interactive Session",
         "description": (
-            "Start a non-blocking background command (`type='exec'`) or multi-turn interactive "
-            "`agy` session (`type='agy'`) and immediately return its `session_id`."
+            "Start a non-blocking background command (`type='exec'`), multi-turn interactive "
+            "`agy` session (`type='agy'`), or background `codex` run (`type='codex'`) and "
+            "immediately return its `session_id`."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "type": {
                     "type": "string",
-                    "enum": ["exec", "agy"],
+                    "enum": ["exec", "agy", "codex"],
                     "default": "exec",
-                    "description": "Session type: 'exec' for shell/CLI commands or 'agy' for multi-turn Antigravity.",
+                    "description": "Session type: 'exec' for shell/CLI commands, 'agy' for Antigravity, or 'codex' for OpenAI Codex.",
                 },
                 "command": {
                     "oneOf": [
@@ -213,7 +302,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Initial prompt when `type='agy'`.",
+                    "description": "Initial prompt when `type='agy'` or `type='codex'`.",
                 },
                 "cwd": {
                     "type": "string",
@@ -235,6 +324,10 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "skip_permissions": {
                     "type": "boolean",
                     "default": True,
+                },
+                "sandbox_mode": {
+                    "type": "string",
+                    "enum": ["workspace-write", "read-only"],
                 },
                 "model": {"type": "string"},
                 "effort": {"type": "string"},
@@ -548,6 +641,16 @@ PROMPT_DEFINITIONS: List[Dict[str, Any]] = [
         ],
     },
     {
+        "name": "delegate_to_codex",
+        "title": "Delegate Feature or Code Review to Local OpenAI Codex (codex)",
+        "description": "Orchestrate local `codex exec` to implement a feature or perform an independent code review.",
+        "arguments": [
+            {"name": "task", "description": "Engineering or review task for Codex", "required": True},
+            {"name": "cwd", "description": "Remote project path", "required": False},
+            {"name": "test_command", "description": "Verification command (e.g. pytest -v)", "required": False},
+        ],
+    },
+    {
         "name": "remote_tdd_loop",
         "title": "Remote Test-Driven Development Loop",
         "description": "Inspect code, write/patch tests and implementation on the remote host, and run test verification.",
@@ -645,7 +748,7 @@ class MCPHandler:
                 continue
             name = params.get("name")
             args = params.get("arguments") or {}
-            if name in ("exec_command", "run_agy"):
+            if name in ("exec_command", "run_agy", "run_codex"):
                 return True
             if name == "session_poll" and isinstance(args, dict) and float(args.get("wait_seconds") or 0) > 0:
                 return True
@@ -899,6 +1002,8 @@ class MCPHandler:
                     "active_sessions": self.sessions.active_count(),
                     "active_agy_sessions": self.sessions.active_agy_count(),
                     "queued_agy_sessions": self.sessions.queued_agy_count(),
+                    "active_codex_sessions": self.sessions.active_codex_count(),
+                    "queued_codex_sessions": self.sessions.queued_codex_count(),
                     "max_concurrent_agy": self.config.max_concurrent_agy,
                     "default_workdir": self.config.default_workdir,
                     "allowed_workdirs": self.config.allowed_workdirs,
@@ -908,6 +1013,10 @@ class MCPHandler:
                     "agy_binary": self.config.agy_binary,
                     "agy_default_skip_permissions": self.config.agy_default_skip_permissions,
                     "agy_default_sandbox": self.config.agy_default_sandbox,
+                    "codex_binary": self.config.codex_binary,
+                    "codex_default_skip_permissions": self.config.codex_default_skip_permissions,
+                    "codex_default_sandbox": self.config.codex_default_sandbox,
+                    "codex_auth_configured": self.sessions.has_codex_auth(),
                     "tls_enabled": bool(self.config.tls_certfile and self.config.tls_keyfile),
                     "mtls_required": self.config.tls_require_client_cert,
                 }
@@ -988,6 +1097,52 @@ class MCPHandler:
                     )
                 return _jsonrpc_result(req_id, _tool_success(result_data))
 
+            if tool_name == "run_codex":
+                prompt = args.get("prompt")
+                extra_args = args.get("args") or []
+                review = bool(args.get("review", False))
+                if not prompt and not extra_args and not review:
+                    return _jsonrpc_result(
+                        req_id,
+                        _tool_error("Provide 'prompt', 'review=true', or 'args' for run_codex"),
+                    )
+                session = await self.sessions.create_codex_session(
+                    prompt=prompt,
+                    cwd=args.get("cwd"),
+                    args=extra_args,
+                    skip_permissions=args.get("skip_permissions", True),
+                    sandbox_mode=args.get("sandbox_mode"),
+                    json_events=bool(args.get("json_events", False)),
+                    model=args.get("model"),
+                    effort=args.get("effort"),
+                    search=bool(args.get("search", False)),
+                    session_id=args.get("session_id"),
+                    continue_last=bool(args.get("continue_last", False)),
+                    review=review,
+                    add_dirs=args.get("add_dirs"),
+                    timeout=args.get("timeout"),
+                    close_stdin=True,
+                )
+                summary = await self._watch_session_with_progress(session, progress_token, emit_event)
+                result_data = {
+                    "session_id": summary["session_id"],
+                    "status": summary["status"],
+                    "returncode": summary["returncode"],
+                    "cwd": summary["cwd"],
+                    "duration_seconds": summary["duration_seconds"],
+                    "stdout": summary["stdout"],
+                    "stderr": summary["stderr"],
+                }
+                if summary["returncode"] != 0:
+                    return _jsonrpc_result(
+                        req_id,
+                        _tool_error(
+                            f"codex exited with code {summary['returncode']} ({summary['status']})",
+                            result_data,
+                        ),
+                    )
+                return _jsonrpc_result(req_id, _tool_success(result_data))
+
             if tool_name == "session_start":
                 stype = str(args.get("type", "exec"))
                 if stype == "agy":
@@ -1007,6 +1162,25 @@ class MCPHandler:
                     )
                     if args.get("prompt"):
                         await session.send_agy_turn(str(args["prompt"]), close_after=False)
+                elif stype == "codex":
+                    prompt = args.get("prompt")
+                    if not prompt:
+                        return _jsonrpc_result(
+                            req_id, _tool_error("Missing 'prompt' for session_start(type='codex')")
+                        )
+                    session = await self.sessions.create_codex_session(
+                        prompt=str(prompt),
+                        cwd=args.get("cwd"),
+                        env=args.get("env"),
+                        skip_permissions=args.get("skip_permissions", True),
+                        sandbox_mode=args.get("sandbox_mode"),
+                        json_events=True,
+                        model=args.get("model"),
+                        effort=args.get("effort"),
+                        use_pty=bool(args.get("use_pty", False)),
+                        timeout=args.get("timeout"),
+                        close_stdin=True,
+                    )
                 else:
                     command = args.get("command")
                     if not command:
@@ -1166,7 +1340,10 @@ class MCPHandler:
                     "active_sessions": self.sessions.active_count(),
                     "active_agy_sessions": self.sessions.active_agy_count(),
                     "queued_agy_sessions": self.sessions.queued_agy_count(),
+                    "active_codex_sessions": self.sessions.active_codex_count(),
+                    "queued_codex_sessions": self.sessions.queued_codex_count(),
                     "max_concurrent_agy": self.config.max_concurrent_agy,
+                    "codex_auth_configured": self.sessions.has_codex_auth(),
                     "default_workdir": self.config.default_workdir,
                 },
                 indent=2,
@@ -1188,6 +1365,7 @@ class MCPHandler:
                     "default_workdir": self.config.default_workdir,
                     "isolate_mount_namespace": self.config.isolate_mount_namespace,
                     "agy_default_sandbox": self.config.agy_default_sandbox,
+                    "codex_default_sandbox": self.config.codex_default_sandbox,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -1240,6 +1418,31 @@ class MCPHandler:
                                     f"Working in remote directory `{cwd}` via dots-gateway MCP tools:\n"
                                     f"1. Inspect the repository layout with `fs_list` and `exec_command` (`git status`).\n"
                                     f"2. Delegate the following task to `run_agy` (`skip_permissions=true`, `cwd='{cwd}'`):\n"
+                                    f"   Task: {task}\n"
+                                    f"3. Review changes with `exec_command` (`git diff`) and verify by running `{test_cmd}`."
+                                ),
+                            },
+                        }
+                    ],
+                },
+            )
+
+        if name == "delegate_to_codex":
+            task = p_args.get("task") or "<describe feature or review task>"
+            test_cmd = p_args.get("test_command") or "pytest -v"
+            return _jsonrpc_result(
+                req_id,
+                {
+                    "description": "Delegate implementation or review to local OpenAI Codex (`codex`) and verify.",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": (
+                                    f"Working in remote directory `{cwd}` via dots-gateway MCP tools:\n"
+                                    f"1. Inspect the repository layout with `fs_list` and `exec_command` (`git status`).\n"
+                                    f"2. Delegate the following task to `run_codex` (`skip_permissions=true`, `sandbox_mode='workspace-write'`, `cwd='{cwd}'`):\n"
                                     f"   Task: {task}\n"
                                     f"3. Review changes with `exec_command` (`git diff`) and verify by running `{test_cmd}`."
                                 ),

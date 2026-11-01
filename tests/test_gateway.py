@@ -360,6 +360,16 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--dangerously-skip-permissions", agy_res["argv"])
         self.assertIn("--sandbox", agy_res["argv"])
 
+        codex_res = await asyncio.to_thread(
+            client.run_codex, prompt=None, args=["--help"], skip_permissions=True
+        )
+        self.assertEqual(codex_res["returncode"], 0)
+        self.assertIn("-a", codex_res["argv"])
+        self.assertIn("never", codex_res["argv"])
+        self.assertIn("-s", codex_res["argv"])
+        self.assertIn("workspace-write", codex_res["argv"])
+        self.assertIn("exec", codex_res["argv"])
+
         async with client.connect_websocket() as ws:
             self.assertEqual(ws.welcome.get("type"), "connected")
             await ws.send_json(
@@ -472,6 +482,53 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ok_agy["returncode"], 0)
         self.assertIn(str(extra_ws.resolve()), ok_agy["argv"])
 
+        # 2b. Validate run_codex sandbox & workspace boundary enforcement
+        for bad_add_dir in [HOME_DIR, "/tmp", "/etc", str(GATEWAY_ROOT)]:
+            with self.assertRaises(RuntimeError) as ctx:
+                await asyncio.to_thread(
+                    client.run_codex,
+                    prompt=None,
+                    args=["--help"],
+                    add_dirs=[bad_add_dir],
+                )
+            self.assertIn("403", str(ctx.exception))
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await asyncio.to_thread(
+                client.run_codex,
+                prompt=None,
+                args=["--help"],
+                sandbox_mode="danger-full-access",
+            )
+        self.assertIn("403", str(ctx.exception))
+
+        for bad_codex_arg in [
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust",
+            f"--add-dir={HOME_DIR}",
+            "-s=danger-full-access",
+            "--config=sandbox_mode=danger-full-access",
+        ]:
+            with self.assertRaises(RuntimeError) as ctx:
+                await asyncio.to_thread(
+                    client.run_codex,
+                    prompt=None,
+                    args=[bad_codex_arg, "--help"],
+                )
+            self.assertIn("403", str(ctx.exception))
+
+        ok_codex = await asyncio.to_thread(
+            client.run_codex,
+            prompt=None,
+            args=["--help"],
+            sandbox_mode="read-only",
+            effort="high",
+            add_dirs=[str(extra_ws)],
+        )
+        self.assertEqual(ok_codex["returncode"], 0)
+        self.assertIn("read-only", ok_codex["argv"])
+        self.assertIn(str(extra_ws.resolve()), ok_codex["argv"])
+
         # 3. CLI path arguments escaping allowed_workdirs or hitting gateway source are rejected (403)
         for escape_cmd in [
             f"cat {GATEWAY_ROOT / 'main.py'}",
@@ -495,13 +552,14 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
             f"gw_exists = os.path.exists({str(GATEWAY_ROOT)!r})\n"
             "ssh_exists = os.path.exists(os.path.expanduser('~/.ssh'))\n"
             "gem_exists = os.path.exists(os.path.expanduser('~/.gemini'))\n"
+            "cdx_exists = os.path.exists(os.path.expanduser('~/.codex'))\n"
             "cfg_exists = os.path.exists(os.path.expanduser('~/.config/dots-gateway'))\n"
             "gh_exists = os.path.isdir(os.path.expanduser('~/.config/gh'))\n"
             f"ws_exists = os.path.isdir({self.tmpdir!r})\n"
             "marker = os.path.expanduser('~/.cache/_unit_persist_probe')\n"
             "open(marker, 'w').write('ok123')\n"
             "print(json.dumps({'cap_eff': cap_eff, 'gw': gw_exists, 'ssh': ssh_exists, "
-            "'gem': gem_exists, 'cfg': cfg_exists, 'gh': gh_exists, 'ws': ws_exists}))\n"
+            "'gem': gem_exists, 'cdx': cdx_exists, 'cfg': cfg_exists, 'gh': gh_exists, 'ws': ws_exists}))\n"
         )
         ns_res = await asyncio.to_thread(
             client.exec_command, ["python3", "-c", probe_code], cwd=self.tmpdir
@@ -512,6 +570,7 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(info["gw"])
         self.assertFalse(info["ssh"])
         self.assertFalse(info["gem"])
+        self.assertFalse(info["cdx"])
         self.assertFalse(info["cfg"])
         self.assertTrue(info["gh"])
         self.assertTrue(info["ws"])

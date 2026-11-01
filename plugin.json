@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "dots-gateway",
-  "version": "1.4.0",
-  "description": "Remote development & Antigravity (agy) MCP plugin enabling OpenAI dots to inspect/edit local files, execute allowlisted dev commands, and run agy --dangerously-skip-permissions.",
+  "version": "1.5.0",
+  "description": "Remote development, Antigravity (agy) & OpenAI Codex (codex) MCP plugin enabling OpenAI dots to inspect/edit local files, execute allowlisted dev commands, and run agy or codex.",
   "author": {
     "name": "caishize",
     "url": "https://github.com/caishize/dots-gateway"

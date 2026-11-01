@@ -385,10 +385,25 @@ class CommandPolicy:
         """Block CLI arguments targeting protected paths or escaping allowed_workdirs."""
         tok_list = list(tokens)
         for idx, tok in enumerate(tok_list[1:], start=1):
-            if tok in ("--no-sandbox", "--sandbox=false", "--sandbox=0", "--remote-control") or tok.startswith(
-                ("--settings=", "--remote-control=")
-            ) or tok == "--settings":
+            if (
+                tok
+                in (
+                    "--no-sandbox",
+                    "--sandbox=false",
+                    "--sandbox=0",
+                    "--sandbox=danger-full-access",
+                    "-s=danger-full-access",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--dangerously-bypass-hook-trust",
+                    "--remote-control",
+                )
+                or tok.startswith(("--settings=", "--remote-control="))
+                or tok == "--settings"
+            ):
                 return False, f"Flag '{tok}' is forbidden in command execution"
+            if tok in ("-s", "--sandbox") and idx + 1 < len(tok_list):
+                if tok_list[idx + 1] == "danger-full-access":
+                    return False, "Sandbox mode 'danger-full-access' is forbidden in command execution"
             if tok == "--add-dir":
                 if idx + 1 >= len(tok_list):
                     return False, "Missing directory path after '--add-dir'"
@@ -423,6 +438,7 @@ class CommandPolicy:
                             ".ssh",
                             ".gnupg",
                             ".gemini",
+                            ".codex",
                             ".config",
                             ".bashrc",
                             ".profile",
@@ -461,7 +477,16 @@ class CommandPolicy:
                 real_base = os.path.basename(res)
                 is_allowed_toolchain_symlink = (
                     self.is_within_allowed_workdirs(lex)
-                    and res.startswith(("/usr/", "/bin/", "/opt/uv-python/", "/opt/uv-tools/", "/opt/flutter/"))
+                    and res.startswith(
+                        (
+                            "/usr/",
+                            "/bin/",
+                            "/opt/uv-python/",
+                            "/opt/uv-tools/",
+                            "/opt/flutter/",
+                            "/opt/codex/",
+                        )
+                    )
                     and (
                         real_base in self._allowed_basenames
                         or bool(_VERSIONED_TOOL_RE.match(real_base))
@@ -590,9 +615,11 @@ class CommandPolicy:
                     if not inner_decision.allowed:
                         return inner_decision
 
-        # Resolve 'agy' binary path automatically if the first token is 'agy'
+        # Resolve 'agy' / 'codex' binary paths automatically if the first token is 'agy' or 'codex'
         if argv and argv[0] == "agy" and os.path.exists(self.config.agy_binary):
             argv = [self.config.agy_binary] + argv[1:]
+        elif argv and argv[0] == "codex" and os.path.exists(self.config.codex_binary):
+            argv = [self.config.codex_binary] + argv[1:]
 
         return PolicyDecision(
             allowed=True,
@@ -705,5 +732,131 @@ class CommandPolicy:
             and "-h" not in argv
         ):
             argv.append("--print=")
+
+        return argv
+
+    def build_codex_argv(
+        self,
+        prompt: Optional[str] = None,
+        args: Optional[Sequence[str]] = None,
+        skip_permissions: Optional[bool] = None,
+        sandbox_mode: Optional[str] = None,
+        json_events: bool = False,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        search: bool = False,
+        session_id: Optional[str] = None,
+        continue_last: bool = False,
+        review: bool = False,
+        skip_git_repo_check: bool = True,
+        ephemeral: bool = False,
+        add_dirs: Optional[Sequence[str]] = None,
+    ) -> List[str]:
+        """Construct a validated non-interactive `codex exec` invocation list confined to allowed_workdirs."""
+        codex_bin = (
+            self.config.codex_binary
+            if os.path.exists(self.config.codex_binary)
+            else "codex"
+        )
+        argv: List[str] = [codex_bin]
+
+        use_skip = (
+            self.config.codex_default_skip_permissions
+            if skip_permissions is None
+            else bool(skip_permissions)
+        )
+        eff_sandbox = (
+            self.config.codex_default_sandbox
+            if sandbox_mode is None
+            else str(sandbox_mode).strip()
+        )
+        if eff_sandbox not in ("read-only", "workspace-write"):
+            raise PermissionError(
+                f"Invalid or forbidden codex sandbox_mode '{eff_sandbox}'; allowed: 'workspace-write', 'read-only'"
+            )
+
+        extra = [str(a) for a in (args or [])]
+        for idx, raw_arg in enumerate(extra):
+            if raw_arg == "--add-dir" or raw_arg.startswith("--add-dir="):
+                raise PermissionError(
+                    "Raw '--add-dir' in args is forbidden; pass 'add_dirs' for workspace validation"
+                )
+            if raw_arg in ("-C", "--cd") or raw_arg.startswith("--cd="):
+                raise PermissionError(
+                    "Raw '-C'/'--cd' in args is forbidden; pass 'cwd' for workspace validation"
+                )
+            if raw_arg in (
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
+                "--remote-control",
+            ) or raw_arg.startswith("--remote-control="):
+                raise PermissionError(
+                    f"Raw '{raw_arg}' flag in args is forbidden by gateway security policy"
+                )
+            if raw_arg in ("-s", "--sandbox") or raw_arg.startswith(("-s=", "--sandbox=")):
+                raise PermissionError(
+                    "Raw '-s'/'--sandbox' in args is forbidden; pass 'sandbox_mode' parameter"
+                )
+            if raw_arg in ("-c", "--config") and idx + 1 < len(extra):
+                cfg_kv = extra[idx + 1].lower()
+                if "sandbox" in cfg_kv or "approval" in cfg_kv:
+                    raise PermissionError(
+                        "Overriding sandbox or approval policy via '-c/--config' is forbidden"
+                    )
+            if raw_arg.startswith(("-c=", "--config=")):
+                cfg_kv = raw_arg.split("=", 1)[1].lower()
+                if "sandbox" in cfg_kv or "approval" in cfg_kv:
+                    raise PermissionError(
+                        "Overriding sandbox or approval policy via '-c/--config' is forbidden"
+                    )
+
+        # Top-level Codex CLI options (placed before `exec` per codex-cli 0.166+ parser)
+        if use_skip:
+            argv.extend(["-a", "never"])
+        argv.extend(["-s", eff_sandbox])
+
+        if model and "-m" not in extra and "--model" not in extra:
+            argv.extend(["-m", model])
+        if effort:
+            mapped_effort = "xhigh" if effort == "max" else str(effort).strip()
+            if mapped_effort not in ("minimal", "low", "medium", "high", "xhigh"):
+                raise ValueError(
+                    f"Unsupported codex effort '{effort}'; expected minimal/low/medium/high/xhigh"
+                )
+            argv.extend(["-c", f'model_reasoning_effort="{mapped_effort}"'])
+        if search and "--search" not in extra:
+            argv.append("--search")
+
+        if add_dirs:
+            for d in add_dirs:
+                ok_dir, dir_err, resolved_dir = self.validate_workdir(str(d))
+                if not ok_dir:
+                    raise PermissionError(dir_err)
+                argv.extend(["--add-dir", resolved_dir])
+
+        # Non-interactive `exec` subcommand (+ optional `review` or `resume`)
+        argv.append("exec")
+        if review:
+            argv.append("review")
+        elif session_id or continue_last:
+            argv.append("resume")
+            if session_id:
+                argv.append(str(session_id))
+            elif continue_last:
+                argv.append("--last")
+
+        if skip_git_repo_check and "--skip-git-repo-check" not in extra:
+            argv.append("--skip-git-repo-check")
+        if ephemeral and "--ephemeral" not in extra:
+            argv.append("--ephemeral")
+        if json_events and "--json" not in extra:
+            argv.append("--json")
+
+        argv.extend(extra)
+
+        if prompt is not None:
+            if prompt.startswith("-") and "--" not in extra:
+                argv.append("--")
+            argv.append(prompt)
 
         return argv

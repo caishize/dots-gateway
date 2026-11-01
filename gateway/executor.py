@@ -15,6 +15,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, AsyncIterator, Deque, Dict, List, Optional, Sequence, Tuple, Union
 
 from .config import GatewayConfig
@@ -27,6 +28,9 @@ _STRIPPED_ENV_KEYS = {
     "GATEWAY_PASSWORD",
     "GATEWAY_HMAC_SECRET",
     "GATEWAY_TLS_KEY",
+    "OPENAI_API_" + "KEY",
+    "CODEX_API_" + "KEY",
+    "CODEX_ACCESS_TOKEN",
 }
 
 
@@ -90,6 +94,7 @@ class ExecutionSession:
         slot_sem: Optional[asyncio.Semaphore] = None,
         queue_timeout: float = 1800.0,
         is_agy: bool = False,
+        is_codex: bool = False,
         spawn_argv: Optional[List[str]] = None,
     ) -> None:
         self.session_id = session_id
@@ -104,6 +109,7 @@ class ExecutionSession:
         self.max_buffer_events = max_buffer_events
         self.max_output_bytes = max_output_bytes
         self.is_agy = is_agy
+        self.is_codex = is_codex
 
         self.status: str = "starting"
         self.pid: Optional[int] = None
@@ -646,10 +652,53 @@ class SessionManager:
             if required_dir not in parts:
                 parts.insert(0, required_dir)
         env["PATH"] = os.pathsep.join(parts)
+        if env.get("TERM") in (None, "", "dumb"):
+            env["TERM"] = "xterm-256color"
         if extra_env:
             for k, v in extra_env.items():
                 env[str(k)] = str(v)
         return env
+
+    def _load_codex_env(self) -> Dict[str, str]:
+        """Load isolated Codex credentials/env overrides from `codex_env_file` (`0600`)."""
+        out: Dict[str, str] = {}
+        raw_path = (self.config.codex_env_file or "").strip()
+        if not raw_path:
+            return out
+        env_p = Path(raw_path).expanduser()
+        if not env_p.is_file():
+            return out
+        try:
+            for raw_line in env_p.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                if k and v:
+                    out[k] = v
+        except OSError:
+            pass
+        return out
+
+    def has_codex_auth(self) -> bool:
+        """Return True if Codex CLI credentials exist in `codex.env` or `~/.codex/auth.json`."""
+        env_map = self._load_codex_env()
+        if any(
+            env_map.get(k)
+            for k in ("OPENAI_API_" + "KEY", "CODEX_API_" + "KEY", "CODEX_ACCESS_TOKEN")
+        ):
+            return True
+        auth_json = Path.home() / ".codex" / "auth.json"
+        try:
+            return auth_json.is_file() and auth_json.stat().st_size > 10
+        except OSError:
+            return False
 
     def _cleanup_old_sessions(self) -> None:
         if len(self._sessions) <= 100:
@@ -676,6 +725,16 @@ class SessionManager:
             1 for s in self._sessions.values() if s.is_agy and s.status == "queued"
         )
 
+    def active_codex_count(self) -> int:
+        return sum(
+            1 for s in self._sessions.values() if s.is_codex and s.status in ("starting", "running")
+        )
+
+    def queued_codex_count(self) -> int:
+        return sum(
+            1 for s in self._sessions.values() if s.is_codex and s.status == "queued"
+        )
+
     async def create_session(
         self,
         command: Union[str, Sequence[str]],
@@ -690,6 +749,7 @@ class SessionManager:
         slot_sem: Optional[asyncio.Semaphore] = None,
         queue_timeout: Optional[float] = None,
         is_agy: bool = False,
+        is_codex: bool = False,
     ) -> ExecutionSession:
         """Validate command against security policy and start an ExecutionSession."""
         if self.active_count() >= self.config.max_concurrent_sessions:
@@ -717,6 +777,8 @@ class SessionManager:
                 shell_cmd = command
                 if shell_cmd.strip().startswith("agy ") and os.path.exists(self.config.agy_binary):
                     shell_cmd = self.config.agy_binary + shell_cmd.strip()[3:]
+                elif shell_cmd.strip().startswith("codex ") and os.path.exists(self.config.codex_binary):
+                    shell_cmd = self.config.codex_binary + shell_cmd.strip()[5:]
             else:
                 shell_cmd = " ".join(shlex.quote(x) for x in decision.normalized_argv)
 
@@ -733,6 +795,7 @@ class SessionManager:
                 allowed_workdirs=self.config.allowed_workdirs,
                 protected_paths=self.config.protected_paths,
                 is_agy=is_agy,
+                is_codex=is_codex,
             )
 
         self._cleanup_old_sessions()
@@ -755,6 +818,7 @@ class SessionManager:
                 else float(queue_timeout)
             ),
             is_agy=is_agy,
+            is_codex=is_codex,
             spawn_argv=spawn_argv,
         )
         self._sessions[session_id] = session
@@ -811,6 +875,67 @@ class SessionManager:
             slot_sem=self._agy_sem,
             queue_timeout=self.config.agy_queue_timeout_seconds,
             is_agy=True,
+        )
+
+    async def create_codex_session(
+        self,
+        prompt: Optional[str] = None,
+        cwd: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+        args: Optional[Sequence[str]] = None,
+        skip_permissions: Optional[bool] = None,
+        sandbox_mode: Optional[str] = None,
+        json_events: bool = False,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        search: bool = False,
+        session_id: Optional[str] = None,
+        continue_last: bool = False,
+        review: bool = False,
+        skip_git_repo_check: bool = True,
+        ephemeral: bool = False,
+        add_dirs: Optional[Sequence[str]] = None,
+        use_pty: bool = False,
+        timeout: Optional[float] = None,
+        initial_stdin: Optional[str] = None,
+        close_stdin: bool = True,
+    ) -> ExecutionSession:
+        """Create a dedicated `codex exec` session jailed to allowed_workdirs + `~/.codex`."""
+        argv = self.policy.build_codex_argv(
+            prompt=prompt,
+            args=args,
+            skip_permissions=skip_permissions,
+            sandbox_mode=sandbox_mode,
+            json_events=json_events,
+            model=model,
+            effort=effort,
+            search=search,
+            session_id=session_id,
+            continue_last=continue_last,
+            review=review,
+            skip_git_repo_check=skip_git_repo_check,
+            ephemeral=ephemeral,
+            add_dirs=add_dirs,
+        )
+        merged_env = self._load_codex_env()
+        if env:
+            for k, v in env.items():
+                merged_env[str(k)] = str(v)
+        is_stream_json = json_events or "--json" in argv
+        eff_timeout = 1800.0 if timeout is None else float(timeout)
+        return await self.create_session(
+            command=argv,
+            cwd=cwd,
+            env=merged_env,
+            shell=False,
+            use_pty=use_pty,
+            stream_json=is_stream_json,
+            timeout=eff_timeout,
+            initial_stdin=initial_stdin,
+            close_stdin=close_stdin,
+            slot_sem=self._agy_sem,
+            queue_timeout=self.config.agy_queue_timeout_seconds,
+            is_codex=True,
         )
 
     def get_session(self, session_id: str) -> Optional[ExecutionSession]:

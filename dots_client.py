@@ -530,6 +530,92 @@ class DotsGatewayClient:
             payload["timeout"] = timeout
         yield from self._stream_sse("POST", "/v1/agy", payload, timeout=(timeout or 1800.0) + 30.0)
 
+    def run_codex(
+        self,
+        prompt: Optional[str] = None,
+        cwd: Optional[str] = None,
+        args: Optional[Sequence[str]] = None,
+        skip_permissions: bool = True,
+        sandbox_mode: str = "workspace-write",
+        json_events: bool = False,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        search: bool = False,
+        session_id: Optional[str] = None,
+        continue_last: bool = False,
+        review: bool = False,
+        add_dirs: Optional[Sequence[str]] = None,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Invoke `codex -a never -s <sandbox_mode> exec` on the gateway machine and return result."""
+        payload: Dict[str, Any] = {
+            "prompt": prompt,
+            "args": list(args or []),
+            "skip_permissions": skip_permissions,
+            "sandbox_mode": sandbox_mode,
+            "json_events": json_events,
+            "search": search,
+            "continue_last": continue_last,
+            "review": review,
+            "stream": False,
+        }
+        if cwd:
+            payload["cwd"] = cwd
+        if model:
+            payload["model"] = model
+        if effort:
+            payload["effort"] = effort
+        if session_id:
+            payload["session_id"] = session_id
+        if add_dirs:
+            payload["add_dirs"] = list(add_dirs)
+        if timeout is not None:
+            payload["timeout"] = timeout
+        return self._request_json("POST", "/v1/codex", payload, timeout=(timeout or 1800.0) + 30.0)
+
+    def stream_codex(
+        self,
+        prompt: Optional[str] = None,
+        cwd: Optional[str] = None,
+        args: Optional[Sequence[str]] = None,
+        skip_permissions: bool = True,
+        sandbox_mode: str = "workspace-write",
+        json_events: bool = True,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        search: bool = False,
+        session_id: Optional[str] = None,
+        continue_last: bool = False,
+        review: bool = False,
+        add_dirs: Optional[Sequence[str]] = None,
+        timeout: Optional[float] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """Invoke `codex exec` and stream real-time SSE events."""
+        payload: Dict[str, Any] = {
+            "prompt": prompt,
+            "args": list(args or []),
+            "skip_permissions": skip_permissions,
+            "sandbox_mode": sandbox_mode,
+            "json_events": json_events,
+            "search": search,
+            "continue_last": continue_last,
+            "review": review,
+            "stream": True,
+        }
+        if cwd:
+            payload["cwd"] = cwd
+        if model:
+            payload["model"] = model
+        if effort:
+            payload["effort"] = effort
+        if session_id:
+            payload["session_id"] = session_id
+        if add_dirs:
+            payload["add_dirs"] = list(add_dirs)
+        if timeout is not None:
+            payload["timeout"] = timeout
+        yield from self._stream_sse("POST", "/v1/codex", payload, timeout=(timeout or 1800.0) + 30.0)
+
     def create_session(self, **kwargs: Any) -> Dict[str, Any]:
         """Start an interactive session via REST (`POST /v1/sessions`)."""
         return self._request_json("POST", "/v1/sessions", kwargs)

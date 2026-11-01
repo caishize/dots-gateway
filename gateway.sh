@@ -23,10 +23,21 @@ SOURCE_TUNNEL_UNIT_FILE="${GATEWAY_DIR}/deploy/${TUNNEL_SERVICE_NAME}"
 CONFIG_FILE="${GATEWAY_DIR}/config.json"
 CLIENT_CONFIG_DIR="${HOME}/.config/dots-gateway"
 TUNNEL_ENV_FILE="${CLIENT_CONFIG_DIR}/tunnel.env"
+CODEX_ENV_FILE="${CLIENT_CONFIG_DIR}/codex.env"
 TUNNEL_HEALTH_URL="http://127.0.0.1:18766"
 
 is_tunnel_configured() {
   [[ -s "${TUNNEL_ENV_FILE}" && -f "${HOME}/.config/tunnel-client/dots-gateway.yaml" ]]
+}
+
+is_codex_auth_configured() {
+  if [[ -f "${HOME}/.codex/auth.json" ]] && [[ $(wc -c < "${HOME}/.codex/auth.json" 2>/dev/null || echo 0) -gt 10 ]]; then
+    return 0
+  fi
+  if [[ -f "${CODEX_ENV_FILE}" ]] && grep -Eq '^(export[[:space:]]+)?(OPENAI|CODEX)_' "${CODEX_ENV_FILE}" 2>/dev/null; then
+    return 0
+  fi
+  return 1
 }
 
 ensure_unit_installed() {
@@ -58,12 +69,39 @@ ensure_local_client_json() {
   mkdir -p "${CLIENT_CONFIG_DIR}"
   chmod 700 "${CLIENT_CONFIG_DIR}"
   python3 - "${CONFIG_FILE}" "${CLIENT_CONFIG_DIR}/client.json" <<'PY'
-import json, os, pathlib, sys
+import json, os, pathlib, shutil, sys
 cfg_p = pathlib.Path(sys.argv[1])
 out_p = pathlib.Path(sys.argv[2])
 d = json.loads(cfg_p.read_text(encoding="utf-8"))
+changed = False
 if d.get("loopback_http_port") is None:
     d["loopback_http_port"] = 18765
+    changed = True
+codex_bin = shutil.which("codex") or "/usr/local/bin/codex"
+if not d.get("codex_binary"):
+    d["codex_binary"] = codex_bin
+    changed = True
+if "codex_default_skip_permissions" not in d:
+    d["codex_default_skip_permissions"] = True
+    changed = True
+if not d.get("codex_default_sandbox"):
+    d["codex_default_sandbox"] = "workspace-write"
+    changed = True
+if not d.get("codex_env_file"):
+    d["codex_env_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "codex.env")
+    changed = True
+ac = d.get("allowed_commands")
+if isinstance(ac, list):
+    for c in ("codex", d["codex_binary"]):
+        if c and c not in ac:
+            ac.append(c)
+            changed = True
+pp = d.get("protected_paths")
+codex_home = str(pathlib.Path.home() / ".codex")
+if isinstance(pp, list) and codex_home not in pp:
+    pp.append(codex_home)
+    changed = True
+if changed:
     cfg_p.write_text(json.dumps(d, indent=2) + "\n", encoding="utf-8")
     os.chmod(cfg_p, 0o600)
 port = d.get("port", 8765)
@@ -247,6 +285,14 @@ cmd_status() {
   echo "============================================================================"
   echo "  Gateway Service  : ${SERVICE_NAME} (${state}) | PID=${pid} (${mem_mib})"
   echo "  Workspace Jail   : ${wdir} (mount_ns=${mns}, agy_sandbox=${sbx})"
+  local codex_ver codex_auth_state
+  codex_ver="$(/usr/local/bin/codex --version 2>/dev/null || echo 'not installed')"
+  if is_codex_auth_configured; then
+    codex_auth_state="auth=configured"
+  else
+    codex_auth_state="auth=pending (run 'dots-gateway codex-setup')"
+  fi
+  echo "  Local Agents     : agy + ${codex_ver} (${codex_auth_state})"
 
   if is_tunnel_configured; then
     local t_state t_pid t_ready t_id
@@ -460,6 +506,49 @@ cmd_tunnel_setup() {
   cmd_status
 }
 
+cmd_codex_setup() {
+  ensure_local_client_json
+  local var_oai="OPENAI_API""_KEY"
+  local var_base="OPENAI_BASE_URL"
+  local oai_val="${!var_oai:-}"
+  local base_val="${!var_base:-}"
+
+  if [[ -z "${oai_val}" ]]; then
+    read -rsp "请输入用于本机 Codex CLI 的 OpenAI API Key (输入不回显): " oai_val
+    echo ""
+  fi
+  oai_val="$(printf "%s" "${oai_val}" | tr -d '[:space:]')"
+  if [[ -z "${oai_val}" ]]; then
+    echo "ERROR: API Key 不能为空。" >&2
+    exit 1
+  fi
+
+  if [[ -z "${base_val}" && -t 0 ]]; then
+    read -rp "可选自定义 Base URL (默认使用 OpenAI 官方接口，直接回车跳过): " base_val
+    base_val="$(printf "%s" "${base_val}" | tr -d '[:space:]')"
+  fi
+
+  mkdir -p "${CLIENT_CONFIG_DIR}" "${HOME}/.codex"
+  chmod 700 "${CLIENT_CONFIG_DIR}" "${HOME}/.codex"
+  umask 077
+  {
+    printf "# Isolated OpenAI Codex CLI environment (0600, injected only into run_codex)\n"
+    printf "%s=%s\n" "${var_oai}" "${oai_val}"
+    if [[ -n "${base_val}" ]]; then
+      printf "%s=%s\n" "${var_base}" "${base_val}"
+    fi
+  } > "${CODEX_ENV_FILE}"
+  chmod 600 "${CODEX_ENV_FILE}"
+
+  if command -v codex >/dev/null 2>&1; then
+    printf "%s\n" "${oai_val}" | codex login --with-api-key >/dev/null
+    chmod 600 "${HOME}/.codex/auth.json" 2>/dev/null || true
+    echo "==> Verifying Codex login status ..."
+    codex login status || true
+  fi
+  echo "✅ Codex CLI 凭证已安全保存至 ${CODEX_ENV_FILE} (0600) 及 ~/.codex/auth.json (即时生效，无需重启网关)。"
+}
+
 cmd_config() {
   (cd "${GATEWAY_DIR}" && python3 main.py --print-plugin-config)
 }
@@ -489,6 +578,7 @@ Dots Gateway & Secure MCP Tunnel 运维管理命令行 (${PROG_NAME})
 
 核心命令:
   tunnel-setup [ID]  交互式配置并启动 OpenAI 官方 Secure MCP Tunnel (tunnel-client 后台常驻)
+  codex-setup        交互式配置本机 OpenAI Codex CLI 的 API Key (0600 隔离存储，即时生效)
   start              启动网关服务 (及已配置的 Tunnel 服务) 并执行健康检查
   stop               停止网关与 Tunnel 后台服务
   restart            重启网关与 Tunnel 后台服务并验证就绪状态 (别名: reload)
@@ -522,6 +612,9 @@ fi
 case "${ACTION}" in
   tunnel-setup|setup-tunnel)
     cmd_tunnel_setup "$@"
+    ;;
+  codex-setup|setup-codex)
+    cmd_codex_setup "$@"
     ;;
   start)
     cmd_start

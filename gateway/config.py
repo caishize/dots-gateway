@@ -15,12 +15,15 @@ GATEWAY_ROOT: Path = Path(__file__).resolve().parent.parent
 HOME_DIR: str = str(Path.home())
 DEFAULT_WORKSPACE_DIR: str = str(Path.home() / "workspaces")
 DEFAULT_AGY_BIN: str = shutil.which("agy") or str(Path.home() / ".local" / "bin" / "agy")
+DEFAULT_CODEX_BIN: str = shutil.which("codex") or "/usr/local/bin/codex"
 
 
 DEFAULT_ALLOWED_COMMANDS: List[str] = [
-    # Antigravity CLI
+    # Local autonomous coding agents (Antigravity CLI & OpenAI Codex CLI)
     "agy",
     DEFAULT_AGY_BIN,
+    "codex",
+    DEFAULT_CODEX_BIN,
     # Shell & builtins
     "bash",
     "sh",
@@ -245,6 +248,7 @@ DEFAULT_PROTECTED_PATHS: List[str] = [
     str(Path.home() / "oh-my-agents"),
     str(Path.home() / ".config"),
     str(Path.home() / ".gemini"),
+    str(Path.home() / ".codex"),
     str(Path.home() / ".ssh"),
     str(Path.home() / ".gnupg"),
     str(Path.home() / ".local"),
@@ -323,10 +327,14 @@ class GatewayConfig:
     protected_paths: List[str] = field(default_factory=lambda: list(DEFAULT_PROTECTED_PATHS))
     default_workdir: str = DEFAULT_WORKSPACE_DIR
     isolate_mount_namespace: bool = True
-    # Antigravity (agy) specific settings
+    # Antigravity (agy) & OpenAI Codex (codex) agent settings
     agy_binary: str = DEFAULT_AGY_BIN
     agy_default_skip_permissions: bool = True
     agy_default_sandbox: bool = True
+    codex_binary: str = DEFAULT_CODEX_BIN
+    codex_default_skip_permissions: bool = True
+    codex_default_sandbox: str = "workspace-write"
+    codex_env_file: str = str(Path.home() / ".config" / "dots-gateway" / "codex.env")
     max_concurrent_agy: int = field(default_factory=detect_recommended_max_agy)
     agy_queue_timeout_seconds: float = 1800.0
     # Execution, connection & memory limits
@@ -400,8 +408,22 @@ class GatewayConfig:
                 "true",
                 "yes",
             )
+        if os.environ.get("GATEWAY_CODEX_BIN"):
+            cfg.codex_binary = os.environ["GATEWAY_CODEX_BIN"]
+        if os.environ.get("GATEWAY_CODEX_SANDBOX"):
+            cfg.codex_default_sandbox = os.environ["GATEWAY_CODEX_SANDBOX"].strip()
+        if os.environ.get("GATEWAY_CODEX_ENV_FILE"):
+            cfg.codex_env_file = os.environ["GATEWAY_CODEX_ENV_FILE"].strip()
         if os.environ.get("GATEWAY_MAX_AGY"):
             cfg.max_concurrent_agy = max(1, int(os.environ["GATEWAY_MAX_AGY"]))
+
+        codex_home_str = str(Path.home() / ".codex")
+        if cfg.protected_paths and codex_home_str not in cfg.protected_paths:
+            cfg.protected_paths.append(codex_home_str)
+        if "agy" in cfg.allowed_commands:
+            for c_cmd in ("codex", cfg.codex_binary):
+                if c_cmd and c_cmd not in cfg.allowed_commands:
+                    cfg.allowed_commands.append(c_cmd)
         if os.environ.get("GATEWAY_TLS_CERT"):
             cfg.tls_certfile = os.environ["GATEWAY_TLS_CERT"]
         if os.environ.get("GATEWAY_TLS_KEY"):

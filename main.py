@@ -193,6 +193,10 @@ async def async_main() -> int:
         f"  Agy Binary          : {cfg.agy_binary} "
         f"(skip_permissions={cfg.agy_default_skip_permissions}, sandbox={cfg.agy_default_sandbox}, max_concurrent_agy={cfg.max_concurrent_agy})"
     )
+    print(
+        f"  Codex Binary        : {cfg.codex_binary} "
+        f"(skip_permissions={cfg.codex_default_skip_permissions}, sandbox={cfg.codex_default_sandbox})"
+    )
     print("-" * 76)
     print(f"  Bearer API Token    : {cfg.api_tokens[0]}")
     print(f"  HMAC-SHA256 Secret  : {cfg.hmac_secret}")

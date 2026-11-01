@@ -67,7 +67,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(os.access(GATEWAY_ROOT / "dots_mcp.py", os.X_OK))
 
         # 4. Validate bundled SKILL.md files
-        for skill_name in ("remote-dev-gateway", "delegate-to-agy"):
+        for skill_name in ("remote-dev-gateway", "delegate-to-agy", "delegate-to-codex"):
             skill_md = GATEWAY_ROOT / "skills" / skill_name / "SKILL.md"
             self.assertTrue(skill_md.is_file(), f"Missing {skill_md}")
             content = skill_md.read_text(encoding="utf-8")
@@ -126,7 +126,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(notif_resp)
         self.assertEqual(sid2, sid)
 
-        # 5. tools/list -> 14 curated tools
+        # 5. tools/list -> 15 curated tools (including run_agy & run_codex)
         tools_resp, _ = await asyncio.to_thread(
             authed.mcp_request,
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
@@ -137,6 +137,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             "gateway_status",
             "exec_command",
             "run_agy",
+            "run_codex",
             "session_start",
             "session_poll",
             "session_input",
@@ -772,6 +773,96 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             await lb_srv.stop()
+
+    async def test_run_codex_vfs_isolation_and_env_injection(self) -> None:
+        mock_codex = Path(self.tmpdir) / "mock_codex.py"
+        mock_codex.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "info = {\n"
+            "    'argv': sys.argv[1:],\n"
+            "    'has_codex_dir': os.path.isdir(os.path.expanduser('~/.codex')),\n"
+            "    'has_gemini_dir': os.path.exists(os.path.expanduser('~/.gemini')),\n"
+            "    'has_ssh_dir': os.path.exists(os.path.expanduser('~/.ssh')),\n"
+            f"    'has_gw_dir': os.path.exists({str(GATEWAY_ROOT)!r}),\n"
+            "    'has_gw_cfg': os.path.exists(os.path.expanduser('~/.config/dots-gateway')),\n"
+            "    'injected_marker': os.environ.get('CODEX_ISOLATED_MARKER', ''),\n"
+            "}\n"
+            "print(json.dumps(info))\n",
+            encoding="utf-8",
+        )
+        mock_codex.chmod(0o755)
+
+        codex_env = Path(self.tmpdir) / "isolated_codex.env"
+        codex_env.write_text("CODEX_ISOLATED_MARKER=codex_only_123\n", encoding="utf-8")
+        codex_env.chmod(0o600)
+
+        cdx_cfg = GatewayConfig(
+            host="127.0.0.1",
+            port=0,
+            api_tokens=["cdx-tok"],
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            codex_binary=str(mock_codex),
+            codex_env_file=str(codex_env),
+            allowed_commands=["python3", "env", str(mock_codex)],
+        )
+        cdx_srv = GatewayServer(cdx_cfg)
+        h, p = await cdx_srv.start()
+        try:
+            client = DotsGatewayClient(base_url=f"http://{h}:{p}", token="cdx-tok")
+
+            # 1. `run_codex` mounts ~/.codex & injects codex_env_file while hiding ~/.gemini, ~/.ssh, ~/gateway
+            resp, _ = await asyncio.to_thread(
+                client.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "cdx-1",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "run_codex",
+                        "arguments": {
+                            "prompt": "- audit security edge cases",
+                            "cwd": self.tmpdir,
+                            "sandbox_mode": "read-only",
+                            "effort": "high",
+                            "continue_last": True,
+                        },
+                    },
+                },
+            )
+            self.assertFalse(resp["result"]["isError"], resp)
+            parsed = json.loads(resp["result"]["structuredContent"]["stdout"].strip())
+            self.assertTrue(parsed["has_codex_dir"])
+            self.assertFalse(parsed["has_gemini_dir"])
+            self.assertFalse(parsed["has_ssh_dir"])
+            self.assertFalse(parsed["has_gw_dir"])
+            self.assertFalse(parsed["has_gw_cfg"])
+            self.assertEqual(parsed["injected_marker"], "codex_only_123")
+            self.assertIn("resume", parsed["argv"])
+            self.assertIn("--last", parsed["argv"])
+            self.assertIn("--", parsed["argv"])
+            self.assertEqual(parsed["argv"][-1], "- audit security edge cases")
+
+            # 2. Normal `exec_command` does NOT receive codex_env_file variables
+            exec_resp, _ = await asyncio.to_thread(
+                client.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "cdx-2",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "exec_command",
+                        "arguments": {"command": ["env"], "cwd": self.tmpdir},
+                    },
+                },
+            )
+            self.assertFalse(exec_resp["result"]["isError"])
+            self.assertNotIn(
+                "codex_only_123", exec_resp["result"]["structuredContent"]["stdout"]
+            )
+        finally:
+            await cdx_srv.stop()
 
 
 if __name__ == "__main__":

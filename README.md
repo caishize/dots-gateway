@@ -45,16 +45,17 @@ OpenAI Cloud Machine (`dots`)                            Local Dev Machine (`~/g
 | :--- | :--- |
 | `gateway_status` | Live health, uptime, active sessions, allowed workspaces, and policy summary |
 | `run_agy` | Run `agy --dangerously-skip-permissions` on the local host (supports `cwd`, `model`, `effort`, `conversation_id`, `continue_last`) |
+| `run_codex` | Run OpenAI Codex CLI (`codex -a never -s workspace-write exec`) on the local host (supports `cwd`, `sandbox_mode`, `model`, `effort`, `session_id`, `continue_last`, `review`) |
 | `exec_command` | Execute allowlisted commands or shell pipelines (`git`, `pytest`, `npm`, `cargo`, `./scripts/...`) with live SSE progress |
 | `fs_stat` / `fs_list` | Inspect file metadata or list directory entries inside allowed workspaces |
 | `fs_read` | Read UTF-8 text or Base64 binary files with optional byte `offset`/`limit` |
 | `fs_write` / `fs_patch` / `fs_delete` | Atomically write, exact search-and-replace patch, or delete workspace files |
-| `session_start` | Launch non-blocking background `exec` or multi-turn interactive `agy` sessions |
+| `session_start` | Launch non-blocking background `exec`, `codex`, or multi-turn interactive `agy` sessions |
 | `session_poll` | Poll incremental events (`after_seq`) with optional long-poll `wait_seconds` |
 | `session_input` / `session_signal` / `session_list` | Send `stdin` / follow-up `agy` turns, signal (`SIGINT`/`SIGTERM`/`SIGKILL`), or list sessions |
 
 - **MCP Resources**: `gateway://status`, `gateway://policy`, and template `file://{path}`
-- **MCP Prompts**: `delegate_to_agy`, `remote_tdd_loop`
+- **MCP Prompts**: `delegate_to_agy`, `delegate_to_codex`, `remote_tdd_loop`
 
 ---
 
@@ -74,6 +75,9 @@ dots-gateway logs -f
 
 # Recommended: Configure & start OpenAI official Secure MCP Tunnel (outbound-only, port-free)
 dots-gateway tunnel-setup
+
+# Configure OpenAI API Key for local Codex CLI (`run_codex`, stored 0600, effective immediately)
+dots-gateway codex-setup
 
 # Issue auto-renewing Let's Encrypt bare-IP + sslip.io TLS certificate (optional, for direct HTTPS)
 dots-gateway sync-ip

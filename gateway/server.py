@@ -472,6 +472,10 @@ class GatewayServer:
                     "agy_binary": self.config.agy_binary,
                     "agy_default_skip_permissions": self.config.agy_default_skip_permissions,
                     "agy_default_sandbox": self.config.agy_default_sandbox,
+                    "codex_binary": self.config.codex_binary,
+                    "codex_default_skip_permissions": self.config.codex_default_skip_permissions,
+                    "codex_default_sandbox": self.config.codex_default_sandbox,
+                    "codex_auth_configured": self.sessions.has_codex_auth(),
                 },
             )
             return
@@ -486,6 +490,10 @@ class GatewayServer:
 
         if req.method == "POST" and path == "/v1/agy":
             await self._handle_http_agy(req, writer)
+            return
+
+        if req.method == "POST" and path == "/v1/codex":
+            await self._handle_http_codex(req, writer)
             return
 
         if req.method == "POST" and path == "/v1/sessions":
@@ -890,6 +898,68 @@ class GatewayServer:
                 extra_headers={"X-Session-Id": session.session_id},
             )
 
+    async def _handle_http_codex(
+        self, req: HTTPRequest, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            body = self._parse_json_body(req)
+        except Exception as exc:
+            await send_json_response(writer, 400, {"ok": False, "error": f"Invalid JSON: {exc}"})
+            return
+
+        prompt = body.get("prompt")
+        args = body.get("args") or []
+        review = bool(body.get("review", False))
+        if prompt is None and not args and not review:
+            await send_json_response(
+                writer,
+                400,
+                {"ok": False, "error": "Provide 'prompt', 'review': true, or 'args'"},
+            )
+            return
+
+        stream = bool(body.get("stream", False)) or (
+            "text/event-stream" in req.headers.get("accept", "")
+        )
+        try:
+            session = await self.sessions.create_codex_session(
+                prompt=prompt,
+                cwd=body.get("cwd"),
+                env=body.get("env"),
+                args=args,
+                skip_permissions=body.get("skip_permissions"),
+                sandbox_mode=body.get("sandbox_mode"),
+                json_events=bool(body.get("json_events", False)),
+                model=body.get("model"),
+                effort=body.get("effort"),
+                search=bool(body.get("search", False)),
+                session_id=body.get("session_id"),
+                continue_last=bool(body.get("continue_last", False)),
+                review=review,
+                add_dirs=body.get("add_dirs"),
+                use_pty=bool(body.get("use_pty", False)),
+                timeout=body.get("timeout"),
+                initial_stdin=body.get("stdin"),
+                close_stdin=bool(body.get("close_stdin", True)),
+            )
+        except PermissionError as exc:
+            await send_json_response(writer, 403, {"ok": False, "error": str(exc)})
+            return
+        except Exception as exc:
+            await send_json_response(writer, 400, {"ok": False, "error": str(exc)})
+            return
+
+        if stream:
+            await self._stream_session_sse(session, writer, after_seq=0)
+        else:
+            summary = await session.wait()
+            await send_json_response(
+                writer,
+                200,
+                {"ok": summary["returncode"] == 0, **summary},
+                extra_headers={"X-Session-Id": session.session_id},
+            )
+
     async def _handle_http_create_session(
         self, req: HTTPRequest, writer: asyncio.StreamWriter
     ) -> None:
@@ -926,6 +996,36 @@ class GatewayServer:
                 )
                 if body.get("prompt"):
                     await session.send_agy_turn(str(body["prompt"]), close_after=False)
+            elif session_type == "codex":
+                prompt = body.get("prompt")
+                args = body.get("args") or []
+                review = bool(body.get("review", False))
+                if prompt is None and not args and not review:
+                    await send_json_response(
+                        writer,
+                        400,
+                        {"ok": False, "error": "Missing 'prompt' for session type 'codex'"},
+                    )
+                    return
+                session = await self.sessions.create_codex_session(
+                    prompt=prompt,
+                    cwd=body.get("cwd"),
+                    env=body.get("env"),
+                    args=args,
+                    skip_permissions=body.get("skip_permissions"),
+                    sandbox_mode=body.get("sandbox_mode"),
+                    json_events=bool(body.get("json_events", True)),
+                    model=body.get("model"),
+                    effort=body.get("effort"),
+                    search=bool(body.get("search", False)),
+                    session_id=body.get("session_id"),
+                    continue_last=bool(body.get("continue_last", False)),
+                    review=review,
+                    add_dirs=body.get("add_dirs"),
+                    use_pty=bool(body.get("use_pty", False)),
+                    timeout=body.get("timeout"),
+                    close_stdin=True,
+                )
             else:
                 command = body.get("command")
                 if not command:
@@ -1093,6 +1193,49 @@ class GatewayServer:
                         )
                         if interactive and prompt is not None:
                             await session.send_agy_turn(str(prompt), close_after=False)
+                    except Exception as exc:
+                        await ws.send_json(
+                            {"type": "error", "id": req_id, "error": str(exc)}
+                        )
+                        continue
+
+                    await ws.send_json(
+                        {
+                            "type": "session.created",
+                            "id": req_id,
+                            "session_id": session.session_id,
+                            "pid": session.pid,
+                            "argv": session.argv,
+                            "cwd": session.cwd,
+                        }
+                    )
+                    t = asyncio.create_task(_forward_session_events(session, req_id))
+                    stream_tasks.add(t)
+                    t.add_done_callback(stream_tasks.discard)
+                    continue
+
+                if action == "codex":
+                    try:
+                        session = await self.sessions.create_codex_session(
+                            prompt=msg.get("prompt"),
+                            cwd=msg.get("cwd"),
+                            env=msg.get("env"),
+                            args=msg.get("args"),
+                            skip_permissions=msg.get("skip_permissions"),
+                            sandbox_mode=msg.get("sandbox_mode"),
+                            json_events=bool(msg.get("json_events", True)),
+                            model=msg.get("model"),
+                            effort=msg.get("effort"),
+                            search=bool(msg.get("search", False)),
+                            session_id=msg.get("session_id"),
+                            continue_last=bool(msg.get("continue_last", False)),
+                            review=bool(msg.get("review", False)),
+                            add_dirs=msg.get("add_dirs"),
+                            use_pty=bool(msg.get("use_pty", False)),
+                            timeout=msg.get("timeout"),
+                            initial_stdin=msg.get("stdin"),
+                            close_stdin=bool(msg.get("close_stdin", True)),
+                        )
                     except Exception as exc:
                         await ws.send_json(
                             {"type": "error", "id": req_id, "error": str(exc)}
