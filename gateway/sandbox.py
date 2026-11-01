@@ -147,7 +147,7 @@ def build_mount_ns_argv(
         "  fi",
         "done",
         # Protect /opt SDK installations as read-only while keeping Flutter's bin/cache writable
-        "for ro_opt in /opt/codex /opt/uv-python /opt/uv-tools /opt/flutter; do",
+        "for ro_opt in /opt/codex /opt/devtools /opt/uv-python /opt/uv-tools /opt/flutter; do",
         '  if [ -d "$ro_opt" ] && [ -d "/mnt$ro_opt" ]; then',
         f'    {q_mount} --bind "$ro_opt" "/mnt$ro_opt"',
         f'    {q_mount} -o remount,bind,ro "/mnt$ro_opt" 2>/dev/null || {q_mount} -o bind,remount,ro "/mnt$ro_opt"',

@@ -499,6 +499,7 @@ class CommandPolicy:
                             "/opt/uv-tools/",
                             "/opt/flutter/",
                             "/opt/codex/",
+                            "/opt/devtools/",
                         )
                     )
                     and (

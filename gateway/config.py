@@ -71,6 +71,8 @@ DEFAULT_ALLOWED_COMMANDS: List[str] = [
     "npm",
     "npx",
     "pnpm",
+    "pnpx",
+    "corepack",
     "yarn",
     "bun",
     "tsc",

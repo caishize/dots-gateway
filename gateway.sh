@@ -101,7 +101,7 @@ if not d.get("codex_env_file"):
     changed = True
 ac = d.get("allowed_commands")
 if isinstance(ac, list):
-    for c in ("codex", d["codex_binary"]):
+    for c in ("codex", d["codex_binary"], "node", "npm", "npx", "pnpm", "pnpx", "corepack", "terraform", "trivy"):
         if c and c not in ac:
             ac.append(c)
             changed = True
