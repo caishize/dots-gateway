@@ -48,6 +48,10 @@ ensure_unit_installed() {
   if ! systemctl --user is-enabled "${SERVICE_NAME}" >/dev/null 2>&1; then
     systemctl --user enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
   fi
+  # Ensure user systemd instance survives SSH logout (`Linger=yes`)
+  if [[ "$(loginctl show-user "${USER}" -p Linger --value 2>/dev/null || echo "no")" != "yes" ]]; then
+    loginctl enable-linger "${USER}" >/dev/null 2>&1 || sudo -n loginctl enable-linger "${USER}" >/dev/null 2>&1 || true
+  fi
 }
 
 ensure_local_client_json() {
