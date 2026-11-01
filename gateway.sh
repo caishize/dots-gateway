@@ -142,6 +142,34 @@ try:
         if new_toml != existing:
             toml_p.write_text(new_toml, encoding="utf-8")
             os.chmod(toml_p, 0o600)
+
+    agy_cfg_dir = pathlib.Path.home() / ".gemini" / "antigravity-cli"
+    if agy_cfg_dir.is_dir():
+        agy_settings_p = agy_cfg_dir / "settings.json"
+        agy_data = (
+            json.loads(agy_settings_p.read_text(encoding="utf-8"))
+            if agy_settings_p.is_file()
+            else {}
+        )
+        if isinstance(agy_data, dict):
+            agy_changed = False
+            tw = list(agy_data.get("trustedWorkspaces") or [])
+            for wd in gw_cfg.allowed_workdirs:
+                abs_wd = os.path.abspath(os.path.expanduser(wd))
+                if abs_wd not in tw:
+                    tw.append(abs_wd)
+                    agy_changed = True
+            if tw and agy_data.get("trustedWorkspaces") != tw:
+                agy_data["trustedWorkspaces"] = tw
+            merged_perms = pol.build_agy_sandbox_settings()["permissions"]
+            if agy_data.get("permissions") != merged_perms:
+                agy_data["permissions"] = merged_perms
+                agy_changed = True
+            if agy_changed:
+                agy_settings_p.write_text(
+                    json.dumps(agy_data, indent=2) + "\n", encoding="utf-8"
+                )
+                os.chmod(agy_settings_p, 0o600)
 except Exception:
     pass
 

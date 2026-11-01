@@ -657,6 +657,15 @@ class SessionManager:
         if extra_env:
             for k, v in extra_env.items():
                 env[str(k)] = str(v)
+        # Ensure loopback traffic (e.g. Flutter `flutter_tester` WebSocket on `127.0.0.1:<port>`)
+        # bypasses outbound sandbox HTTP proxies (`agy --sandbox`'s `HTTP_PROXY`/`connectd`)
+        for np_key in ("NO_PROXY", "no_proxy"):
+            existing_np = [x.strip() for x in env.get(np_key, "").split(",") if x.strip()]
+            if "*" not in existing_np:
+                for host in ("localhost", "127.0.0.1", "::1"):
+                    if host not in existing_np:
+                        existing_np.append(host)
+                env[np_key] = ",".join(existing_np)
         return env
 
     def _load_codex_env(self) -> Dict[str, str]:
@@ -757,7 +766,9 @@ class SessionManager:
                 f"Maximum concurrent sessions ({self.config.max_concurrent_sessions}) reached"
             )
 
-        decision = self.policy.validate_command(command, cwd=cwd)
+        decision = self.policy.validate_command(
+            command, cwd=cwd, _trusted_agy_argv=is_agy
+        )
         if not decision.allowed:
             raise PermissionError(decision.reason)
 
@@ -860,6 +871,7 @@ class SessionManager:
             conversation_id=conversation_id,
             continue_last=continue_last,
             add_dirs=add_dirs,
+            cwd=cwd,
         )
         is_stream_json = output_format == "stream-json" or "--output-format=stream-json" in argv
         return await self.create_session(

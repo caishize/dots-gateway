@@ -9,7 +9,7 @@ import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from .config import GatewayConfig
 
@@ -382,11 +382,16 @@ class CommandPolicy:
         return True, ""
 
     def _check_protected_arguments(
-        self, tokens: Sequence[str], resolved_cwd: str
+        self,
+        tokens: Sequence[str],
+        resolved_cwd: str,
+        _trusted_agy_argv: bool = False,
     ) -> Tuple[bool, str]:
         """Block CLI arguments targeting protected paths or escaping allowed_workdirs."""
         tok_list = list(tokens)
         for idx, tok in enumerate(tok_list[1:], start=1):
+            if _trusted_agy_argv and tok.startswith("--settings={"):
+                continue
             if (
                 tok
                 in (
@@ -520,6 +525,7 @@ class CommandPolicy:
         command: Union[str, Sequence[str]],
         cwd: Optional[str] = None,
         _depth: int = 0,
+        _trusted_agy_argv: bool = False,
     ) -> PolicyDecision:
         if _depth > 8:
             return PolicyDecision(False, reason="Excessive nested subshell depth")
@@ -609,7 +615,11 @@ class CommandPolicy:
             if not ok_rm:
                 return PolicyDecision(False, reason=rm_err, resolved_cwd=resolved_cwd)
 
-            ok_prot, prot_err = self._check_protected_arguments(seg_tokens[idx:], resolved_cwd)
+            ok_prot, prot_err = self._check_protected_arguments(
+                seg_tokens[idx:],
+                resolved_cwd,
+                _trusted_agy_argv=(_trusted_agy_argv and _depth == 0),
+            )
             if not ok_prot:
                 return PolicyDecision(False, reason=prot_err, resolved_cwd=resolved_cwd)
 
@@ -653,6 +663,7 @@ class CommandPolicy:
         conversation_id: Optional[str] = None,
         continue_last: bool = False,
         add_dirs: Optional[Sequence[str]] = None,
+        cwd: Optional[str] = None,
     ) -> List[str]:
         """Construct a validated `agy` CLI invocation list confined to allowed_workdirs."""
         agy_bin = (
@@ -692,8 +703,11 @@ class CommandPolicy:
 
         if use_skip and "--dangerously-skip-permissions" not in extra:
             argv.append("--dangerously-skip-permissions")
-        if use_sandbox and "--sandbox" not in extra:
-            argv.append("--sandbox")
+        if use_sandbox:
+            if "--sandbox" not in extra:
+                argv.append("--sandbox")
+            agy_settings = self.build_agy_sandbox_settings(cwd=cwd, add_dirs=add_dirs)
+            argv.append(f"--settings={json.dumps(agy_settings, separators=(',', ':'))}")
 
         if model and "--model" not in extra:
             argv.extend(["--model", model])
@@ -743,6 +757,65 @@ class CommandPolicy:
             argv.append("--print=")
 
         return argv
+
+    def get_agy_writable_roots(
+        self,
+        cwd: Optional[str] = None,
+        add_dirs: Optional[Sequence[str]] = None,
+    ) -> List[str]:
+        """Compute safe `write_file(...)` mount roots for `agy --sandbox`.
+
+        Includes the validated session `cwd` explicitly (because `agy --sandbox`
+        otherwise mounts an active sub-workspace read-only in default/enterprise
+        mode even when a parent directory is writable), alongside all configured
+        `allowed_workdirs`, `add_dirs`, Flutter SDK `bin/cache`, and isolated
+        developer toolchain caches.
+        """
+        ok_cwd, cwd_err, resolved_cwd = self.validate_workdir(cwd)
+        if not ok_cwd:
+            raise PermissionError(cwd_err)
+
+        roots: List[str] = []
+        seen: set[str] = set()
+
+        def _add(cand_path: str) -> None:
+            norm = os.path.abspath(cand_path)
+            if norm not in seen:
+                seen.add(norm)
+                roots.append(norm)
+
+        _add(resolved_cwd)
+        for root in self.get_codex_writable_roots(add_dirs=add_dirs):
+            _add(root)
+        return roots
+
+    def build_agy_sandbox_settings(
+        self,
+        cwd: Optional[str] = None,
+        add_dirs: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """Build session `--settings` JSON granting `write_file` mounts inside `agy --sandbox`."""
+        perms: Dict[str, Any] = {}
+        settings_path = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
+        try:
+            if settings_path.is_file():
+                raw = json.loads(settings_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict) and isinstance(raw.get("permissions"), dict):
+                    for k, v in raw["permissions"].items():
+                        if isinstance(v, list):
+                            perms[k] = [str(x) for x in v]
+        except Exception:
+            pass
+
+        allow_list: List[str] = list(perms.get("allow") or [])
+        allow_seen = set(allow_list)
+        for root in self.get_agy_writable_roots(cwd=cwd, add_dirs=add_dirs):
+            rule = f"write_file({root})"
+            if rule not in allow_seen:
+                allow_seen.add(rule)
+                allow_list.append(rule)
+        perms["allow"] = allow_list
+        return {"permissions": perms}
 
     def get_codex_writable_roots(
         self, add_dirs: Optional[Sequence[str]] = None

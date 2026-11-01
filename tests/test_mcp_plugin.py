@@ -918,6 +918,89 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await cdx_srv.stop()
 
+    async def test_run_agy_vfs_sandbox_settings_and_loopback_no_proxy(self) -> None:
+        sub_ws = Path(self.tmpdir) / "nested-worktree" / "demo-app"
+        sub_ws.mkdir(parents=True, exist_ok=True)
+
+        mock_agy = Path(self.tmpdir) / "mock_agy.py"
+        mock_agy.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "info = {\n"
+            "    'argv': sys.argv[1:],\n"
+            "    'cwd': os.getcwd(),\n"
+            "    'no_proxy': os.environ.get('NO_PROXY', ''),\n"
+            "    'no_proxy_lower': os.environ.get('no_proxy', ''),\n"
+            "    'has_gemini_dir': os.path.isdir(os.path.expanduser('~/.gemini')),\n"
+            "    'has_codex_dir': os.path.exists(os.path.expanduser('~/.codex')),\n"
+            "    'has_ssh_dir': os.path.exists(os.path.expanduser('~/.ssh')),\n"
+            f"    'has_gw_dir': os.path.exists({str(GATEWAY_ROOT)!r}),\n"
+            "    'has_gw_cfg': os.path.exists(os.path.expanduser('~/.config/dots-gateway')),\n"
+            "    'flutter_bin_writable': os.access('/opt/flutter/bin/flutter', os.W_OK) if os.path.exists('/opt/flutter/bin/flutter') else None,\n"
+            "    'flutter_cache_writable': os.access('/opt/flutter/bin/cache', os.W_OK) if os.path.isdir('/opt/flutter/bin/cache') else None,\n"
+            "}\n"
+            "print(json.dumps(info))\n",
+            encoding="utf-8",
+        )
+        mock_agy.chmod(0o755)
+
+        agy_cfg = GatewayConfig(
+            host="127.0.0.1",
+            port=0,
+            api_tokens=["agy-tok"],
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            agy_binary=str(mock_agy),
+            allowed_commands=["python3", "env", str(mock_agy)],
+        )
+        agy_srv = GatewayServer(agy_cfg)
+        h, p = await agy_srv.start()
+        try:
+            client = DotsGatewayClient(base_url=f"http://{h}:{p}", token="agy-tok")
+
+            resp, _ = await asyncio.to_thread(
+                client.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "agy-1",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "run_agy",
+                        "arguments": {
+                            "prompt": "run flutter test",
+                            "cwd": str(sub_ws),
+                        },
+                    },
+                },
+            )
+            self.assertFalse(resp["result"]["isError"], resp)
+            parsed = json.loads(resp["result"]["structuredContent"]["stdout"].strip())
+            self.assertEqual(parsed["cwd"], str(sub_ws.resolve()))
+            self.assertTrue(parsed["has_gemini_dir"])
+            self.assertFalse(parsed["has_codex_dir"])
+            self.assertFalse(parsed["has_ssh_dir"])
+            self.assertFalse(parsed["has_gw_dir"])
+            self.assertFalse(parsed["has_gw_cfg"])
+            for host in ("localhost", "127.0.0.1", "::1"):
+                self.assertIn(host, parsed["no_proxy"].split(","))
+                self.assertIn(host, parsed["no_proxy_lower"].split(","))
+            if os.path.isdir("/opt/flutter/bin/cache"):
+                self.assertFalse(parsed["flutter_bin_writable"])
+                self.assertTrue(parsed["flutter_cache_writable"])
+
+            settings_arg = next(
+                a for a in parsed["argv"] if a.startswith("--settings=")
+            )
+            settings_obj = json.loads(settings_arg.split("=", 1)[1])
+            allow_rules = settings_obj["permissions"]["allow"]
+            self.assertIn(f"write_file({sub_ws.resolve()})", allow_rules)
+            self.assertIn(f"write_file({Path(self.tmpdir).resolve()})", allow_rules)
+            if os.path.isdir("/opt/flutter/bin/cache"):
+                self.assertIn("write_file(/opt/flutter/bin/cache)", allow_rules)
+            self.assertNotIn(f"write_file({GATEWAY_ROOT})", allow_rules)
+        finally:
+            await agy_srv.stop()
+
 
 if __name__ == "__main__":
     unittest.main()
