@@ -94,6 +94,7 @@ DEFAULT_ALLOWED_COMMANDS: List[str] = [
     "make",
     "cmake",
     "ninja",
+    "pkg-config",
     "gcc",
     "g++",
     "clang",
