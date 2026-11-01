@@ -18,7 +18,7 @@ from .executor import ExecutionSession, SessionManager
 from .files import FileService
 from .mcp import MCPHandler
 from .oauth import OAuthServer
-from .policy import CommandPolicy
+from .policy import CommandPolicy, redact_for_audit_log
 from .protocol import (
     HTTPRequest,
     SSEWriter,
@@ -747,6 +747,11 @@ class GatewayServer:
                 writer, 404, {"ok": False, "error": f"Unknown file endpoint: {req.method} {path}"}
             )
         except PermissionError as exc:
+            logger.warning(
+                "HTTP file policy rejection: path=%s reason=%s",
+                path,
+                exc,
+            )
             await send_json_response(writer, 403, {"ok": False, "error": str(exc)})
         except FileNotFoundError as exc:
             await send_json_response(writer, 404, {"ok": False, "error": str(exc)})
@@ -802,6 +807,13 @@ class GatewayServer:
                 close_stdin=close_stdin,
             )
         except PermissionError as exc:
+            logger.warning(
+                "HTTP exec policy rejection: route=%s cwd=%r reason=%s preview=%s",
+                req.path,
+                body.get("cwd"),
+                exc,
+                redact_for_audit_log(command),
+            )
             await send_json_response(writer, 403, {"ok": False, "error": str(exc)})
             return
         except Exception as exc:
@@ -874,6 +886,13 @@ class GatewayServer:
             if interactive and prompt is not None:
                 await session.send_agy_turn(str(prompt), close_after=False)
         except PermissionError as exc:
+            logger.warning(
+                "HTTP agy policy rejection: route=%s cwd=%r reason=%s preview=%s",
+                req.path,
+                body.get("cwd"),
+                exc,
+                redact_for_audit_log(args or body.get("add_dirs")),
+            )
             await send_json_response(writer, 403, {"ok": False, "error": str(exc)})
             return
         except Exception as exc:
@@ -943,6 +962,13 @@ class GatewayServer:
                 close_stdin=bool(body.get("close_stdin", True)),
             )
         except PermissionError as exc:
+            logger.warning(
+                "HTTP codex policy rejection: route=%s cwd=%r reason=%s preview=%s",
+                req.path,
+                body.get("cwd"),
+                exc,
+                redact_for_audit_log(args or body.get("add_dirs") or body.get("sandbox_mode")),
+            )
             await send_json_response(writer, 403, {"ok": False, "error": str(exc)})
             return
         except Exception as exc:
@@ -1047,6 +1073,14 @@ class GatewayServer:
                     close_stdin=bool(body.get("close_stdin", False)),
                 )
         except PermissionError as exc:
+            logger.warning(
+                "HTTP session policy rejection: route=%s type=%s cwd=%r reason=%s preview=%s",
+                req.path,
+                session_type,
+                body.get("cwd"),
+                exc,
+                redact_for_audit_log(body.get("command") or body.get("args") or body.get("add_dirs")),
+            )
             await send_json_response(writer, 403, {"ok": False, "error": str(exc)})
             return
         except Exception as exc:

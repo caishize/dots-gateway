@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 import json
+import logging
 import secrets
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -22,7 +23,9 @@ from . import __version__
 from .config import GatewayConfig
 from .executor import ExecutionSession, SessionManager
 from .files import FileService
-from .policy import CommandPolicy
+from .policy import CommandPolicy, redact_for_audit_log
+
+logger = logging.getLogger("dots_gateway")
 
 SUPPORTED_PROTOCOL_VERSIONS: Tuple[str, ...] = (
     "2025-06-18",
@@ -72,9 +75,10 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "exec_command",
         "title": "Execute Remote Development Command",
         "description": (
-            "Execute an allowlisted command or compound shell pipeline (e.g., `git status`, "
-            "`pytest -v`, `cd ~/proj && npm test`, `./scripts/build.sh`) on the remote machine "
-            "and return stdout, stderr, and exit code."
+            "Execute an allowlisted command, compound shell pipeline, or multi-line heredoc script "
+            "(e.g., `git status`, `pytest -v`, `cd ~/proj && npm test`, "
+            "`python3 - <<'PY'\\nimport sys\\nprint(sys.version)\\nPY`, or `./scripts/build.sh`) "
+            "on the remote machine and return stdout, stderr, and exit code."
         ),
         "inputSchema": {
             "type": "object",
@@ -1324,7 +1328,21 @@ class MCPHandler:
                 )
                 return _jsonrpc_result(req_id, _tool_success(res))
 
-        except (PermissionError, FileNotFoundError, ValueError, RuntimeError, OSError) as exc:
+        except PermissionError as exc:
+            preview = redact_for_audit_log(
+                args.get("command")
+                if "command" in args
+                else (args.get("path") or args.get("args") or args.get("add_dirs"))
+            )
+            logger.warning(
+                "MCP policy rejection: tool=%s cwd=%r reason=%s preview=%s",
+                tool_name,
+                args.get("cwd"),
+                exc,
+                preview,
+            )
+            return _jsonrpc_result(req_id, _tool_error(str(exc)))
+        except (FileNotFoundError, ValueError, RuntimeError, OSError) as exc:
             return _jsonrpc_result(req_id, _tool_error(str(exc)))
 
         return _jsonrpc_error(req_id, -32602, f"Unhandled tool: {tool_name}")

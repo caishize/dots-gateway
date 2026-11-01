@@ -246,6 +246,118 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res_script["returncode"], 0)
         self.assertIn("LOCAL_BUILD_OK", res_script["stdout"])
 
+    async def test_multiline_heredoc_comments_and_security_invariants(self) -> None:
+        from gateway.policy import redact_for_audit_log
+
+        client = DotsGatewayClient(
+            base_url=self.base_url, token="test-secret-token-12345"
+        )
+
+        # 1. Multi-line Python heredoc (`<<'PY'`) with `import`, apostrophe comments, and MCP `exec_command`
+        heredoc_py = (
+            "python3 - <<'PY'\n"
+            "import json\n"
+            "import pathlib\n"
+            "# It's a multi-line script; don't split `import` as a shell command )\n"
+            "print(json.dumps({'heredoc_ok': True, 'cwd_exists': pathlib.Path('.').is_dir()}))\n"
+            "PY"
+        )
+        mcp_resp, _ = await asyncio.to_thread(
+            client.mcp_request,
+            {
+                "jsonrpc": "2.0",
+                "id": "hd-1",
+                "method": "tools/call",
+                "params": {
+                    "name": "exec_command",
+                    "arguments": {"command": heredoc_py, "cwd": self.tmpdir},
+                },
+            },
+        )
+        self.assertFalse(mcp_resp["result"]["isError"], mcp_resp)
+        hd_out = json.loads(mcp_resp["result"]["structuredContent"]["stdout"].strip())
+        self.assertEqual(hd_out, {"heredoc_ok": True, "cwd_exists": True})
+
+        # 2. Chained heredoc + `$(...)` heredoc capture + `#` comments + `\\\n` continuation + `$'...'` + `if`/`for`
+        complex_script = (
+            "set -euo pipefail\n"
+            "# Leading comment with apostrophe: don't fail\n"
+            "python3 \\\n"
+            "  -c \\\n"
+            "  $'import sys\\nx = \\'CONT_ANSI_OK\\'\\nprint(x)'\n"
+            "CAP=$(python3 - <<-'PY'\n"
+            "\timport json\n"
+            "\t# Unmatched paren & quote in heredoc inside $(...): don't )\n"
+            "\tprint(json.dumps({'cap': 99}))\n"
+            "\tPY\n"
+            ")\n"
+            "echo \"CAP=$CAP\"\n"
+            "for tag in alpha beta; do\n"
+            "  if [ \"$tag\" = \"beta\" ]; then\n"
+            "    python3 - <<'PY' && echo \"LOOP_DONE\"\n"
+            "import os\n"
+            "print('TAG_BETA_OK')\n"
+            "PY\n"
+            "  fi\n"
+            "done\n"
+        )
+        res_complex = await asyncio.to_thread(
+            client.exec_command, complex_script, cwd=self.tmpdir
+        )
+        self.assertEqual(res_complex["returncode"], 0, res_complex["stderr"])
+        self.assertIn("CONT_ANSI_OK", res_complex["stdout"])
+        self.assertIn('CAP={"cap": 99}', res_complex["stdout"])
+        self.assertIn("TAG_BETA_OK", res_complex["stdout"])
+        self.assertIn("LOOP_DONE", res_complex["stdout"])
+
+        # 3. Security invariants: escapes via unquoted heredoc `$(...)`, `bash <<'EOF'`, `bash -lc`,
+        #    `env`, glued redirections, or `for` over protected paths MUST still be blocked (403)
+        for blocked_multiline in [
+            "python3 - <<PY\n'$(sudo id)'\nPY",
+            "python3 - <<PY\n`sudo id`\nPY",
+            "bash <<'EOF'\nsudo whoami\nEOF",
+            "sh -s <<'EOF'\nrm -rf /\nEOF",
+            "bash -lc 'sudo whoami'",
+            "env FOO=1 sudo whoami",
+            "env -C /etc ls",
+            f"cat >{GATEWAY_ROOT / 'config.json'}",
+            "for f in ~/.ssh/id_rsa; do cat \"$f\"; done",
+        ]:
+            with self.assertRaises(RuntimeError) as ctx:
+                await asyncio.to_thread(
+                    client.exec_command, blocked_multiline, cwd=self.tmpdir
+                )
+            self.assertIn("403", str(ctx.exception), f"Expected 403 for {blocked_multiline!r}")
+
+        # 4. Audit log redaction & MCP rejection warning verification
+        redacted = redact_for_audit_log(
+            "curl -H 'Authorization: Bearer sk-secret1234567890abcdef' token=my_tok_999\nnext"
+        )
+        self.assertNotIn("sk-secret1234567890abcdef", redacted)
+        self.assertNotIn("my_tok_999", redacted)
+        self.assertNotIn("\n", redacted)
+
+        with self.assertLogs("dots_gateway", level="WARNING") as log_cm:
+            rej_resp, _ = await asyncio.to_thread(
+                client.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "rej-1",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "exec_command",
+                        "arguments": {
+                            "command": "not_allowed_cmd --api-key=sk-1234567890abcdef",
+                            "cwd": self.tmpdir,
+                        },
+                    },
+                },
+            )
+        self.assertTrue(rej_resp["result"]["isError"])
+        joined_logs = "\n".join(log_cm.output)
+        self.assertIn("MCP policy rejection: tool=exec_command", joined_logs)
+        self.assertNotIn("sk-1234567890abcdef", joined_logs)
+
     async def test_large_stream_json_over_64kb_and_chunked_http(self) -> None:
         client = DotsGatewayClient(
             base_url=self.base_url, token="test-secret-token-12345"

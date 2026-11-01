@@ -786,10 +786,11 @@ class SessionManager:
         if use_shell:
             if isinstance(command, str):
                 shell_cmd = command
-                if shell_cmd.strip().startswith("agy ") and os.path.exists(self.config.agy_binary):
-                    shell_cmd = self.config.agy_binary + shell_cmd.strip()[3:]
-                elif shell_cmd.strip().startswith("codex ") and os.path.exists(self.config.codex_binary):
-                    shell_cmd = self.config.codex_binary + shell_cmd.strip()[5:]
+                stripped_leading = shell_cmd.lstrip()
+                if stripped_leading.startswith("agy ") and os.path.exists(self.config.agy_binary):
+                    shell_cmd = self.config.agy_binary + stripped_leading[3:]
+                elif stripped_leading.startswith("codex ") and os.path.exists(self.config.codex_binary):
+                    shell_cmd = self.config.codex_binary + stripped_leading[5:]
             else:
                 shell_cmd = " ".join(shlex.quote(x) for x in decision.normalized_argv)
 

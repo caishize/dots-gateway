@@ -28,6 +28,7 @@ DEFAULT_ALLOWED_COMMANDS: List[str] = [
     "bash",
     "sh",
     "cd",
+    "set",
     "export",
     "unset",
     "true",

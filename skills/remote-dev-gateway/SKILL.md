@@ -19,7 +19,7 @@ Use this workflow whenever you need to inspect code, edit files, run builds/test
 
 ## 3. Running Commands, Builds & Tests
 - Use `exec_command` for allowlisted development tools (`git`, `pytest`, `python3`, `ruff`, `mypy`, `npm`, `pnpm`, `tsc`, `vitest`, `cargo`, `go`, `make`, `./scripts/...`, `.venv/bin/...`).
-- Compound pipelines (`cd subproj && pytest -v | tee test.log`) are supported automatically inside `allowed_workdirs` (default: `~/workspaces`).
+- Compound pipelines (`cd subproj && pytest -v | tee test.log`) and multi-line heredoc scripts (`python3 - <<'PY'\nimport ...\nPY`) are supported automatically inside `allowed_workdirs` (default: `~/workspaces`).
 - All commands execute inside an isolated Linux mount namespace (`unshare` + `pivot_root`) confined strictly to `allowed_workdirs`; parent `$HOME` directories (`~/gateway`, `~/.ssh`, `~/.gemini`, `~/.config`), host `/tmp`, and privilege-escalation commands (`sudo`, `docker`, `mkfs`, `shutdown`, etc.) are blocked by both policy and kernel VFS isolation.
 
 ## 4. Long-Running & Interactive Processes
