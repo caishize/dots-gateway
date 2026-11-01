@@ -27,6 +27,8 @@
   "codex_binary": "/usr/local/bin/codex",
   "codex_default_skip_permissions": true,
   "codex_default_sandbox": "workspace-write",
+  "codex_sandbox_network_access": true,
+  "codex_extra_writable_roots": [],
   "default_timeout_seconds": 600.0,
   "max_timeout_seconds": 7200.0,
   "max_concurrent_sessions": 32,

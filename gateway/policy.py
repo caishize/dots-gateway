@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
@@ -404,6 +406,13 @@ class CommandPolicy:
             if tok in ("-s", "--sandbox") and idx + 1 < len(tok_list):
                 if tok_list[idx + 1] == "danger-full-access":
                     return False, "Sandbox mode 'danger-full-access' is forbidden in command execution"
+            if tok in ("-c", "--config") and idx + 1 < len(tok_list):
+                if "danger-full-access" in tok_list[idx + 1].lower():
+                    return False, "Sandbox mode 'danger-full-access' is forbidden in command execution"
+            if idx > 1 and tok_list[idx - 1] in ("-c", "--config") and tok.startswith(
+                "sandbox_workspace_write."
+            ):
+                continue
             if tok == "--add-dir":
                 if idx + 1 >= len(tok_list):
                     return False, "Missing directory path after '--add-dir'"
@@ -735,6 +744,82 @@ class CommandPolicy:
 
         return argv
 
+    def get_codex_writable_roots(
+        self, add_dirs: Optional[Sequence[str]] = None
+    ) -> List[str]:
+        """Compute safe `sandbox_workspace_write.writable_roots` for Codex CLI.
+
+        Exposes all configured `allowed_workdirs` (so git worktrees can update shared
+        `.git/worktrees/*` state), Flutter SDK's `bin/cache` (for `engine.stamp`,
+        `engine.realm`, and `lockfile`), and isolated developer toolchain caches mounted
+        by `sandbox.py`, while keeping SDK binaries, `~/gateway`, `~/.ssh`, `~/.codex`,
+        `~/.gemini`, and `~/.config/dots-gateway` read-only or hidden.
+        """
+        roots: List[str] = []
+        seen: set[str] = set()
+
+        def _add(cand_path: str) -> None:
+            norm = os.path.abspath(cand_path)
+            if norm not in seen:
+                seen.add(norm)
+                roots.append(norm)
+
+        for allowed in self._allowed_roots:
+            _add(allowed)
+
+        if add_dirs:
+            for d in add_dirs:
+                ok_dir, dir_err, resolved_dir = self.validate_workdir(str(d))
+                if not ok_dir:
+                    raise PermissionError(dir_err)
+                _add(resolved_dir)
+
+        flutter_cache_candidates: List[str] = ["/opt/flutter/bin/cache"]
+        flutter_bin = shutil.which("flutter")
+        if flutter_bin:
+            try:
+                fl_root = Path(flutter_bin).resolve().parent.parent
+                flutter_cache_candidates.append(str(fl_root / "bin" / "cache"))
+            except OSError:
+                pass
+        for fc in flutter_cache_candidates:
+            if os.path.isdir(fc) and not self.is_protected_path(os.path.abspath(fc)):
+                _add(fc)
+
+        home_dir = str(Path.home().resolve())
+        home_already_covered = any(
+            home_dir == r or home_dir.startswith(r.rstrip("/") + "/")
+            for r in self._allowed_roots
+        )
+        if not home_already_covered:
+            for rel in (
+                ".pub-cache",
+                os.path.join(".config", "flutter"),
+                ".dart-tool",
+                ".dartServer",
+                ".cache",
+                ".npm",
+                os.path.join(".local", "share"),
+                os.path.join(".config", "gh"),
+            ):
+                abs_cache = os.path.join(home_dir, rel)
+                if self.config.isolate_mount_namespace or os.path.isdir(abs_cache):
+                    _add(abs_cache)
+
+        for raw_extra in self.config.codex_extra_writable_roots:
+            try:
+                p = Path(raw_extra).expanduser()
+                lex = os.path.abspath(str(p))
+                res = str(p.resolve())
+            except OSError:
+                continue
+            if self.is_protected_path(lex) or self.is_protected_path(res):
+                continue
+            if os.path.isdir(lex):
+                _add(lex)
+
+        return roots
+
     def build_codex_argv(
         self,
         prompt: Optional[str] = None,
@@ -814,6 +899,17 @@ class CommandPolicy:
         if use_skip:
             argv.extend(["-a", "never"])
         argv.extend(["-s", eff_sandbox])
+
+        if eff_sandbox == "workspace-write":
+            net_bool = "true" if self.config.codex_sandbox_network_access else "false"
+            writable_roots = self.get_codex_writable_roots(add_dirs=add_dirs)
+            argv.extend(["-c", f"sandbox_workspace_write.network_access={net_bool}"])
+            argv.extend(
+                [
+                    "-c",
+                    f"sandbox_workspace_write.writable_roots={json.dumps(writable_roots)}",
+                ]
+            )
 
         if model and "-m" not in extra and "--model" not in extra:
             argv.extend(["-m", model])

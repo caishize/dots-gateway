@@ -68,10 +68,13 @@ ensure_unit_installed() {
 ensure_local_client_json() {
   mkdir -p "${CLIENT_CONFIG_DIR}"
   chmod 700 "${CLIENT_CONFIG_DIR}"
-  python3 - "${CONFIG_FILE}" "${CLIENT_CONFIG_DIR}/client.json" <<'PY'
-import json, os, pathlib, shutil, sys
+  python3 - "${CONFIG_FILE}" "${CLIENT_CONFIG_DIR}/client.json" "${GATEWAY_DIR}" <<'PY'
+import json, os, pathlib, re, shutil, sys
 cfg_p = pathlib.Path(sys.argv[1])
 out_p = pathlib.Path(sys.argv[2])
+gw_dir = sys.argv[3]
+if gw_dir not in sys.path:
+    sys.path.insert(0, gw_dir)
 d = json.loads(cfg_p.read_text(encoding="utf-8"))
 changed = False
 if d.get("loopback_http_port") is None:
@@ -86,6 +89,12 @@ if "codex_default_skip_permissions" not in d:
     changed = True
 if not d.get("codex_default_sandbox"):
     d["codex_default_sandbox"] = "workspace-write"
+    changed = True
+if "codex_sandbox_network_access" not in d:
+    d["codex_sandbox_network_access"] = True
+    changed = True
+if "codex_extra_writable_roots" not in d:
+    d["codex_extra_writable_roots"] = []
     changed = True
 if not d.get("codex_env_file"):
     d["codex_env_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "codex.env")
@@ -104,6 +113,38 @@ if isinstance(pp, list) and codex_home not in pp:
 if changed:
     cfg_p.write_text(json.dumps(d, indent=2) + "\n", encoding="utf-8")
     os.chmod(cfg_p, 0o600)
+
+# Sync [sandbox_workspace_write] into ~/.codex/config.toml so Codex CLI (both via
+# run_codex and interactive/app-server sessions) can write Flutter SDK bin/cache & caches
+try:
+    from gateway.config import GatewayConfig
+    from gateway.policy import CommandPolicy
+
+    gw_cfg = GatewayConfig.load(cfg_p)
+    pol = CommandPolicy(gw_cfg)
+    w_roots = pol.get_codex_writable_roots()
+    net_str = "true" if gw_cfg.codex_sandbox_network_access else "false"
+    codex_dir_p = pathlib.Path(codex_home)
+    if codex_dir_p.is_dir():
+        toml_p = codex_dir_p / "config.toml"
+        existing = toml_p.read_text(encoding="utf-8") if toml_p.is_file() else ""
+        cleaned = re.sub(
+            r"(?ms)^\[sandbox_workspace_write\]\n.*?(?=^\[|\Z)",
+            "",
+            existing,
+        ).rstrip()
+        block = (
+            "[sandbox_workspace_write]\n"
+            f"network_access = {net_str}\n"
+            f"writable_roots = {json.dumps(w_roots)}\n"
+        )
+        new_toml = (cleaned + "\n\n" + block) if cleaned else block
+        if new_toml != existing:
+            toml_p.write_text(new_toml, encoding="utf-8")
+            os.chmod(toml_p, 0o600)
+except Exception:
+    pass
+
 port = d.get("port", 8765)
 scheme = "https" if (d.get("tls_certfile") and d.get("tls_keyfile")) else "http"
 h_key = "hmac_" + "secret"

@@ -334,6 +334,8 @@ class GatewayConfig:
     codex_binary: str = DEFAULT_CODEX_BIN
     codex_default_skip_permissions: bool = True
     codex_default_sandbox: str = "workspace-write"
+    codex_sandbox_network_access: bool = True
+    codex_extra_writable_roots: List[str] = field(default_factory=list)
     codex_env_file: str = str(Path.home() / ".config" / "dots-gateway" / "codex.env")
     max_concurrent_agy: int = field(default_factory=detect_recommended_max_agy)
     agy_queue_timeout_seconds: float = 1800.0
@@ -412,6 +414,17 @@ class GatewayConfig:
             cfg.codex_binary = os.environ["GATEWAY_CODEX_BIN"]
         if os.environ.get("GATEWAY_CODEX_SANDBOX"):
             cfg.codex_default_sandbox = os.environ["GATEWAY_CODEX_SANDBOX"].strip()
+        if os.environ.get("GATEWAY_CODEX_NETWORK_ACCESS"):
+            cfg.codex_sandbox_network_access = (
+                os.environ["GATEWAY_CODEX_NETWORK_ACCESS"].strip().lower()
+                in ("1", "true", "yes")
+            )
+        if os.environ.get("GATEWAY_CODEX_WRITABLE_ROOTS"):
+            cfg.codex_extra_writable_roots = [
+                x.strip()
+                for x in os.environ["GATEWAY_CODEX_WRITABLE_ROOTS"].split(",")
+                if x.strip()
+            ]
         if os.environ.get("GATEWAY_CODEX_ENV_FILE"):
             cfg.codex_env_file = os.environ["GATEWAY_CODEX_ENV_FILE"].strip()
         if os.environ.get("GATEWAY_MAX_AGY"):

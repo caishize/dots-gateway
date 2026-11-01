@@ -786,6 +786,8 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             "    'has_ssh_dir': os.path.exists(os.path.expanduser('~/.ssh')),\n"
             f"    'has_gw_dir': os.path.exists({str(GATEWAY_ROOT)!r}),\n"
             "    'has_gw_cfg': os.path.exists(os.path.expanduser('~/.config/dots-gateway')),\n"
+            "    'flutter_bin_writable': os.access('/opt/flutter/bin/flutter', os.W_OK) if os.path.exists('/opt/flutter/bin/flutter') else None,\n"
+            "    'flutter_cache_writable': os.access('/opt/flutter/bin/cache', os.W_OK) if os.path.isdir('/opt/flutter/bin/cache') else None,\n"
             "    'injected_marker': os.environ.get('CODEX_ISOLATED_MARKER', ''),\n"
             "}\n"
             "print(json.dumps(info))\n",
@@ -843,8 +845,60 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--last", parsed["argv"])
             self.assertIn("--", parsed["argv"])
             self.assertEqual(parsed["argv"][-1], "- audit security edge cases")
+            if os.path.isdir("/opt/flutter/bin/cache"):
+                self.assertFalse(parsed["flutter_bin_writable"])
+                self.assertTrue(parsed["flutter_cache_writable"])
 
-            # 2. Normal `exec_command` does NOT receive codex_env_file variables
+            # 2. Default workspace-write mode configures sandbox_workspace_write writable_roots & network_access
+            ws_resp, _ = await asyncio.to_thread(
+                client.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "cdx-ws",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "run_codex",
+                        "arguments": {
+                            "prompt": "run flutter test",
+                            "cwd": self.tmpdir,
+                        },
+                    },
+                },
+            )
+            self.assertFalse(ws_resp["result"]["isError"], ws_resp)
+            ws_parsed = json.loads(ws_resp["result"]["structuredContent"]["stdout"].strip())
+            ws_argv = ws_parsed["argv"]
+            self.assertIn("sandbox_workspace_write.network_access=true", ws_argv)
+            wr_arg = next(
+                a for a in ws_argv if a.startswith("sandbox_workspace_write.writable_roots=")
+            )
+            wr_list = json.loads(wr_arg.split("=", 1)[1])
+            self.assertIn(str(Path(self.tmpdir).resolve()), wr_list)
+            if os.path.isdir("/opt/flutter/bin/cache"):
+                self.assertIn("/opt/flutter/bin/cache", wr_list)
+            self.assertNotIn(str(GATEWAY_ROOT), wr_list)
+            self.assertNotIn(os.path.expanduser("~/.codex"), wr_list)
+
+            # 3. Caller-supplied '-c sandbox...' override in args is still rejected
+            bad_resp, _ = await asyncio.to_thread(
+                client.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "cdx-bad",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "run_codex",
+                        "arguments": {
+                            "prompt": "bypass attempt",
+                            "cwd": self.tmpdir,
+                            "args": ["-c", "sandbox_mode=danger-full-access"],
+                        },
+                    },
+                },
+            )
+            self.assertTrue(bad_resp["result"]["isError"])
+
+            # 4. Normal `exec_command` does NOT receive codex_env_file variables
             exec_resp, _ = await asyncio.to_thread(
                 client.mcp_request,
                 {
