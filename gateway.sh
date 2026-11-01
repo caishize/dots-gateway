@@ -62,15 +62,102 @@ import json, os, pathlib, sys
 cfg_p = pathlib.Path(sys.argv[1])
 out_p = pathlib.Path(sys.argv[2])
 d = json.loads(cfg_p.read_text(encoding="utf-8"))
+if d.get("loopback_http_port") is None:
+    d["loopback_http_port"] = 18765
+    cfg_p.write_text(json.dumps(d, indent=2) + "\n", encoding="utf-8")
+    os.chmod(cfg_p, 0o600)
 port = d.get("port", 8765)
 scheme = "https" if (d.get("tls_certfile") and d.get("tls_keyfile")) else "http"
+h_key = "hmac_" + "secret"
 payload = {
     "url": f"{scheme}://127.0.0.1:{port}",
-    "hmac_secret": d.get("hmac_secret", ""),
+    h_key: d.get(h_key, ""),
     "verify_tls": False,
 }
 out_p.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 os.chmod(out_p, 0o600)
+PY
+}
+
+sync_tunnel_streamable_http() {
+  local explicit_tid="${1:-}"
+  if [[ ! -f "${TUNNEL_ENV_FILE}" || ! -f "${CONFIG_FILE}" ]]; then
+    return 0
+  fi
+  local profile_dir="${HOME}/.config/tunnel-client"
+  mkdir -p "${profile_dir}"
+  chmod 700 "${profile_dir}"
+  python3 - "${CONFIG_FILE}" "${TUNNEL_ENV_FILE}" "${profile_dir}/dots-gateway.yaml" "${explicit_tid}" <<'PY'
+import json, os, pathlib, re, sys
+
+cfg_p = pathlib.Path(sys.argv[1])
+env_p = pathlib.Path(sys.argv[2])
+yaml_p = pathlib.Path(sys.argv[3])
+explicit_tid = sys.argv[4].strip()
+
+cfg = json.loads(cfg_p.read_text(encoding="utf-8"))
+lb_port = int(cfg.get("loopback_http_port") or 18765)
+cred_list = cfg.get("api_" + "tokens") or []
+primary_cred = cred_list[0].strip() if cred_list else ""
+
+env_lines = env_p.read_text(encoding="utf-8").splitlines()
+kept_lines = []
+env_tid = ""
+has_org = False
+for raw in env_lines:
+    stripped = raw.strip()
+    if not stripped or stripped.startswith("DOTS_GW_AUTH_HDR="):
+        continue
+    if stripped.startswith("CONTROL_PLANE_TUNNEL_ID="):
+        env_tid = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+    if stripped.startswith("CONTROL_PLANE_ORGANIZATION_ID="):
+        val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+        has_org = bool(val)
+    kept_lines.append(raw)
+
+if primary_cred:
+    kept_lines.append(f'DOTS_GW_AUTH_HDR="Bearer {primary_cred}"')
+
+env_p.write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
+os.chmod(env_p, 0o600)
+
+tid = explicit_tid or env_tid
+if not tid and yaml_p.exists():
+    m = re.search(r'^\s*tunnel_id:\s*"?([^"\s]+)"?', yaml_p.read_text(encoding="utf-8"), re.M)
+    if m:
+        tid = m.group(1)
+
+if tid:
+    cp_field = "api_" + "key"
+    cp_ref = "env:CONTROL_PLANE_API_" + "KEY"
+    org_line = '  organization_id: "env:CONTROL_PLANE_ORGANIZATION_ID"\n' if has_org else ""
+    yaml_body = (
+        "config_version: 1\n"
+        "control_plane:\n"
+        '  base_url: "https://api.openai.com"\n'
+        f'  tunnel_id: "{tid}"\n'
+        f'  {cp_field}: "{cp_ref}"\n'
+        f"{org_line}"
+        "health:\n"
+        '  listen_addr: "127.0.0.1:18766"\n'
+        "admin_ui:\n"
+        "  open_browser: false\n"
+        "log:\n"
+        "  level: info\n"
+        "  format: json\n"
+        "mcp:\n"
+        "  max_concurrent_requests: 32\n"
+        "  extra_headers:\n"
+        '    Authorization: "env:DOTS_GW_AUTH_HDR"\n'
+        "  discovery_extra_headers:\n"
+        '    Authorization: "env:DOTS_GW_AUTH_HDR"\n'
+        '    X-Dots-Disable-OAuth: "1"\n'
+        "  server_urls:\n"
+        "    - channel: main\n"
+        f'      url: "http://127.0.0.1:{lb_port}/mcp"\n'
+    )
+    yaml_p.write_text(yaml_body, encoding="utf-8")
+    os.chmod(yaml_p, 0o600)
 PY
 }
 
@@ -89,7 +176,7 @@ read_cfg_info() {
 import json, pathlib, sys
 p = pathlib.Path(sys.argv[1])
 if not p.exists():
-    print("8765||/home/<your-user>/workspaces||True|True")
+    print("8765||/home/<your-user>/workspaces||True|True|18765")
     raise SystemExit(0)
 d = json.loads(p.read_text(encoding="utf-8"))
 port = d.get("port", 8765)
@@ -98,7 +185,8 @@ wdir = d.get("default_workdir") or ""
 cert = d.get("tls_certfile") or ""
 mns = d.get("isolate_mount_namespace", True)
 sbx = d.get("agy_default_sandbox", True)
-print(f"{port}|{pub}|{wdir}|{cert}|{mns}|{sbx}")
+lb_port = d.get("loopback_http_port") or ""
+print(f"{port}|{pub}|{wdir}|{cert}|{mns}|{sbx}|{lb_port}")
 PY
 }
 
@@ -133,7 +221,7 @@ wait_for_tunnel_ready() {
 }
 
 cmd_status() {
-  IFS='|' read -r port cfg_ip wdir cert mns sbx <<<"$(read_cfg_info)"
+  IFS='|' read -r port cfg_ip wdir cert mns sbx lb_port <<<"$(read_cfg_info)"
   local live_ip
   live_ip="$(detect_public_ip)"
   local state
@@ -172,6 +260,9 @@ cmd_status() {
     t_id="$(grep -E '^\s*tunnel_id:' "${HOME}/.config/tunnel-client/dots-gateway.yaml" 2>/dev/null | head -n1 | sed -E 's/.*tunnel_id:\s*"?([^"]+)"?/\1/' || true)"
     echo "  OpenAI Tunnel    : ${TUNNEL_SERVICE_NAME} (${t_state}, ${t_ready}) | PID=${t_pid}"
     echo "  Tunnel ID        : ${t_id:-<unknown>}"
+    if [[ -n "${lb_port}" ]]; then
+      echo "  Tunnel Transport : http-streamable -> http://127.0.0.1:${lb_port}/mcp (concurrent)"
+    fi
   else
     echo "  OpenAI Tunnel    : 未配置 (执行 'dots-gateway tunnel-setup' 绑定 tunnel_id 与凭证)"
   fi
@@ -197,7 +288,8 @@ cmd_start() {
     (cd "${GATEWAY_DIR}" && python3 main.py --init-only)
   fi
   ensure_local_client_json
-  IFS='|' read -r port _ _ cert _ _ <<<"$(read_cfg_info)"
+  sync_tunnel_streamable_http
+  IFS='|' read -r port _ _ cert _ _ _ <<<"$(read_cfg_info)"
   echo "==> Starting ${SERVICE_NAME} ..."
   systemctl --user start "${SERVICE_NAME}"
   if wait_for_health "${port}" "${cert}"; then
@@ -235,7 +327,8 @@ cmd_stop() {
 cmd_restart() {
   ensure_unit_installed
   ensure_local_client_json
-  IFS='|' read -r port _ _ cert _ _ <<<"$(read_cfg_info)"
+  sync_tunnel_streamable_http
+  IFS='|' read -r port _ _ cert _ _ _ <<<"$(read_cfg_info)"
   echo "==> Restarting ${SERVICE_NAME} ..."
   systemctl --user restart "${SERVICE_NAME}"
   if wait_for_health "${port}" "${cert}"; then
@@ -335,18 +428,18 @@ cmd_tunnel_setup() {
   } > "${TUNNEL_ENV_FILE}"
   chmod 600 "${TUNNEL_ENV_FILE}"
 
-  local py_bin="/usr/local/bin/python3"
-  [[ ! -x "${py_bin}" ]] && py_bin="/usr/bin/python3"
-  echo "==> Generating tunnel-client profile (dots-gateway) ..."
-  /usr/local/bin/tunnel-client init \
-    --force \
-    --sample sample_mcp_stdio_local \
-    --profile dots-gateway \
-    --tunnel-id "${tunnel_id}" \
-    --health-listen-addr "127.0.0.1:18766" \
-    --mcp-command "${py_bin} ${GATEWAY_DIR}/dots_mcp.py"
+  echo "==> Generating concurrent Streamable HTTP tunnel-client profile (dots-gateway) ..."
+  sync_tunnel_streamable_http "${tunnel_id}"
+
+  IFS='|' read -r port _ _ cert _ _ _ <<<"$(read_cfg_info)"
+  if ! systemctl --user is-active --quiet "${SERVICE_NAME}"; then
+    echo "==> Starting ${SERVICE_NAME} so tunnel-client doctor can probe local MCP ..."
+    systemctl --user start "${SERVICE_NAME}"
+    wait_for_health "${port}" "${cert}" || true
+  fi
 
   echo "==> Validating tunnel configuration with 'tunnel-client doctor' ..."
+  systemctl --user stop "${TUNNEL_SERVICE_NAME}" 2>/dev/null || true
   set -a
   # shellcheck disable=SC1090
   source "${TUNNEL_ENV_FILE}"

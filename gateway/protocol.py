@@ -261,7 +261,7 @@ class SSEWriter:
             "HTTP/1.1 200 OK\r\n",
             "Content-Type: text/event-stream; charset=utf-8\r\n",
             "Cache-Control: no-cache, no-store\r\n",
-            "Connection: keep-alive\r\n",
+            "Connection: close\r\n",
             "X-Accel-Buffering: no\r\n",
         ]
         for k, v in self.extra_headers.items():

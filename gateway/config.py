@@ -301,6 +301,7 @@ class GatewayConfig:
 
     host: str = "0.0.0.0"
     port: int = 8765
+    loopback_http_port: Optional[int] = None
     public_ip: Optional[str] = None
     # Authentication & network access control
     api_tokens: List[str] = field(default_factory=list)
@@ -359,6 +360,9 @@ class GatewayConfig:
             cfg.host = os.environ["GATEWAY_HOST"]
         if os.environ.get("GATEWAY_PORT"):
             cfg.port = int(os.environ["GATEWAY_PORT"])
+        if os.environ.get("GATEWAY_LOOPBACK_HTTP_PORT"):
+            raw_lb = os.environ["GATEWAY_LOOPBACK_HTTP_PORT"].strip()
+            cfg.loopback_http_port = int(raw_lb) if raw_lb and raw_lb != "0" else None
         if os.environ.get("GATEWAY_PUBLIC_IP"):
             cfg.public_ip = os.environ["GATEWAY_PUBLIC_IP"].strip()
         if os.environ.get("GATEWAY_TOKEN"):

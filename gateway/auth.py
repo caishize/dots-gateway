@@ -208,12 +208,13 @@ class Authenticator:
         headers: Dict[str, str],
         body: bytes = b"",
         client_ip: str = "unknown",
+        bypass_ip_allowlist: bool = False,
     ) -> AuthResult:
         """Authenticate an incoming HTTP or WebSocket handshake request without blocking event loop."""
         hdrs = {k.lower(): v for k, v in headers.items()}
         effective_ip = self.resolve_client_ip(client_ip, hdrs)
 
-        if not self.is_ip_allowed(effective_ip):
+        if not bypass_ip_allowlist and not self.is_ip_allowed(effective_ip):
             return AuthResult(
                 authenticated=False,
                 error=f"Client IP {effective_ip} is not in allowed_client_ips",

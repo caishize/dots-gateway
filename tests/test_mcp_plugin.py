@@ -626,6 +626,153 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(st_ok, 200)
         self.assertGreaterEqual(len(json.loads(cap_raw)["result"]["tools"]), 14)
 
+    async def test_loopback_streamable_http_concurrency_and_oauth_suppression(self) -> None:
+        import time
+        import urllib.error
+        import urllib.request
+
+        lb_cfg = GatewayConfig(
+            host="127.0.0.1",
+            port=0,
+            loopback_http_port=0,
+            api_tokens=list(self.cfg.api_tokens),
+            allowed_client_ips=["192.0.2.0/24"],  # Restrict external listener; loopback must still work
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            tls_certfile=self.pki["server_cert"],
+            tls_keyfile=self.pki["server_key"],
+            tls_ca_file=self.pki["ca_cert"],
+        )
+        lb_srv = GatewayServer(lb_cfg)
+        await lb_srv.start()
+        try:
+            lb_port = lb_cfg.loopback_http_port
+            assert lb_port is not None and lb_port > 0
+            lb_url = f"http://127.0.0.1:{lb_port}"
+            auth_hdr = f"Bearer {self.cfg.api_tokens[0]}"
+
+            def _lb_req(
+                method: str,
+                path: str,
+                payload: Any = None,
+                headers: Dict[str, str] | None = None,
+            ):
+                hdrs = dict(headers or {})
+                body = json.dumps(payload).encode("utf-8") if payload is not None else None
+                if body is not None:
+                    hdrs.setdefault("Content-Type", "application/json")
+                req = urllib.request.Request(
+                    f"{lb_url}{path}", data=body, headers=hdrs, method=method
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                        return resp.status, dict(resp.headers.items()), resp.read().decode("utf-8")
+                except urllib.error.HTTPError as err:
+                    return err.code, dict(err.headers.items()), err.read().decode("utf-8")
+
+            # 1. Loopback listener suppresses OAuth discovery (404) & omits resource_metadata on 401
+            st_wk, _, _ = await asyncio.to_thread(
+                _lb_req, "GET", "/.well-known/oauth-protected-resource"
+            )
+            self.assertEqual(st_wk, 404)
+
+            st_unauth, hdr_unauth, _ = await asyncio.to_thread(
+                _lb_req, "POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            )
+            self.assertEqual(st_unauth, 401)
+            self.assertNotIn("resource_metadata=", hdr_unauth.get("WWW-Authenticate", ""))
+
+            # 2. SSE stream response uses RFC-compliant `Connection: close` framing
+            st_sse, hdr_sse, body_sse = await asyncio.to_thread(
+                _lb_req,
+                "POST",
+                "/mcp",
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "exec_command",
+                        "arguments": {"command": ["echo", "sse_loopback_ok"], "cwd": self.tmpdir},
+                    },
+                },
+                {
+                    "Authorization": auth_hdr,
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+            self.assertEqual(st_sse, 200)
+            self.assertEqual(hdr_sse.get("Connection", "").lower(), "close")
+            self.assertIn("sse_loopback_ok", body_sse)
+
+            # 3. Concurrent Streamable HTTP calls with colliding JSON-RPC `id: 1` + discovery
+            #    do NOT block behind slow `tools/call` (fixes tunnel-client stdio HOL blocking)
+            async def _slow_call():
+                t0 = time.monotonic()
+                st, _, raw = await asyncio.to_thread(
+                    _lb_req,
+                    "POST",
+                    "/mcp",
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exec_command",
+                            "arguments": {
+                                "command": ["python3", "-c", "import time; time.sleep(1.5); print('SLOW_DONE')"],
+                                "cwd": self.tmpdir,
+                            },
+                        },
+                    },
+                    {"Authorization": auth_hdr},
+                )
+                return st, raw, time.monotonic() - t0
+
+            async def _fast_probe():
+                await asyncio.sleep(0.1)
+                t0 = time.monotonic()
+                st1, _, raw1 = await asyncio.to_thread(
+                    _lb_req,
+                    "POST",
+                    "/mcp",
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                    {"Authorization": auth_hdr},
+                )
+                st2, _, raw2 = await asyncio.to_thread(
+                    _lb_req,
+                    "POST",
+                    "/mcp",
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exec_command",
+                            "arguments": {"command": ["echo", "FAST_PARALLEL"], "cwd": self.tmpdir},
+                        },
+                    },
+                    {"Authorization": auth_hdr},
+                )
+                return st1, raw1, st2, raw2, time.monotonic() - t0
+
+            slow_res, fast_res = await asyncio.gather(_slow_call(), _fast_probe())
+            self.assertEqual(slow_res[0], 200)
+            self.assertIn("SLOW_DONE", slow_res[1])
+            self.assertGreaterEqual(slow_res[2], 1.45)
+
+            self.assertEqual(fast_res[0], 200)
+            self.assertGreaterEqual(len(json.loads(fast_res[1])["result"]["tools"]), 14)
+            self.assertEqual(fast_res[2], 200)
+            self.assertIn("FAST_PARALLEL", fast_res[3])
+            self.assertLess(
+                fast_res[4],
+                slow_res[2] - 0.5,
+                f"Fast parallel calls ({fast_res[4]:.3f}s) did not complete well before slow call ({slow_res[2]:.3f}s)",
+            )
+        finally:
+            await lb_srv.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

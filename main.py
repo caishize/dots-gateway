@@ -90,6 +90,8 @@ async def async_main() -> int:
     cfg_path = Path(args.config)
     cfg = GatewayConfig.load(cfg_path)
     dirty = not cfg_path.exists()
+    if dirty and cfg.loopback_http_port is None:
+        cfg.loopback_http_port = 18765
 
     if args.host:
         cfg.host = args.host
@@ -177,6 +179,8 @@ async def async_main() -> int:
     print(f"  Config File         : {cfg_path}")
     print(f"  HTTPS/SSE Endpoint  : {scheme}://{display_host}:{cfg.port}")
     print(f"  MCP Endpoint (HTTP) : {scheme}://{display_host}:{cfg.port}/mcp")
+    if cfg.loopback_http_port:
+        print(f"  Loopback Tunnel MCP : http://127.0.0.1:{cfg.loopback_http_port}/mcp")
     print(f"  WebSocket (Duplex)  : {ws_scheme}://{display_host}:{cfg.port}/v1/ws")
     print(f"  TLS Encryption      : {'ENABLED (TLS 1.2/1.3)' if use_tls else 'DISABLED (Plaintext)'}")
     if use_tls:

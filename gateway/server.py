@@ -48,6 +48,7 @@ class GatewayServer:
         self.files = FileService(self.policy)
         self.sessions = SessionManager(config, self.policy)
         self._server: Optional[asyncio.AbstractServer] = None
+        self._loopback_server: Optional[asyncio.AbstractServer] = None
         self._conn_sem = asyncio.Semaphore(max(1, config.max_concurrent_connections))
         self._started_at = time.time()
         self.mcp = MCPHandler(
@@ -79,9 +80,30 @@ class GatewayServer:
         sockets = self._server.sockets or []
         bound_port = sockets[0].getsockname()[1] if sockets else self.config.port
         self.config.port = bound_port
+
+        if self.config.loopback_http_port is not None:
+            self._loopback_server = await asyncio.start_server(
+                self._handle_loopback_client,
+                host="127.0.0.1",
+                port=self.config.loopback_http_port,
+                ssl=None,
+                limit=16 * 1024 * 1024,
+            )
+            lb_sockets = self._loopback_server.sockets or []
+            if lb_sockets:
+                self.config.loopback_http_port = lb_sockets[0].getsockname()[1]
+            logger.info(
+                "Loopback tunnel HTTP listener active on http://127.0.0.1:%s/mcp",
+                self.config.loopback_http_port,
+            )
+
         return self.config.host, bound_port
 
     async def stop(self) -> None:
+        if self._loopback_server is not None:
+            self._loopback_server.close()
+            await self._loopback_server.wait_closed()
+            self._loopback_server = None
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -91,17 +113,36 @@ class GatewayServer:
         if self._server is None:
             await self.start()
         assert self._server is not None
-        async with self._server:
-            await self._server.serve_forever()
+        if self._loopback_server is not None:
+            async with self._server, self._loopback_server:
+                await asyncio.gather(
+                    self._server.serve_forever(),
+                    self._loopback_server.serve_forever(),
+                )
+        else:
+            async with self._server:
+                await self._server.serve_forever()
+
+    async def _handle_loopback_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await self._handle_client(reader, writer, is_loopback_http=True)
 
     async def _handle_client(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        is_loopback_http: bool = False,
     ) -> None:
         peer = writer.get_extra_info("peername")
         client_ip = str(peer[0]) if isinstance(peer, (tuple, list)) and peer else "unknown"
 
         # Fast-reject unauthorized IPs at TCP accept time in direct-connect mode
-        if not self.config.trusted_proxies and not self.auth.is_ip_allowed(client_ip):
+        if (
+            not is_loopback_http
+            and not self.config.trusted_proxies
+            and not self.auth.is_ip_allowed(client_ip)
+        ):
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -185,6 +226,7 @@ class GatewayServer:
                             headers=req.headers,
                             body=req.body,
                             client_ip=client_ip,
+                            bypass_ip_allowlist=is_loopback_http,
                         )
                         is_authed = ares.authenticated
 
@@ -212,6 +254,13 @@ class GatewayServer:
 
                 # OAuth 2.1 Discovery, Dynamic Client Registration, Authorize & Token endpoints
                 if path.startswith("/.well-known/") or path.startswith("/oauth/"):
+                    if is_loopback_http or req.headers.get("x-dots-disable-oauth") == "1":
+                        await send_json_response(
+                            writer,
+                            404,
+                            {"ok": False, "error": "OAuth discovery disabled on local tunnel listener"},
+                        )
+                        return
                     handled = await self._handle_oauth_routes(
                         req=req, path=path, query=query, writer=writer, client_ip=client_ip
                     )
@@ -225,15 +274,20 @@ class GatewayServer:
                     headers=req.headers,
                     body=req.body,
                     client_ip=client_ip,
+                    bypass_ip_allowlist=is_loopback_http,
                 )
                 if not auth_res.authenticated:
                     origin = self._request_origin(req)
+                    if is_loopback_http or req.headers.get("x-dots-disable-oauth") == "1":
+                        www_auth = 'Bearer realm="dots-gateway"'
+                    else:
+                        www_auth = (
+                            f'Bearer realm="dots-gateway", '
+                            f'resource_metadata="{origin}/.well-known/oauth-protected-resource"'
+                        )
                     extra_hdrs = (
                         {
-                            "WWW-Authenticate": (
-                                f'Bearer realm="dots-gateway", '
-                                f'resource_metadata="{origin}/.well-known/oauth-protected-resource"'
-                            ),
+                            "WWW-Authenticate": www_auth,
                             "Access-Control-Allow-Origin": "*",
                         }
                         if auth_res.status_code == 401
