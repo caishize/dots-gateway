@@ -478,6 +478,8 @@ class GatewayServer:
                     "codex_binary": self.config.codex_binary,
                     "codex_default_skip_permissions": self.config.codex_default_skip_permissions,
                     "codex_default_sandbox": self.config.codex_default_sandbox,
+                    "codex_sandbox_network_access": self.config.codex_sandbox_network_access,
+                    "codex_writable_roots": self.policy.get_codex_writable_roots(),
                     "codex_auth_configured": self.sessions.has_codex_auth(),
                 },
             )

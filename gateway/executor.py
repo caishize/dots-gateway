@@ -759,6 +759,7 @@ class SessionManager:
         queue_timeout: Optional[float] = None,
         is_agy: bool = False,
         is_codex: bool = False,
+        readonly_subpaths: Optional[Sequence[str]] = None,
     ) -> ExecutionSession:
         """Validate command against security policy and start an ExecutionSession."""
         if self.active_count() >= self.config.max_concurrent_sessions:
@@ -808,6 +809,7 @@ class SessionManager:
                 protected_paths=self.config.protected_paths,
                 is_agy=is_agy,
                 is_codex=is_codex,
+                readonly_subpaths=readonly_subpaths,
             )
 
         self._cleanup_old_sessions()
@@ -929,6 +931,10 @@ class SessionManager:
             skip_git_repo_check=skip_git_repo_check,
             ephemeral=ephemeral,
             add_dirs=add_dirs,
+            cwd=cwd,
+        )
+        _, ro_hook_dirs = self.policy.resolve_codex_git_metadata_dirs(
+            cwd=cwd, add_dirs=add_dirs
         )
         merged_env = self._load_codex_env()
         if env:
@@ -949,6 +955,7 @@ class SessionManager:
             slot_sem=self._agy_sem,
             queue_timeout=self.config.agy_queue_timeout_seconds,
             is_codex=True,
+            readonly_subpaths=ro_hook_dirs,
         )
 
     def get_session(self, session_id: str) -> Optional[ExecutionSession]:

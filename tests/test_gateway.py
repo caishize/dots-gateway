@@ -648,9 +648,13 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         for bad_codex_arg in [
             "--dangerously-bypass-approvals-and-sandbox",
             "--dangerously-bypass-hook-trust",
+            "--approve-for-me",
+            "-P=:danger-full-access",
+            "--permission-profile=:danger-full-access",
             f"--add-dir={HOME_DIR}",
             "-s=danger-full-access",
             "--config=sandbox_mode=danger-full-access",
+            "--config=default_permissions=:danger-full-access",
         ]:
             with self.assertRaises(RuntimeError) as ctx:
                 await asyncio.to_thread(
@@ -659,6 +663,46 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
                     args=[bad_codex_arg, "--help"],
                 )
             self.assertIn("403", str(ctx.exception))
+
+        # 2c. Validate Codex Git worktree metadata resolution & malicious `.git` escape rejection
+        import subprocess as _sp
+
+        wt_main = Path(self.tmpdir) / "git_main_repo"
+        wt_linked = Path(self.tmpdir) / "git_linked_wt"
+        wt_subdir = wt_linked / "packages" / "core"
+        _sp.run(["git", "init", "-q", str(wt_main)], check=True)
+        _sp.run(["git", "-C", str(wt_main), "config", "user.email", "t@example.com"], check=True)
+        _sp.run(["git", "-C", str(wt_main), "config", "user.name", "Test"], check=True)
+        (wt_main / "README.md").write_text("init\n", encoding="utf-8")
+        _sp.run(["git", "-C", str(wt_main), "add", "README.md"], check=True)
+        _sp.run(["git", "-C", str(wt_main), "commit", "-qm", "init"], check=True)
+        _sp.run(
+            ["git", "-C", str(wt_main), "worktree", "add", "-q", "-b", "feat/wt", str(wt_linked)],
+            check=True,
+        )
+        wt_subdir.mkdir(parents=True, exist_ok=True)
+
+        wt_pol = CommandPolicy(self.cfg)
+        git_rw, git_ro_hooks = wt_pol.resolve_codex_git_metadata_dirs(cwd=str(wt_subdir))
+        expected_common = str((wt_main / ".git").resolve())
+        expected_wt_gd = str((wt_main / ".git" / "worktrees" / "git_linked_wt").resolve())
+        expected_hooks = str((wt_main / ".git" / "hooks").resolve())
+        self.assertIn(expected_common, git_rw)
+        self.assertIn(expected_wt_gd, git_rw)
+        self.assertLess(git_rw.index(expected_common), git_rw.index(expected_wt_gd))
+        self.assertIn(expected_hooks, git_ro_hooks)
+
+        codex_wr = wt_pol.get_codex_writable_roots(cwd=str(wt_subdir))
+        self.assertIn(expected_common, codex_wr)
+        self.assertIn(expected_wt_gd, codex_wr)
+
+        # Malicious `.git` pointer targeting outside `allowed_workdirs` MUST be ignored
+        evil_wt = Path(self.tmpdir) / "evil_gitdir_escape"
+        evil_wt.mkdir()
+        (evil_wt / ".git").write_text(f"gitdir: {GATEWAY_ROOT}\n", encoding="utf-8")
+        evil_rw, evil_ro = wt_pol.resolve_codex_git_metadata_dirs(cwd=str(evil_wt))
+        self.assertEqual(evil_rw, [])
+        self.assertEqual(evil_ro, [])
 
         ok_codex = await asyncio.to_thread(
             client.run_codex,

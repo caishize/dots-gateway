@@ -918,6 +918,241 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await cdx_srv.stop()
 
+    async def test_run_codex_git_worktree_metadata_writability_and_hooks_ro(self) -> None:
+        import http.server
+        import subprocess
+        import threading
+
+        scratch_base = Path("/var/tmp") if os.path.isdir("/var/tmp") else Path(self.tmpdir)
+        nontmp_root = tempfile.mkdtemp(prefix="dots_gw_codex_wt_", dir=str(scratch_base))
+        try:
+            main_repo = Path(nontmp_root) / "main-repo"
+            linked_wt = Path(nontmp_root) / "linked-wt"
+            subprocess.run(["git", "init", "-q", str(main_repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(main_repo), "config", "user.email", "gw@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(main_repo), "config", "user.name", "GW Test"],
+                check=True,
+            )
+            (main_repo / "README.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(main_repo), "add", "README.md"], check=True)
+            subprocess.run(["git", "-C", str(main_repo), "commit", "-qm", "base"], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(main_repo),
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "integrate/wt-check",
+                    str(linked_wt),
+                ],
+                check=True,
+            )
+            hooks_dir = (main_repo / ".git" / "hooks").resolve()
+            wt_gitdir = (main_repo / ".git" / "worktrees" / "linked-wt").resolve()
+            common_gitdir = (main_repo / ".git").resolve()
+
+            # A. Verify VFS mount-namespace locks `.git/hooks` read-only while exposing `commondir` & `gitdir`
+            probe_codex = Path(nontmp_root) / "probe_codex.py"
+            probe_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                f"hooks_file = {str(hooks_dir / 'pre-commit')!r}\n"
+                "hook_err = ''\n"
+                "try:\n"
+                "    open(hooks_file, 'w').write('#!/bin/sh\\nexit 1\\n')\n"
+                "except OSError as exc:\n"
+                "    hook_err = str(exc)\n"
+                "print(json.dumps({\n"
+                "    'argv': sys.argv[1:],\n"
+                f"    'wt_index_dir_w': os.access({str(wt_gitdir)!r}, os.W_OK),\n"
+                f"    'common_objs_w': os.access({str(common_gitdir / 'objects')!r}, os.W_OK),\n"
+                "    'hook_err': hook_err,\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            probe_codex.chmod(0o755)
+
+            wt_cfg = GatewayConfig(
+                host="127.0.0.1",
+                port=0,
+                api_tokens=["wt-tok"],
+                allowed_workdirs=[nontmp_root],
+                default_workdir=nontmp_root,
+                codex_binary=str(probe_codex),
+                allowed_commands=["python3", str(probe_codex)],
+            )
+            wt_srv = GatewayServer(wt_cfg)
+            h, p = await wt_srv.start()
+            try:
+                client = DotsGatewayClient(base_url=f"http://{h}:{p}", token="wt-tok")
+                resp, _ = await asyncio.to_thread(
+                    client.mcp_request,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "wt-probe-1",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "run_codex",
+                            "arguments": {"prompt": "commit worktree", "cwd": str(linked_wt)},
+                        },
+                    },
+                )
+                self.assertFalse(resp["result"]["isError"], resp)
+                info = json.loads(resp["result"]["structuredContent"]["stdout"].strip())
+                self.assertTrue(info["wt_index_dir_w"])
+                self.assertTrue(info["common_objs_w"])
+                self.assertTrue(info["hook_err"], "Expected .git/hooks write to fail as read-only")
+                wr_arg = next(
+                    a
+                    for a in info["argv"]
+                    if a.startswith("sandbox_workspace_write.writable_roots=")
+                )
+                wr_list = json.loads(wr_arg.split("=", 1)[1])
+                self.assertIn(str(common_gitdir), wr_list)
+                self.assertIn(str(wt_gitdir), wr_list)
+            finally:
+                await wt_srv.stop()
+
+            # B. If real `codex` CLI is installed, verify real `codex exec` + `bwrap` commits in linked worktree
+            real_codex = shutil.which("codex")
+            if real_codex:
+                tool_outputs: List[str] = []
+
+                class _MockResponsesHandler(http.server.BaseHTTPRequestHandler):
+                    def log_message(self, *args: Any) -> None:
+                        pass
+
+                    def do_POST(self) -> None:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        body = json.loads(self.rfile.read(length).decode("utf-8"))
+                        outs = [
+                            i
+                            for i in body.get("input", [])
+                            if i.get("type") == "function_call_output"
+                        ]
+                        if outs:
+                            tool_outputs.append(str(outs[-1].get("output", "")))
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.end_headers()
+                        if not outs:
+                            sh_cmd = (
+                                "echo composed >> README.md && "
+                                "git add README.md && "
+                                "git commit -m 'worktree composed commit' && "
+                                f"(echo bad > {hooks_dir}/pre-commit 2>&1 || echo HOOK_STILL_RO) && "
+                                "(echo bad > .git 2>&1 || echo DOTGIT_PTR_RO)"
+                            )
+                            item: Dict[str, Any] = {
+                                "type": "function_call",
+                                "id": "fc_wt_1",
+                                "call_id": "call_wt_1",
+                                "name": "exec_command",
+                                "arguments": json.dumps({"cmd": sh_cmd}),
+                            }
+                        else:
+                            item = {
+                                "type": "message",
+                                "id": "msg_wt_1",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [{"type": "output_text", "text": "COMPOSED_OK"}],
+                            }
+                        for ev in (
+                            {
+                                "type": "response.created",
+                                "response": {"id": "r_wt", "status": "in_progress", "output": []},
+                            },
+                            {"type": "response.output_item.done", "output_index": 0, "item": item},
+                            {
+                                "type": "response.completed",
+                                "response": {
+                                    "id": "r_wt",
+                                    "status": "completed",
+                                    "output": [item],
+                                    "usage": {
+                                        "input_tokens": 5,
+                                        "output_tokens": 5,
+                                        "total_tokens": 10,
+                                    },
+                                },
+                            },
+                        ):
+                            self.wfile.write(
+                                f"event: {ev['type']}\ndata: {json.dumps(ev)}\n\n".encode("utf-8")
+                            )
+                        self.wfile.flush()
+
+                mock_http = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MockResponsesHandler)
+                mock_port = mock_http.server_address[1]
+                threading.Thread(target=mock_http.serve_forever, daemon=True).start()
+                try:
+                    real_cfg = GatewayConfig(
+                        host="127.0.0.1",
+                        port=0,
+                        api_tokens=["real-cdx-tok"],
+                        allowed_workdirs=[nontmp_root],
+                        default_workdir=nontmp_root,
+                        codex_binary=real_codex,
+                    )
+                    real_srv = GatewayServer(real_cfg)
+                    rh, rp = await real_srv.start()
+                    try:
+                        rclient = DotsGatewayClient(
+                            base_url=f"http://{rh}:{rp}", token="real-cdx-tok"
+                        )
+                        prov_override = (
+                            f'model_providers.mock={{name="mock",'
+                            f'base_url="http://127.0.0.1:{mock_port}",wire_api="responses"}}'
+                        )
+                        real_resp, _ = await asyncio.to_thread(
+                            rclient.mcp_request,
+                            {
+                                "jsonrpc": "2.0",
+                                "id": "wt-real-1",
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "run_codex",
+                                    "arguments": {
+                                        "prompt": "compose and commit",
+                                        "cwd": str(linked_wt),
+                                        "model": "codex-mini-latest",
+                                        "args": [
+                                            "--ephemeral",
+                                            "-c",
+                                            prov_override,
+                                            "-c",
+                                            'model_provider="mock"',
+                                        ],
+                                    },
+                                },
+                            },
+                        )
+                        self.assertFalse(real_resp["result"]["isError"], real_resp)
+                        joined_tool_out = "\n".join(tool_outputs)
+                        self.assertIn("worktree composed commit", joined_tool_out)
+                        self.assertIn("HOOK_STILL_RO", joined_tool_out)
+                        self.assertIn("DOTGIT_PTR_RO", joined_tool_out)
+                        git_log = subprocess.check_output(
+                            ["git", "-C", str(linked_wt), "log", "-1", "--oneline"],
+                            text=True,
+                        )
+                        self.assertIn("worktree composed commit", git_log)
+                    finally:
+                        await real_srv.stop()
+                finally:
+                    mock_http.shutdown()
+                    mock_http.server_close()
+        finally:
+            shutil.rmtree(nontmp_root, ignore_errors=True)
+
     async def test_run_agy_vfs_sandbox_settings_and_loopback_no_proxy(self) -> None:
         sub_ws = Path(self.tmpdir) / "nested-worktree" / "demo-app"
         sub_ws.mkdir(parents=True, exist_ok=True)

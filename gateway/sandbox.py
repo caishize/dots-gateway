@@ -77,6 +77,7 @@ def build_mount_ns_argv(
     protected_paths: Sequence[str],
     is_agy: bool = False,
     is_codex: bool = False,
+    readonly_subpaths: Optional[Sequence[str]] = None,
 ) -> List[str]:
     """Wrap `target_argv` in an unprivileged user+mount namespace `pivot_root` jail."""
     if not can_use_mount_namespace():
@@ -173,6 +174,28 @@ def build_mount_ns_argv(
         q_dst = shlex.quote(f"/mnt{wdir}")
         lines.append(f"mkdir -p {q_dst}")
         lines.append(f"{q_mount} --rbind {q_wdir} {q_dst}")
+
+    # Lock sensitive subpaths inside allowed workspaces (e.g. `.git/hooks` for Codex) read-only
+    for raw_ro_sub in readonly_subpaths or ():
+        try:
+            ro_lex = os.path.abspath(os.path.expanduser(str(raw_ro_sub)))
+            if os.path.islink(ro_lex) or not os.path.isdir(ro_lex):
+                continue
+            ro_res = str(Path(ro_lex).resolve())
+        except OSError:
+            continue
+        if ro_res != ro_lex or not _is_covered_by_roots(ro_res, allowed_roots):
+            continue
+        q_ro_src = shlex.quote(ro_res)
+        q_ro_dst = shlex.quote(f"/mnt{ro_res}")
+        lines.extend(
+            [
+                f"if [ ! -L {q_ro_src} ] && [ -d {q_ro_src} ] && [ -d {q_ro_dst} ]; then",
+                f"  {q_mount} --bind {q_ro_src} {q_ro_dst}",
+                f"  {q_mount} -o remount,bind,ro {q_ro_dst} 2>/dev/null || {q_mount} -o bind,remount,ro {q_ro_dst}",
+                "fi",
+            ]
+        )
 
     if not home_covered:
         q_mnt_home = shlex.quote(f"/mnt{home_dir}")

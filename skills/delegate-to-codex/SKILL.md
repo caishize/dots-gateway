@@ -5,7 +5,7 @@ description: Delegate coding, refactoring, autonomous debugging, and independent
 
 # Delegating Software Engineering & Review Tasks to Local `codex`
 
-The remote host has OpenAI Codex CLI (`codex`) installed and authorized by the gateway to run unattended inside `allowed_workdirs` (default: `~/workspaces`) with `-a never -s workspace-write`, kernel mount-namespace VFS isolation, and isolated `~/.codex` persistence.
+The remote host has OpenAI Codex CLI (`codex`) installed and authorized by the gateway to run unattended inside `allowed_workdirs` (default: `~/workspaces`) with `-a never -s workspace-write`, validated Git repository & linked `git worktree` metadata writability (`commondir` + `gitdir` inside `allowed_workdirs`, while `.git/hooks` and worktree `.git` pointer files stay read-only), kernel mount-namespace VFS isolation, and isolated `~/.codex` persistence.
 
 ## When to Use `run_codex` vs `run_agy` vs Direct `fs_patch`
 - **Use `fs_read` + `fs_patch` + `exec_command` directly** for quick inspections, targeted 1–2 file edits, git operations, or running a known test command.

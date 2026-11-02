@@ -1358,7 +1358,7 @@ class CommandPolicy:
                 roots.append(norm)
 
         _add(resolved_cwd)
-        for root in self.get_codex_writable_roots(add_dirs=add_dirs):
+        for root in self.get_codex_writable_roots(add_dirs=add_dirs, cwd=cwd):
             _add(root)
         return roots
 
@@ -1541,16 +1541,157 @@ class CommandPolicy:
             "permissions": perms,
         }
 
+    def resolve_codex_git_metadata_dirs(
+        self,
+        cwd: Optional[str] = None,
+        add_dirs: Optional[Sequence[str]] = None,
+    ) -> Tuple[List[str], List[str]]:
+        """Resolve validated Git metadata (`commondir` & `gitdir`) and `hooks` paths for Codex.
+
+        In `codex-cli 0.166+`, every writable workspace root automatically receives synthetic
+        read-only submounts over `<root>/.git` and (for linked `git worktree` checkouts) the
+        resolved `<main-repo>/.git/worktrees/<id>` directory, blocking `index.lock` creation
+        even when the parent workspace root is in `writable_roots`.
+
+        Returns `(git_writable_dirs, git_readonly_hook_dirs)` strictly confined to
+        `allowed_workdirs` and excluding `protected_paths`, allowing `git add` / `git commit`
+        inside standalone repositories, subdirectories, and linked `git worktree` checkouts
+        while keeping `<wt>/.git` pointer files and `.git/hooks` read-only.
+        """
+        start_dirs: List[str] = []
+        seen_starts: set[str] = set()
+
+        def _push_start(raw_dir: str, strict: bool) -> None:
+            ok_dir, dir_err, resolved_dir = self.validate_workdir(raw_dir)
+            if not ok_dir:
+                if strict:
+                    raise PermissionError(dir_err)
+                return
+            if resolved_dir not in seen_starts:
+                seen_starts.add(resolved_dir)
+                start_dirs.append(resolved_dir)
+
+        if cwd is not None:
+            _push_start(str(cwd), strict=True)
+        elif self.config.default_workdir:
+            _push_start(str(self.config.default_workdir), strict=False)
+
+        if add_dirs:
+            for d in add_dirs:
+                _push_start(str(d), strict=True)
+
+        writable_git_dirs: List[str] = []
+        seen_git_dirs: set[str] = set()
+        readonly_hook_dirs: List[str] = []
+        seen_hook_dirs: set[str] = set()
+
+        def _record_git_dir(raw_cand: Path) -> Optional[str]:
+            ok_gd, _, resolved_gd = self.validate_workdir(str(raw_cand))
+            if not ok_gd:
+                return None
+            if resolved_gd not in seen_git_dirs:
+                seen_git_dirs.add(resolved_gd)
+                writable_git_dirs.append(resolved_gd)
+            hooks_cand = os.path.join(resolved_gd, "hooks")
+            if not os.path.islink(hooks_cand) and os.path.isdir(hooks_cand):
+                ok_hk, _, resolved_hk = self.validate_workdir(hooks_cand)
+                if ok_hk and resolved_hk not in seen_hook_dirs:
+                    seen_hook_dirs.add(resolved_hk)
+                    readonly_hook_dirs.append(resolved_hk)
+            return resolved_gd
+
+        def _record_commondir_if_present(validated_git_dir: str) -> Optional[str]:
+            common_file = Path(validated_git_dir) / "commondir"
+            try:
+                if (
+                    not common_file.is_symlink()
+                    and common_file.is_file()
+                    and common_file.stat().st_size <= 8192
+                ):
+                    lines = [
+                        ln.strip()
+                        for ln in common_file.read_text(
+                            encoding="utf-8", errors="replace"
+                        ).splitlines()
+                        if ln.strip()
+                    ]
+                    if lines:
+                        raw_common = lines[0]
+                        cand_common = (
+                            Path(raw_common)
+                            if os.path.isabs(raw_common)
+                            else (Path(validated_git_dir) / raw_common)
+                        )
+                        return _record_git_dir(cand_common)
+            except OSError:
+                pass
+            return None
+
+        for start in start_dirs:
+            cur = Path(start)
+            while True:
+                cur_str = str(cur)
+                if not self.is_within_allowed_workdirs(cur_str) or self.is_protected_path(cur_str):
+                    break
+                dot_git = cur / ".git"
+                dot_git_lex = os.path.abspath(str(dot_git))
+                if not self.is_protected_path(dot_git_lex):
+                    try:
+                        if not dot_git.is_symlink() and dot_git.is_dir():
+                            ok_dg, _, prelim_gd = self.validate_workdir(str(dot_git))
+                            if ok_dg:
+                                _record_commondir_if_present(prelim_gd)
+                                _record_git_dir(Path(prelim_gd))
+                            break
+                        if (
+                            not dot_git.is_symlink()
+                            and dot_git.is_file()
+                            and dot_git.stat().st_size <= 8192
+                        ):
+                            first_lines = [
+                                ln.strip()
+                                for ln in dot_git.read_text(
+                                    encoding="utf-8", errors="replace"
+                                ).splitlines()
+                                if ln.strip()
+                            ]
+                            if first_lines and first_lines[0].startswith("gitdir:"):
+                                raw_gitdir = first_lines[0][len("gitdir:") :].strip()
+                                if raw_gitdir:
+                                    cand_gd = (
+                                        Path(raw_gitdir)
+                                        if os.path.isabs(raw_gitdir)
+                                        else (cur / raw_gitdir)
+                                    )
+                                    ok_gd, _, prelim_gd = self.validate_workdir(str(cand_gd))
+                                    if ok_gd:
+                                        _record_commondir_if_present(prelim_gd)
+                                        _record_git_dir(Path(prelim_gd))
+                            break
+                    except OSError:
+                        break
+
+                parent = cur.parent
+                if parent == cur:
+                    break
+                cur = parent
+
+        return writable_git_dirs, readonly_hook_dirs
+
     def get_codex_writable_roots(
-        self, add_dirs: Optional[Sequence[str]] = None
+        self,
+        add_dirs: Optional[Sequence[str]] = None,
+        cwd: Optional[str] = None,
     ) -> List[str]:
         """Compute safe `sandbox_workspace_write.writable_roots` for Codex CLI.
 
-        Exposes all configured `allowed_workdirs` (so git worktrees can update shared
-        `.git/worktrees/*` state), Flutter SDK's `bin/cache` (for `engine.stamp`,
-        `engine.realm`, and `lockfile`), and isolated developer toolchain caches mounted
-        by `sandbox.py`, while keeping SDK binaries, `~/gateway`, `~/.ssh`, `~/.codex`,
-        `~/.gemini`, and `~/.config/dots-gateway` read-only or hidden.
+        Exposes all configured `allowed_workdirs`, validated Git `commondir` & worktree
+        `gitdir` metadata directories for `cwd` / `add_dirs` (so `git add` & `git commit`
+        succeed inside standalone repos and linked `git worktree` checkouts while `.git/hooks`
+        is locked read-only by `sandbox.py`), Flutter SDK's `bin/cache`, and isolated
+        developer toolchain caches mounted by `sandbox.py`, while keeping SDK binaries,
+        `~/gateway`, `~/.ssh`, `~/.codex`, `~/.gemini`, and `~/.config/dots-gateway`
+        read-only or hidden.
         """
         roots: List[str] = []
         seen: set[str] = set()
@@ -1570,6 +1711,12 @@ class CommandPolicy:
                 if not ok_dir:
                     raise PermissionError(dir_err)
                 _add(resolved_dir)
+
+        git_writable_dirs, _ = self.resolve_codex_git_metadata_dirs(
+            cwd=cwd, add_dirs=add_dirs
+        )
+        for gd in git_writable_dirs:
+            _add(gd)
 
         flutter_cache_candidates: List[str] = ["/opt/flutter/bin/cache"]
         flutter_bin = shutil.which("flutter")
@@ -1633,8 +1780,14 @@ class CommandPolicy:
         skip_git_repo_check: bool = True,
         ephemeral: bool = False,
         add_dirs: Optional[Sequence[str]] = None,
+        cwd: Optional[str] = None,
     ) -> List[str]:
         """Construct a validated non-interactive `codex exec` invocation list confined to allowed_workdirs."""
+        if cwd is not None:
+            ok_cwd, cwd_err, _ = self.validate_workdir(str(cwd))
+            if not ok_cwd:
+                raise PermissionError(cwd_err)
+
         codex_bin = (
             self.config.codex_binary
             if os.path.exists(self.config.codex_binary)
@@ -1670,8 +1823,11 @@ class CommandPolicy:
             if raw_arg in (
                 "--dangerously-bypass-approvals-and-sandbox",
                 "--dangerously-bypass-hook-trust",
+                "--approve-for-me",
                 "--remote-control",
-            ) or raw_arg.startswith("--remote-control="):
+                "-P",
+                "--permission-profile",
+            ) or raw_arg.startswith(("--remote-control=", "-P=", "--permission-profile=")):
                 raise PermissionError(
                     f"Raw '{raw_arg}' flag in args is forbidden by gateway security policy"
                 )
@@ -1681,15 +1837,15 @@ class CommandPolicy:
                 )
             if raw_arg in ("-c", "--config") and idx + 1 < len(extra):
                 cfg_kv = extra[idx + 1].lower()
-                if "sandbox" in cfg_kv or "approval" in cfg_kv:
+                if "sandbox" in cfg_kv or "approval" in cfg_kv or "permission" in cfg_kv:
                     raise PermissionError(
-                        "Overriding sandbox or approval policy via '-c/--config' is forbidden"
+                        "Overriding sandbox, approval, or permission policy via '-c/--config' is forbidden"
                     )
             if raw_arg.startswith(("-c=", "--config=")):
                 cfg_kv = raw_arg.split("=", 1)[1].lower()
-                if "sandbox" in cfg_kv or "approval" in cfg_kv:
+                if "sandbox" in cfg_kv or "approval" in cfg_kv or "permission" in cfg_kv:
                     raise PermissionError(
-                        "Overriding sandbox or approval policy via '-c/--config' is forbidden"
+                        "Overriding sandbox, approval, or permission policy via '-c/--config' is forbidden"
                     )
 
         # Top-level Codex CLI options (placed before `exec` per codex-cli 0.166+ parser)
@@ -1699,7 +1855,7 @@ class CommandPolicy:
 
         if eff_sandbox == "workspace-write":
             net_bool = "true" if self.config.codex_sandbox_network_access else "false"
-            writable_roots = self.get_codex_writable_roots(add_dirs=add_dirs)
+            writable_roots = self.get_codex_writable_roots(add_dirs=add_dirs, cwd=cwd)
             argv.extend(["-c", f"sandbox_workspace_write.network_access={net_bool}"])
             argv.extend(
                 [
