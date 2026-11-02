@@ -1435,6 +1435,238 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await agy_srv.stop()
 
+    async def test_session_ledger_persistence_and_restart_reconciliation(self) -> None:
+        import signal
+        from gateway.executor import (
+            _read_boot_id,
+            _read_proc_start_ticks,
+            is_process_instance_alive,
+        )
+
+        # 1. Kernel `(boot_id, pid, proc_start_ticks)` PID-reuse safety unit checks
+        my_pid = os.getpid()
+        my_boot = _read_boot_id()
+        my_ticks = _read_proc_start_ticks(my_pid)
+        self.assertIsNotNone(my_ticks)
+        assert my_ticks is not None
+        self.assertTrue(is_process_instance_alive(my_pid, my_boot, my_ticks))
+        self.assertFalse(
+            is_process_instance_alive(my_pid, my_boot, my_ticks + 1),
+            "Mismatched proc_start_ticks (recycled PID) must report not alive",
+        )
+        if my_boot:
+            self.assertFalse(
+                is_process_instance_alive(
+                    my_pid, "00000000-0000-0000-0000-000000000000", my_ticks
+                ),
+                "Mismatched boot_id (host reboot) must report not alive",
+            )
+
+        # 2. End-to-end session persistence & post-restart reconciliation across GatewayServer instances
+        ledger_dir = Path(self.tmpdir) / "persisted_sessions"
+        cfg1 = GatewayConfig(
+            host="127.0.0.1",
+            port=0,
+            api_tokens=["persist-tok"],
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            session_state_dir=str(ledger_dir),
+        )
+        srv1 = GatewayServer(cfg1)
+        h1, p1 = await srv1.start()
+        done_sid = ""
+        interrupted_sid = ""
+        interrupted_pid: Optional[int] = None
+        try:
+            c1 = DotsGatewayClient(base_url=f"http://{h1}:{p1}", token="persist-tok")
+
+            # A. Start and complete a fast session (including JSON thread_id extraction)
+            s1_start, _ = await asyncio.to_thread(
+                c1.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "p-start-1",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "session_start",
+                        "arguments": {
+                            "type": "exec",
+                            "cwd": self.tmpdir,
+                            "command": [
+                                "python3",
+                                "-c",
+                                "print('COMPLETED_BEFORE_RESTART')",
+                            ],
+                        },
+                    },
+                },
+            )
+            done_sid = s1_start["result"]["structuredContent"]["session_id"]
+            s1_poll, _ = await asyncio.to_thread(
+                c1.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "p-poll-1",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "session_poll",
+                        "arguments": {
+                            "session_id": done_sid,
+                            "wait_seconds": 5,
+                            "wait_for_exit": True,
+                        },
+                    },
+                },
+            )
+            self.assertEqual(
+                s1_poll["result"]["structuredContent"]["status"], "completed"
+            )
+            self.assertFalse(s1_poll["result"]["structuredContent"]["process_alive"])
+
+            # B. Start a long-running background session that is active when Gateway restarts
+            s2_start, _ = await asyncio.to_thread(
+                c1.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "p-start-2",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "session_start",
+                        "arguments": {
+                            "type": "exec",
+                            "cwd": self.tmpdir,
+                            "command": [
+                                "python3",
+                                "-c",
+                                "import time; print('IN_FLIGHT_PROGRESS', flush=True); time.sleep(60)",
+                            ],
+                        },
+                    },
+                },
+            )
+            interrupted_sid = s2_start["result"]["structuredContent"]["session_id"]
+            interrupted_pid = s2_start["result"]["structuredContent"]["pid"]
+
+            # Wait until IN_FLIGHT_PROGRESS is captured
+            for _ in range(20):
+                p2_live, _ = await asyncio.to_thread(
+                    c1.mcp_request,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "p-poll-2-live",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "session_poll",
+                            "arguments": {"session_id": interrupted_sid, "wait_seconds": 0.2},
+                        },
+                    },
+                )
+                sc_live = p2_live["result"]["structuredContent"]
+                if "IN_FLIGHT_PROGRESS" in sc_live.get("stdout", ""):
+                    self.assertTrue(sc_live["process_alive"])
+                    break
+                await asyncio.sleep(0.1)
+
+            # Stop srv1 (flushes `"status": "running"` ledger file), then simulate systemd cgroup SIGKILL
+            await srv1.stop()
+            live_obj = srv1.sessions._sessions.get(interrupted_sid)
+            if interrupted_pid:
+                try:
+                    os.killpg(os.getpgid(interrupted_pid), signal.SIGKILL)
+                except OSError:
+                    pass
+            if live_obj is not None and live_obj._proc is not None:
+                try:
+                    await asyncio.wait_for(live_obj._proc.wait(), timeout=3.0)
+                except Exception:
+                    pass
+            # Re-write pre-crash `"running"` snapshot so srv2 exercises full startup reconciliation
+            running_snap = json.loads(
+                (ledger_dir / f"{interrupted_sid}.json").read_text(encoding="utf-8")
+            )
+            running_snap["status"] = "running"
+            running_snap["ended_at"] = None
+            running_snap["returncode"] = None
+            (ledger_dir / f"{interrupted_sid}.json").write_text(
+                json.dumps(running_snap), encoding="utf-8"
+            )
+        finally:
+            await srv1.stop()
+
+        # 3. Boot a brand-new GatewayServer (`srv2`) using the same `session_state_dir`
+        cfg2 = GatewayConfig(
+            host="127.0.0.1",
+            port=0,
+            api_tokens=["persist-tok"],
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            session_state_dir=str(ledger_dir),
+        )
+        srv2 = GatewayServer(cfg2)
+        h2, p2 = await srv2.start()
+        try:
+            c2 = DotsGatewayClient(base_url=f"http://{h2}:{p2}", token="persist-tok")
+
+            # Completed session from srv1 is still queryable
+            r_done, _ = await asyncio.to_thread(
+                c2.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "p2-done",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "session_poll",
+                        "arguments": {"session_id": done_sid},
+                    },
+                },
+            )
+            self.assertFalse(r_done["result"]["isError"], r_done)
+            sc_done = r_done["result"]["structuredContent"]
+            self.assertEqual(sc_done["status"], "completed")
+            self.assertFalse(sc_done["process_alive"])
+            self.assertTrue(sc_done["reconciled_after_restart"])
+            self.assertIn("COMPLETED_BEFORE_RESTART", sc_done["stdout"])
+
+            # Interrupted running session from srv1 is reconciled deterministically as exited
+            r_int, _ = await asyncio.to_thread(
+                c2.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "p2-int",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "session_poll",
+                        "arguments": {"session_id": interrupted_sid, "wait_seconds": 2},
+                    },
+                },
+            )
+            self.assertFalse(r_int["result"]["isError"], r_int)
+            sc_int = r_int["result"]["structuredContent"]
+            self.assertEqual(sc_int["status"], "interrupted_by_restart")
+            self.assertFalse(sc_int["process_alive"])
+            self.assertTrue(sc_int["reconciled_after_restart"])
+            self.assertIn("IN_FLIGHT_PROGRESS", sc_int["stdout"])
+            self.assertIn("interrupted by gateway restart", sc_int["stderr"])
+
+            # Both appear in session_list
+            r_list, _ = await asyncio.to_thread(
+                c2.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "p2-list",
+                    "method": "tools/call",
+                    "params": {"name": "session_list", "arguments": {}},
+                },
+            )
+            listed_ids = {
+                s["session_id"]
+                for s in r_list["result"]["structuredContent"]["sessions"]
+            }
+            self.assertIn(done_sid, listed_ids)
+            self.assertIn(interrupted_sid, listed_ids)
+        finally:
+            await srv2.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

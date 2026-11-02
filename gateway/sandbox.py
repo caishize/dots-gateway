@@ -157,6 +157,12 @@ def build_mount_ns_argv(
         'if [ -d "/opt/flutter/bin/cache" ] && [ -d "/mnt/opt/flutter/bin/cache" ]; then',
         f'  {q_mount} --rbind "/opt/flutter/bin/cache" "/mnt/opt/flutter/bin/cache"',
         "fi",
+        # Mask host per-user runtime sockets (/run/user/$UID/systemd, /run/user/$UID/gnupg)
+        # while preserving /run/systemd/resolve DNS and a clean private XDG_RUNTIME_DIR
+        'if [ -d "/mnt/run/user" ]; then',
+        f'  {q_mount} -t tmpfs -o size=8m,mode=0755 tmpfs /mnt/run/user',
+        '  mkdir -p "/mnt/run/user/$(id -u)" && chmod 0700 "/mnt/run/user/$(id -u)"',
+        "fi",
         "mkdir -p /mnt/tmp /mnt/mnt /mnt/home",
         "chmod 1777 /mnt/tmp",
     ]

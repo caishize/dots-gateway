@@ -15,14 +15,187 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Deque, Dict, List, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 from .config import GatewayConfig
 from .policy import CommandPolicy
 from .sandbox import build_mount_ns_argv
 
 STREAM_LINE_LIMIT = 16 * 1024 * 1024  # 16 MiB asyncio StreamReader buffer limit
+_PERSISTED_TAIL_CHARS = 65536  # Max stdout/stderr characters retained in on-disk session ledger
+_PERSIST_THROTTLE_SECONDS = 2.0
+_SESSION_ID_SAFE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+
+def _read_boot_id() -> str:
+    """Return the Linux kernel boot UUID (`/proc/sys/kernel/random/boot_id`), or empty string."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _read_proc_start_ticks(pid: int) -> Optional[int]:
+    """Return kernel `starttime` ticks (field 22 of `/proc/<pid>/stat`) for live non-zombie `pid`."""
+    if not pid or pid <= 0:
+        return None
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    rparen = raw.rfind(")")
+    if rparen < 0:
+        return None
+    fields = raw[rparen + 2 :].split()
+    if len(fields) < 20:
+        return None
+    #Zombie ('Z') or Dead ('X'/'x') processes have already terminated execution
+    if fields[0] in ("Z", "X", "x"):
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
+def is_process_instance_alive(
+    pid: Optional[int],
+    boot_id: Optional[str],
+    proc_start_ticks: Optional[int],
+) -> bool:
+    """Verify whether the exact process `(boot_id, pid, proc_start_ticks)` is still alive (PID-reuse safe)."""
+    if not pid or pid <= 0 or proc_start_ticks is None:
+        return False
+    cur_boot = _read_boot_id()
+    if boot_id and cur_boot and cur_boot != boot_id:
+        return False
+    cur_ticks = _read_proc_start_ticks(pid)
+    return cur_ticks is not None and cur_ticks == proc_start_ticks
+
+
+def _extract_initial_agent_id(
+    argv: Sequence[str], is_agy: bool, is_codex: bool
+) -> Optional[str]:
+    """Extract resumed conversation/session ID from `agy` or `codex` CLI arguments when present."""
+    if is_agy:
+        for i, tok in enumerate(argv):
+            if tok == "--resume" and i + 1 < len(argv):
+                cand = argv[i + 1].strip()
+                if cand and not cand.startswith("-"):
+                    return cand
+            elif tok.startswith("--resume="):
+                cand = tok.split("=", 1)[1].strip()
+                if cand:
+                    return cand
+    if is_codex:
+        for i, tok in enumerate(argv):
+            if tok == "resume" and i + 1 < len(argv):
+                for sub in argv[i + 1 :]:
+                    if sub == "--":
+                        break
+                    if sub.startswith("-") or sub == "-":
+                        continue
+                    return sub.strip() or None
+    return None
+
+
+def _extract_stream_agent_id(text: str) -> Optional[str]:
+    """Extract `thread_id` / `conversation_id` from JSONL agent stdout lines when available."""
+    for raw_line in text.splitlines():
+        s = raw_line.strip()
+        if not s.startswith("{") or not s.endswith("}"):
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        for key in ("thread_id", "conversation_id", "conversationId"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        if obj.get("type") == "session_meta" and isinstance(obj.get("payload"), dict):
+            pid_val = obj["payload"].get("id")
+            if isinstance(pid_val, str) and pid_val.strip():
+                return pid_val.strip()
+    return None
+
+
+def _discover_codex_rollout_id(cwd: str, started_at: float) -> Optional[str]:
+    """Best-effort lookup of unambiguous Codex rollout UUID matching `(cwd, started_at)`."""
+    sessions_root = Path.home() / ".codex" / "sessions"
+    if not sessions_root.is_dir():
+        return None
+    try:
+        resolved_cwd = str(Path(cwd).resolve())
+    except OSError:
+        resolved_cwd = cwd
+
+    candidates: List[Tuple[float, Path]] = []
+    try:
+        year_dirs = sorted(
+            (p for p in sessions_root.iterdir() if p.is_dir()), reverse=True
+        )[:2]
+        for y_dir in year_dirs:
+            month_dirs = sorted((p for p in y_dir.iterdir() if p.is_dir()), reverse=True)[:2]
+            for m_dir in month_dirs:
+                day_dirs = sorted(
+                    (p for p in m_dir.iterdir() if p.is_dir()), reverse=True
+                )[:3]
+                for d_dir in day_dirs:
+                    for f in d_dir.glob("rollout-*.jsonl"):
+                        try:
+                            st = f.stat()
+                        except OSError:
+                            continue
+                        if st.st_mtime >= started_at - 5.0:
+                            candidates.append((st.st_mtime, f))
+    except OSError:
+        return None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    matched_ids: List[str] = []
+    for _, fpath in candidates[:25]:
+        try:
+            with fpath.open("r", encoding="utf-8", errors="replace") as fh:
+                first_line = fh.readline(16384).strip()
+            if not first_line:
+                continue
+            meta = json.loads(first_line)
+            if not isinstance(meta, dict) or meta.get("type") != "session_meta":
+                continue
+            payload = meta.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            p_cwd = str(payload.get("cwd") or "")
+            if p_cwd != resolved_cwd and p_cwd != cwd:
+                continue
+            ts_raw = str(payload.get("timestamp") or meta.get("timestamp") or "")
+            if not ts_raw:
+                continue
+            dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            if abs(dt.timestamp() - started_at) <= 45.0:
+                rid = str(payload.get("id") or "").strip()
+                if rid and rid not in matched_ids:
+                    matched_ids.append(rid)
+        except Exception:
+            continue
+
+    return matched_ids[0] if len(matched_ids) == 1 else None
 _STRIPPED_ENV_KEYS = {
     "GATEWAY_TOKEN",
     "GATEWAY_PASSWORD",
@@ -96,6 +269,7 @@ class ExecutionSession:
         is_agy: bool = False,
         is_codex: bool = False,
         spawn_argv: Optional[List[str]] = None,
+        on_persist: Optional[Callable[["ExecutionSession", bool], None]] = None,
     ) -> None:
         self.session_id = session_id
         self.argv = argv
@@ -110,12 +284,19 @@ class ExecutionSession:
         self.max_output_bytes = max_output_bytes
         self.is_agy = is_agy
         self.is_codex = is_codex
+        self._on_persist = on_persist
 
         self.status: str = "starting"
         self.pid: Optional[int] = None
+        self.boot_id: str = _read_boot_id()
+        self.proc_start_ticks: Optional[int] = None
+        self.agent_conversation_id: Optional[str] = _extract_initial_agent_id(
+            argv, is_agy=is_agy, is_codex=is_codex
+        )
         self.returncode: Optional[int] = None
         self.started_at: float = time.time()
         self.ended_at: Optional[float] = None
+        self._last_persist_mono: float = 0.0
 
         self._slot_sem = slot_sem
         self._queue_timeout = queue_timeout
@@ -135,6 +316,18 @@ class ExecutionSession:
         self._done_event = asyncio.Event()
         self._watch_tasks: List[asyncio.Task[Any]] = []
 
+    def _notify_persist(self, force: bool = False) -> None:
+        if self._on_persist is None:
+            return
+        now_m = time.monotonic()
+        if not force and (now_m - self._last_persist_mono) < _PERSIST_THROTTLE_SECONDS:
+            return
+        self._last_persist_mono = now_m
+        try:
+            self._on_persist(self, force)
+        except Exception:
+            pass
+
     def _append_stdout(self, text: str) -> None:
         b_len = len(text.encode("utf-8", errors="replace"))
         self._stdout_chunks.append((b_len, text))
@@ -143,6 +336,13 @@ class ExecutionSession:
             old_len, _ = self._stdout_chunks.popleft()
             self._stdout_bytes -= old_len
             self.stdout_truncated = True
+        found_id = False
+        if (self.is_codex or self.is_agy) and not self.agent_conversation_id:
+            cand_id = _extract_stream_agent_id(text)
+            if cand_id:
+                self.agent_conversation_id = cand_id
+                found_id = True
+        self._notify_persist(force=found_id)
 
     def _append_stderr(self, text: str) -> None:
         b_len = len(text.encode("utf-8", errors="replace"))
@@ -152,6 +352,7 @@ class ExecutionSession:
             old_len, _ = self._stderr_chunks.popleft()
             self._stderr_bytes -= old_len
             self.stderr_truncated = True
+        self._notify_persist(force=False)
 
     def _emit(self, event_type: str, data: Any) -> SessionEvent:
         self._seq += 1
@@ -181,6 +382,7 @@ class ExecutionSession:
                 "queued",
                 {"message": "Waiting for available agy concurrency slot", "cwd": self.cwd},
             )
+            self._notify_persist(force=True)
             self._watch_tasks.append(
                 asyncio.create_task(self._queued_start_loop(close_stdin=close_stdin))
             )
@@ -219,6 +421,7 @@ class ExecutionSession:
                     "duration_seconds": round(self.ended_at - self.started_at, 4),
                 },
             )
+            self._notify_persist(force=True)
             self._done_event.set()
             for q in list(self._subscribers):
                 try:
@@ -239,6 +442,7 @@ class ExecutionSession:
                     "duration_seconds": round(self.ended_at - self.started_at, 4),
                 },
             )
+            self._notify_persist(force=True)
             self._done_event.set()
             for q in list(self._subscribers):
                 try:
@@ -265,6 +469,7 @@ class ExecutionSession:
             self.status = "failed"
             self._emit("error", str(exc))
             self._emit("exit", {"returncode": -1, "status": "failed", "duration_seconds": 0.0})
+            self._notify_persist(force=True)
             self._done_event.set()
             for q in list(self._subscribers):
                 try:
@@ -332,6 +537,8 @@ class ExecutionSession:
                     pass
 
         self.pid = self._proc.pid
+        self.boot_id = _read_boot_id()
+        self.proc_start_ticks = _read_proc_start_ticks(self.pid) if self.pid else None
         self.status = "running"
         self._emit(
             "started",
@@ -344,6 +551,7 @@ class ExecutionSession:
                 "stream_json": self.stream_json,
             },
         )
+        self._notify_persist(force=True)
 
         if initial_stdin is not None:
             await self.write_stdin(initial_stdin, close_after=close_stdin)
@@ -468,6 +676,9 @@ class ExecutionSession:
         elif self.status != "killed":
             self.status = "completed" if self.returncode == 0 else "failed"
 
+        if self.is_codex and not self.agent_conversation_id:
+            self.agent_conversation_id = _discover_codex_rollout_id(self.cwd, self.started_at)
+
         self._emit(
             "exit",
             {
@@ -476,6 +687,7 @@ class ExecutionSession:
                 "duration_seconds": round(self.ended_at - self.started_at, 4),
             },
         )
+        self._notify_persist(force=True)
         self._done_event.set()
         for q in list(self._subscribers):
             try:
@@ -604,9 +816,20 @@ class ExecutionSession:
                 yield ev
 
     def to_summary(self, include_output: bool = True, after_seq: int = 0) -> Dict[str, Any]:
+        if self.is_codex and not self.agent_conversation_id and self.pid is not None:
+            self.agent_conversation_id = _discover_codex_rollout_id(self.cwd, self.started_at)
+        proc_alive = bool(
+            self._proc is not None
+            and self._proc.returncode is None
+            and self.status == "running"
+        )
         res: Dict[str, Any] = {
             "session_id": self.session_id,
+            "session_kind": "agy" if self.is_agy else ("codex" if self.is_codex else "exec"),
             "status": self.status,
+            "process_alive": proc_alive,
+            "reconciled_after_restart": False,
+            "agent_conversation_id": self.agent_conversation_id,
             "pid": self.pid,
             "argv": self.argv,
             "shell_cmd": self.shell_cmd,
@@ -629,15 +852,430 @@ class ExecutionSession:
             ]
         return res
 
+    def to_persisted_dict(self, max_tail_chars: int = _PERSISTED_TAIL_CHARS) -> Dict[str, Any]:
+        """Serialize session metadata and bounded output tail for crash/restart recovery."""
+        full_out = "".join(t for _, t in self._stdout_chunks)
+        full_err = "".join(t for _, t in self._stderr_chunks)
+        out_trunc = self.stdout_truncated or (len(full_out) > max_tail_chars)
+        err_trunc = self.stderr_truncated or (len(full_err) > max_tail_chars)
+        return {
+            "schema_version": 1,
+            "session_id": self.session_id,
+            "session_kind": "agy" if self.is_agy else ("codex" if self.is_codex else "exec"),
+            "is_agy": self.is_agy,
+            "is_codex": self.is_codex,
+            "status": self.status,
+            "pid": self.pid,
+            "boot_id": self.boot_id,
+            "proc_start_ticks": self.proc_start_ticks,
+            "agent_conversation_id": self.agent_conversation_id,
+            "argv": self.argv,
+            "shell_cmd": self.shell_cmd,
+            "cwd": self.cwd,
+            "returncode": self.returncode,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "last_seq": self._seq,
+            "stdout": full_out[-max_tail_chars:] if max_tail_chars > 0 else "",
+            "stderr": full_err[-max_tail_chars:] if max_tail_chars > 0 else "",
+            "stdout_truncated": out_trunc,
+            "stderr_truncated": err_trunc,
+            "reconciled_after_restart": False,
+        }
+
+
+class PersistedSession:
+    """Disk-backed historical or restart-reconciled session record."""
+
+    def __init__(
+        self,
+        record: Dict[str, Any],
+        on_update: Optional[Callable[["PersistedSession"], None]] = None,
+    ) -> None:
+        self.session_id: str = str(record["session_id"])
+        self.is_agy: bool = bool(record.get("is_agy") or record.get("session_kind") == "agy")
+        self.is_codex: bool = bool(
+            record.get("is_codex") or record.get("session_kind") == "codex"
+        )
+        self.status: str = str(record.get("status") or "completed")
+        raw_pid = record.get("pid")
+        self.pid: Optional[int] = int(raw_pid) if raw_pid is not None else None
+        self.boot_id: str = str(record.get("boot_id") or "")
+        raw_ticks = record.get("proc_start_ticks")
+        self.proc_start_ticks: Optional[int] = (
+            int(raw_ticks) if raw_ticks is not None else None
+        )
+        raw_conv = record.get("agent_conversation_id")
+        self.agent_conversation_id: Optional[str] = (
+            str(raw_conv) if raw_conv else None
+        )
+        self.argv: List[str] = [str(x) for x in (record.get("argv") or [])]
+        raw_sc = record.get("shell_cmd")
+        self.shell_cmd: Optional[str] = str(raw_sc) if raw_sc is not None else None
+        self.cwd: str = str(record.get("cwd") or "")
+        raw_rc = record.get("returncode")
+        self.returncode: Optional[int] = int(raw_rc) if raw_rc is not None else None
+        self.started_at: float = float(record.get("started_at") or time.time())
+        raw_end = record.get("ended_at")
+        self.ended_at: Optional[float] = float(raw_end) if raw_end is not None else None
+        self._seq: int = max(1, int(record.get("last_seq") or 1))
+        self.stdout: str = str(record.get("stdout") or "")
+        self.stderr: str = str(record.get("stderr") or "")
+        self.stdout_truncated: bool = bool(record.get("stdout_truncated", False))
+        self.stderr_truncated: bool = bool(record.get("stderr_truncated", False))
+        self.reconciled_after_restart: bool = bool(
+            record.get("reconciled_after_restart", True)
+        )
+        self._on_update = on_update
+
+    def is_alive(self) -> bool:
+        """Check kernel `(boot_id, pid, proc_start_ticks)` identity and auto-transition if exited."""
+        if self.status not in ("queued", "starting", "running", "orphaned_running"):
+            return False
+        alive = is_process_instance_alive(
+            self.pid, self.boot_id, self.proc_start_ticks
+        )
+        if not alive:
+            if self.status != "killed":
+                self.status = "interrupted_by_restart"
+            if self.ended_at is None:
+                self.ended_at = time.time()
+            if self.returncode is None:
+                self.returncode = -15
+            self._seq += 1
+            if self._on_update is not None:
+                try:
+                    self._on_update(self)
+                except Exception:
+                    pass
+        return alive
+
+    def _build_events(self, after_seq: int = 0) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        if self._seq > after_seq:
+            ev_ts = self.ended_at or self.started_at
+            events.append(
+                {
+                    "seq": self._seq,
+                    "type": "exit" if not self.is_alive() else "reconciled",
+                    "timestamp": ev_ts,
+                    "session_id": self.session_id,
+                    "data": {
+                        "status": self.status,
+                        "returncode": self.returncode,
+                        "process_alive": self.is_alive(),
+                        "reconciled_after_restart": self.reconciled_after_restart,
+                        "agent_conversation_id": self.agent_conversation_id,
+                    },
+                }
+            )
+        return events
+
+    def to_summary(self, include_output: bool = True, after_seq: int = 0) -> Dict[str, Any]:
+        alive = self.is_alive()
+        if self.is_codex and not self.agent_conversation_id:
+            self.agent_conversation_id = _discover_codex_rollout_id(self.cwd, self.started_at)
+        res: Dict[str, Any] = {
+            "session_id": self.session_id,
+            "session_kind": "agy" if self.is_agy else ("codex" if self.is_codex else "exec"),
+            "status": self.status,
+            "process_alive": alive,
+            "reconciled_after_restart": self.reconciled_after_restart,
+            "agent_conversation_id": self.agent_conversation_id,
+            "pid": self.pid,
+            "argv": self.argv,
+            "shell_cmd": self.shell_cmd,
+            "cwd": self.cwd,
+            "returncode": self.returncode,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "duration_seconds": (
+                round((self.ended_at or time.time()) - self.started_at, 4)
+            ),
+            "last_seq": self._seq,
+            "stdout_truncated": self.stdout_truncated,
+            "stderr_truncated": self.stderr_truncated,
+        }
+        if include_output:
+            res["stdout"] = self.stdout
+            res["stderr"] = self.stderr
+            res["events"] = self._build_events(after_seq=after_seq)
+        return res
+
+    def to_persisted_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "session_id": self.session_id,
+            "session_kind": "agy" if self.is_agy else ("codex" if self.is_codex else "exec"),
+            "is_agy": self.is_agy,
+            "is_codex": self.is_codex,
+            "status": self.status,
+            "pid": self.pid,
+            "boot_id": self.boot_id,
+            "proc_start_ticks": self.proc_start_ticks,
+            "agent_conversation_id": self.agent_conversation_id,
+            "argv": self.argv,
+            "shell_cmd": self.shell_cmd,
+            "cwd": self.cwd,
+            "returncode": self.returncode,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "last_seq": self._seq,
+            "stdout": self.stdout[-_PERSISTED_TAIL_CHARS:],
+            "stderr": self.stderr[-_PERSISTED_TAIL_CHARS:],
+            "stdout_truncated": self.stdout_truncated,
+            "stderr_truncated": self.stderr_truncated,
+            "reconciled_after_restart": self.reconciled_after_restart,
+        }
+
+    async def subscribe_with_heartbeat(
+        self, after_seq: int = 0, heartbeat_seconds: float = 15.0
+    ) -> AsyncIterator[Optional[SessionEvent]]:
+        for raw_ev in self._build_events(after_seq=after_seq):
+            yield SessionEvent(
+                seq=raw_ev["seq"],
+                type=raw_ev["type"],
+                timestamp=raw_ev["timestamp"],
+                session_id=self.session_id,
+                data=raw_ev["data"],
+            )
+        idle_elapsed = 0.0
+        while self.is_alive():
+            await asyncio.sleep(0.25)
+            idle_elapsed += 0.25
+            if not self.is_alive():
+                yield SessionEvent(
+                    seq=self._seq,
+                    type="exit",
+                    timestamp=self.ended_at or time.time(),
+                    session_id=self.session_id,
+                    data={
+                        "status": self.status,
+                        "returncode": self.returncode,
+                        "process_alive": False,
+                    },
+                )
+                break
+            if idle_elapsed >= heartbeat_seconds:
+                idle_elapsed = 0.0
+                yield None
+
+    async def subscribe(self, after_seq: int = 0) -> AsyncIterator[SessionEvent]:
+        async for ev in self.subscribe_with_heartbeat(after_seq=after_seq, heartbeat_seconds=30.0):
+            if ev is not None:
+                yield ev
+
+    async def send_signal(self, sig_name: str = "SIGTERM") -> None:
+        """Signal an orphaned process ONLY if its `(boot_id, pid, proc_start_ticks)` identity matches."""
+        if not self.is_alive() or not self.pid:
+            return
+        sig_map = {
+            "SIGINT": signal.SIGINT,
+            "SIGTERM": signal.SIGTERM,
+            "SIGKILL": signal.SIGKILL,
+            "SIGHUP": signal.SIGHUP,
+        }
+        sig = sig_map.get(sig_name.upper(), signal.SIGTERM)
+        # Re-verify PID identity immediately prior to killpg/kill
+        if not is_process_instance_alive(self.pid, self.boot_id, self.proc_start_ticks):
+            self.is_alive()
+            return
+        try:
+            os.killpg(os.getpgid(self.pid), sig)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                os.kill(self.pid, sig)
+            except Exception:
+                pass
+        if sig == signal.SIGKILL:
+            self.status = "killed"
+        await asyncio.sleep(0.05)
+        if not is_process_instance_alive(self.pid, self.boot_id, self.proc_start_ticks):
+            self.status = "killed"
+            self.ended_at = self.ended_at or time.time()
+            if self.returncode is None:
+                self.returncode = -int(sig)
+            self._seq += 1
+        if self._on_update is not None:
+            try:
+                self._on_update(self)
+            except Exception:
+                pass
+
+    async def write_stdin(self, data: Union[str, bytes], close_after: bool = False) -> None:
+        raise RuntimeError(
+            f"Session {self.session_id} cannot accept interactive stdin after gateway restart "
+            f"(status={self.status}, process_alive={self.is_alive()})"
+        )
+
+    async def send_agy_turn(self, prompt: str, close_after: bool = False) -> None:
+        raise RuntimeError(
+            f"Session {self.session_id} cannot accept follow-up turns after gateway restart "
+            f"(status={self.status}, process_alive={self.is_alive()}); resume via conversation_id instead"
+        )
+
+    def resize_pty(self, rows: int, cols: int) -> None:
+        raise RuntimeError("Persisted session does not have an active PTY")
+
 
 class SessionManager:
-    """Manages active and historical ExecutionSessions with policy validation."""
+    """Manages active and historical ExecutionSessions with policy validation and disk ledger."""
 
     def __init__(self, config: GatewayConfig, policy: CommandPolicy) -> None:
         self.config = config
         self.policy = policy
         self._sessions: Dict[str, ExecutionSession] = {}
+        self._persisted: Dict[str, PersistedSession] = {}
         self._agy_sem = asyncio.Semaphore(max(1, config.max_concurrent_agy))
+        self._state_dir: Optional[Path] = (
+            Path(config.session_state_dir).expanduser()
+            if config.session_state_dir
+            else None
+        )
+        if self._state_dir is not None:
+            self._init_and_reconcile_ledger()
+
+    def _session_file_path(self, session_id: str) -> Optional[Path]:
+        if self._state_dir is None or not session_id:
+            return None
+        if not all(ch in _SESSION_ID_SAFE_CHARS for ch in session_id):
+            return None
+        return self._state_dir / f"{session_id}.json"
+
+    def _write_ledger_record(self, session_id: str, payload: Dict[str, Any]) -> None:
+        target = self._session_file_path(session_id)
+        if target is None or self._state_dir is None:
+            return
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(self._state_dir, 0o700)
+            except OSError:
+                pass
+            tmp_p = target.with_suffix(f".{os.getpid()}.tmp")
+            tmp_p.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(tmp_p, 0o600)
+            os.replace(tmp_p, target)
+        except OSError:
+            pass
+
+    def _on_live_session_persist(self, session: ExecutionSession, _force: bool) -> None:
+        self._write_ledger_record(session.session_id, session.to_persisted_dict())
+
+    def _on_persisted_session_update(self, psession: PersistedSession) -> None:
+        self._write_ledger_record(psession.session_id, psession.to_persisted_dict())
+
+    def _prune_ledger_files(self) -> None:
+        if self._state_dir is None or not self._state_dir.is_dir():
+            return
+        max_keep = max(10, int(self.config.max_persisted_sessions or 200))
+        try:
+            files = sorted(
+                self._state_dir.glob("*.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return
+        for stale in files[max_keep:]:
+            sid = stale.stem
+            if sid in self._sessions and self._sessions[sid].status in (
+                "queued",
+                "starting",
+                "running",
+            ):
+                continue
+            self._persisted.pop(sid, None)
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
+    def _init_and_reconcile_ledger(self) -> None:
+        assert self._state_dir is not None
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(self._state_dir, 0o700)
+        except OSError:
+            return
+
+        max_keep = max(10, int(self.config.max_persisted_sessions or 200))
+        try:
+            files = sorted(
+                self._state_dir.glob("*.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return
+
+        for fpath in files[:max_keep]:
+            try:
+                raw = json.loads(fpath.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict) or not raw.get("session_id"):
+                    continue
+                file_mtime = fpath.stat().st_mtime
+            except Exception:
+                continue
+
+            saved_status = str(raw.get("status") or "")
+            dirty = False
+            if raw.get("is_codex") and not raw.get("agent_conversation_id") and raw.get("cwd"):
+                cand_cid = _discover_codex_rollout_id(
+                    str(raw["cwd"]), float(raw.get("started_at") or file_mtime)
+                )
+                if cand_cid:
+                    raw["agent_conversation_id"] = cand_cid
+                    dirty = True
+
+            if saved_status in ("queued", "starting", "running", "orphaned_running"):
+                pid_val = int(raw["pid"]) if raw.get("pid") is not None else None
+                boot_val = str(raw.get("boot_id") or "")
+                ticks_val = (
+                    int(raw["proc_start_ticks"])
+                    if raw.get("proc_start_ticks") is not None
+                    else None
+                )
+                if is_process_instance_alive(pid_val, boot_val, ticks_val):
+                    raw["status"] = "orphaned_running"
+                else:
+                    raw["status"] = "interrupted_by_restart"
+                    if raw.get("ended_at") is None:
+                        raw["ended_at"] = file_mtime
+                    if raw.get("returncode") is None:
+                        raw["returncode"] = -15
+                    note = (
+                        "\n[dots-gateway] Session interrupted by gateway restart; "
+                        "kernel /proc identity check confirmed prior process exited.\n"
+                    )
+                    existing_err = str(raw.get("stderr") or "")
+                    if "[dots-gateway] Session interrupted by gateway restart" not in existing_err:
+                        raw["stderr"] = (existing_err + note)[-_PERSISTED_TAIL_CHARS:]
+                    raw["last_seq"] = int(raw.get("last_seq") or 1) + 1
+                raw["reconciled_after_restart"] = True
+                dirty = True
+            elif not raw.get("reconciled_after_restart"):
+                raw["reconciled_after_restart"] = True
+
+            ps = PersistedSession(raw, on_update=self._on_persisted_session_update)
+            self._persisted[ps.session_id] = ps
+            if dirty:
+                self._write_ledger_record(ps.session_id, ps.to_persisted_dict())
+
+        self._prune_ledger_files()
+
+    def flush_all(self) -> None:
+        """Persist current state of all live in-memory sessions before shutdown."""
+        if self._state_dir is None:
+            return
+        for s in list(self._sessions.values()):
+            self._write_ledger_record(s.session_id, s.to_persisted_dict())
+        self._prune_ledger_files()
 
     def _prepare_env(self, extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         env = {
@@ -710,14 +1348,21 @@ class SessionManager:
             return False
 
     def _cleanup_old_sessions(self) -> None:
-        if len(self._sessions) <= 100:
-            return
-        completed = [
-            s for s in self._sessions.values() if s.status not in ("queued", "starting", "running")
-        ]
-        completed.sort(key=lambda s: s.ended_at or 0.0)
-        for s in completed[: len(self._sessions) - 100]:
-            self._sessions.pop(s.session_id, None)
+        if len(self._sessions) > 100:
+            completed = [
+                s
+                for s in self._sessions.values()
+                if s.status not in ("queued", "starting", "running")
+            ]
+            completed.sort(key=lambda s: s.ended_at or 0.0)
+            for s in completed[: len(self._sessions) - 100]:
+                if self._state_dir is not None:
+                    self._persisted[s.session_id] = PersistedSession(
+                        s.to_persisted_dict(),
+                        on_update=self._on_persisted_session_update,
+                    )
+                self._sessions.pop(s.session_id, None)
+        self._prune_ledger_files()
 
     def active_count(self) -> int:
         return sum(
@@ -792,6 +1437,8 @@ class SessionManager:
                     shell_cmd = self.config.agy_binary + stripped_leading[3:]
                 elif stripped_leading.startswith("codex ") and os.path.exists(self.config.codex_binary):
                     shell_cmd = self.config.codex_binary + stripped_leading[5:]
+                elif stripped_leading.startswith("bwrap ") and os.path.exists(self.config.bwrap_binary):
+                    shell_cmd = self.config.bwrap_binary + stripped_leading[5:]
             else:
                 shell_cmd = " ".join(shlex.quote(x) for x in decision.normalized_argv)
 
@@ -834,6 +1481,9 @@ class SessionManager:
             is_agy=is_agy,
             is_codex=is_codex,
             spawn_argv=spawn_argv,
+            on_persist=(
+                self._on_live_session_persist if self._state_dir is not None else None
+            ),
         )
         self._sessions[session_id] = session
         await session.start(initial_stdin=initial_stdin, close_stdin=close_stdin)
@@ -962,13 +1612,20 @@ class SessionManager:
             readonly_subpaths=ro_hook_dirs,
         )
 
-    def get_session(self, session_id: str) -> Optional[ExecutionSession]:
-        return self._sessions.get(session_id)
+    def get_session(
+        self, session_id: str
+    ) -> Optional[Union[ExecutionSession, PersistedSession]]:
+        live = self._sessions.get(session_id)
+        if live is not None:
+            return live
+        return self._persisted.get(session_id)
 
     def list_sessions(self) -> List[Dict[str, Any]]:
-        return [
-            s.to_summary(include_output=False)
-            for s in sorted(
-                self._sessions.values(), key=lambda x: x.started_at, reverse=True
-            )
-        ]
+        combined: List[Union[ExecutionSession, PersistedSession]] = list(
+            self._sessions.values()
+        )
+        for sid, ps in self._persisted.items():
+            if sid not in self._sessions:
+                combined.append(ps)
+        combined.sort(key=lambda x: x.started_at, reverse=True)
+        return [s.to_summary(include_output=False) for s in combined]

@@ -391,8 +391,9 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "session_poll",
         "title": "Poll Background Session Output & Status",
         "description": (
-            "Fetch current status, stdout/stderr, and incremental events (`after_seq`) of a "
-            "background or interactive session, optionally waiting up to `wait_seconds` for new output."
+            "Fetch current status, `process_alive` (/proc kernel identity check), stdout/stderr, "
+            "and incremental events (`after_seq`) of a background or pre-restart persisted session, "
+            "optionally waiting up to `wait_seconds` for new output."
         ),
         "inputSchema": {
             "type": "object",
@@ -489,7 +490,10 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "name": "session_list",
         "title": "List Active & Recent Sessions",
-        "description": "List all active and recently completed execution sessions on the gateway.",
+        "description": (
+            "List all active, recently completed, and restart-reconciled execution sessions on the gateway "
+            "(including `process_alive` and `agent_conversation_id` when available)."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -1273,7 +1277,12 @@ class MCPHandler:
                 wait_seconds = min(max(0.0, float(args.get("wait_seconds") or 0.0)), 60.0)
                 wait_for_exit = bool(args.get("wait_for_exit", False))
 
-                if wait_seconds > 0 and session.status in ("queued", "starting", "running"):
+                if wait_seconds > 0 and session.status in (
+                    "queued",
+                    "starting",
+                    "running",
+                    "orphaned_running",
+                ):
                     deadline = time.monotonic() + wait_seconds
                     async for ev in session.subscribe_with_heartbeat(
                         after_seq=after_seq,
@@ -1425,6 +1434,8 @@ class MCPHandler:
                     "queued_codex_sessions": self.sessions.queued_codex_count(),
                     "max_concurrent_agy": self.config.max_concurrent_agy,
                     "codex_auth_configured": self.sessions.has_codex_auth(),
+                    "session_persistence_enabled": bool(self.config.session_state_dir),
+                    "persisted_sessions": len(self.sessions._persisted),
                     "default_workdir": self.config.default_workdir,
                 },
                 indent=2,

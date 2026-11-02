@@ -100,6 +100,7 @@ class GatewayServer:
         return self.config.host, bound_port
 
     async def stop(self) -> None:
+        self.sessions.flush_all()
         if self._loopback_server is not None:
             self._loopback_server.close()
             await self._loopback_server.wait_closed()
@@ -113,15 +114,18 @@ class GatewayServer:
         if self._server is None:
             await self.start()
         assert self._server is not None
-        if self._loopback_server is not None:
-            async with self._server, self._loopback_server:
-                await asyncio.gather(
-                    self._server.serve_forever(),
-                    self._loopback_server.serve_forever(),
-                )
-        else:
-            async with self._server:
-                await self._server.serve_forever()
+        try:
+            if self._loopback_server is not None:
+                async with self._server, self._loopback_server:
+                    await asyncio.gather(
+                        self._server.serve_forever(),
+                        self._loopback_server.serve_forever(),
+                    )
+            else:
+                async with self._server:
+                    await self._server.serve_forever()
+        finally:
+            self.sessions.flush_all()
 
     async def _handle_loopback_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

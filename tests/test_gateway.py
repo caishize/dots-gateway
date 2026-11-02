@@ -865,6 +865,102 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await rot_srv.stop()
 
+    async def test_bwrap_descendant_containment_and_systemd_run_blocked(self) -> None:
+        client = DotsGatewayClient(
+            base_url=self.base_url, token="test-secret-token-12345"
+        )
+        # 1. Host systemd escape vector (`systemd-run`) must remain blocked
+        sr_dec = self.server.policy.validate_command(["systemd-run", "--version"], cwd=self.tmpdir)
+        self.assertFalse(sr_dec.allowed)
+
+        # 2. `bwrap` wrapper flags are strictly validated and inner command is recursively checked
+        self.assertTrue(
+            self.server.policy.validate_command(["bwrap", "--version"], cwd=self.tmpdir).allowed
+        )
+        self.assertFalse(
+            self.server.policy.validate_command(
+                ["bwrap", "--ro-bind", "/", "/", "--", "sudo", "id"], cwd=self.tmpdir
+            ).allowed
+        )
+        self.assertFalse(
+            self.server.policy.validate_command(
+                ["bwrap", "--args", "3", "--", "echo", "hi"], cwd=self.tmpdir
+            ).allowed
+        )
+        self.assertFalse(
+            self.server.policy.validate_command(
+                ["bwrap", "--cap-add", "ALL", "--", "echo", "hi"], cwd=self.tmpdir
+            ).allowed
+        )
+        self.assertFalse(
+            self.server.policy.validate_command(
+                ["bwrap", "--unknown-flag", "x", "--", "echo", "hi"], cwd=self.tmpdir
+            ).allowed
+        )
+        self.assertFalse(
+            self.server.policy.validate_command(
+                ["bwrap", "--ro-bind", os.path.expanduser("~/.ssh"), "/mnt", "--", "ls", "/mnt"],
+                cwd=self.tmpdir,
+            ).allowed
+        )
+
+        # 3. `nl` utility is allowlisted
+        nl_res = await asyncio.to_thread(
+            client.exec_command,
+            "printf 'alpha\\nbeta\\n' | nl -ba",
+            self.tmpdir,
+        )
+        self.assertTrue(nl_res["ok"], nl_res)
+        self.assertIn("alpha", nl_res["stdout"])
+
+        # 4. If `bwrap` is installed on host, verify `--unshare-pid --die-with-parent` kills detached
+        #    grandchild processes immediately upon leader exit and `/run/user/$UID/systemd` is masked
+        if os.path.exists(self.cfg.bwrap_binary) or shutil.which("bwrap"):
+            ver_res = await asyncio.to_thread(
+                client.exec_command, ["bwrap", "--version"], self.tmpdir
+            )
+            self.assertTrue(ver_res["ok"], ver_res)
+
+            escaped_marker = Path(self.tmpdir) / "detached_grandchild_escaped.txt"
+            py_leader = (
+                "import os, pathlib, subprocess, sys\n"
+                f"marker = {str(escaped_marker)!r}\n"
+                "uid_systemd = f'/run/user/{os.getuid()}/systemd'\n"
+                "print('SYSTEMD_BUS_VISIBLE=' + str(os.path.exists(uid_systemd)))\n"
+                "subprocess.Popen(\n"
+                "    [sys.executable, '-c', f'import time, pathlib; time.sleep(0.35); pathlib.Path({marker!r}).write_text(\"escaped\")'],\n"
+                "    start_new_session=True,\n"
+                ")\n"
+                "print('LEADER_EXITED_CLEANLY')\n"
+            )
+            bw_cmd = [
+                "bwrap",
+                "--dev-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--die-with-parent",
+                "--unshare-pid",
+                "--new-session",
+                "--chdir",
+                self.tmpdir,
+                "--",
+                "python3",
+                "-c",
+                py_leader,
+            ]
+            bw_res = await asyncio.to_thread(client.exec_command, bw_cmd, self.tmpdir)
+            self.assertTrue(bw_res["ok"], bw_res)
+            self.assertIn("LEADER_EXITED_CLEANLY", bw_res["stdout"])
+            if self.cfg.isolate_mount_namespace:
+                self.assertIn("SYSTEMD_BUS_VISIBLE=False", bw_res["stdout"])
+            await asyncio.sleep(0.55)
+            self.assertFalse(
+                escaped_marker.exists(),
+                "Detached grandchild inside bwrap --unshare-pid --die-with-parent must be killed when leader exits",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

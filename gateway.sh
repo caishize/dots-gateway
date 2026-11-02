@@ -461,10 +461,135 @@ cmd_stop() {
   echo "✅ Services stopped (gateway=${state})."
 }
 
+drain_and_snapshot_before_restart() {
+  local force_restart="$1"
+  local wait_forever="$2"
+  if ! systemctl --user is-active --quiet "${SERVICE_NAME}"; then
+    return 0
+  fi
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    return 0
+  fi
+
+  if [[ "${force_restart}" != "1" ]]; then
+    local max_wait="${DOTS_RESTART_DRAIN_SECONDS:-120}"
+    local elapsed=0
+    while true; do
+      local active_cnt
+      active_cnt="$(python3 - "${CONFIG_FILE}" <<'PY'
+import json, pathlib, ssl, sys, urllib.request
+try:
+    cfg = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+    toks = cfg.get("api_" + "tokens") or []
+    if not toks:
+        print("0")
+        raise SystemExit(0)
+    port = int(cfg.get("port") or 8765)
+    scheme = "https" if (cfg.get("tls_certfile") and cfg.get("tls_keyfile")) else "http"
+    req = urllib.request.Request(
+        f"{scheme}://127.0.0.1:{port}/v1/health",
+        headers={"Authorization": f"Bearer {toks[0]}"},
+    )
+    ctx = ssl._create_unverified_context() if scheme == "https" else None
+    with urllib.request.urlopen(req, context=ctx, timeout=2.5) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        print(int(data.get("active_sessions") or 0))
+except Exception:
+    print("0")
+PY
+)"
+      if [[ ! "${active_cnt}" =~ ^[0-9]+$ ]] || (( active_cnt == 0 )); then
+        break
+      fi
+      if [[ "${wait_forever}" != "1" ]] && (( elapsed >= max_wait )); then
+        echo "❌ 检测到当前仍有 ${active_cnt} 个活跃会话正在运行 (已等待 ${elapsed}s)，为避免中断任务已取消重启。" >&2
+        echo "   可使用 '${PROG_NAME} restart --wait' 等待全部任务自然结束后重启，或 '${PROG_NAME} restart --force' 强制立即重启。" >&2
+        return 1
+      fi
+      if (( elapsed == 0 )); then
+        echo "==> Draining ${active_cnt} active session(s) before restarting ${SERVICE_NAME} ..."
+      fi
+      sleep 2
+      elapsed=$(( elapsed + 2 ))
+    done
+  fi
+
+  # Snapshot in-memory sessions to disk ledger before stopping (seamless across upgrades)
+  python3 - "${CONFIG_FILE}" <<'PY'
+import json, os, pathlib, ssl, sys, urllib.request
+try:
+    cfg = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+    toks = cfg.get("api_" + "tokens") or []
+    if not toks:
+        raise SystemExit(0)
+    port = int(cfg.get("port") or 8765)
+    scheme = "https" if (cfg.get("tls_certfile") and cfg.get("tls_keyfile")) else "http"
+    ctx = ssl._create_unverified_context() if scheme == "https" else None
+    hdrs = {"Authorization": f"Bearer {toks[0]}"}
+    sdir = pathlib.Path(cfg.get("session_state_dir") or (pathlib.Path.home() / ".config" / "dots-gateway" / "sessions")).expanduser()
+    sdir.mkdir(parents=True, exist_ok=True)
+    os.chmod(sdir, 0o700)
+    boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    req = urllib.request.Request(f"{scheme}://127.0.0.1:{port}/v1/sessions", headers=hdrs)
+    with urllib.request.urlopen(req, context=ctx, timeout=3.0) as resp:
+        items = json.loads(resp.read().decode("utf-8")).get("sessions") or []
+    for item in items[:200]:
+        sid = str(item.get("session_id") or "")
+        if not sid or (sdir / f"{sid}.json").exists():
+            continue
+        dreq = urllib.request.Request(f"{scheme}://127.0.0.1:{port}/v1/sessions/{sid}", headers=hdrs)
+        with urllib.request.urlopen(dreq, context=ctx, timeout=3.0) as dresp:
+            det = json.loads(dresp.read().decode("utf-8"))
+        argv = det.get("argv") or []
+        exe0 = os.path.basename(argv[0]) if argv else ""
+        is_agy = bool(det.get("session_kind") == "agy" or exe0 == "agy")
+        is_codex = bool(det.get("session_kind") == "codex" or exe0 == "codex")
+        rec = {
+            "schema_version": 1,
+            "session_id": sid,
+            "session_kind": "agy" if is_agy else ("codex" if is_codex else "exec"),
+            "is_agy": is_agy,
+            "is_codex": is_codex,
+            "status": det.get("status") or "completed",
+            "pid": det.get("pid"),
+            "boot_id": boot_id,
+            "proc_start_ticks": None,
+            "agent_conversation_id": det.get("agent_conversation_id"),
+            "argv": argv,
+            "shell_cmd": det.get("shell_cmd"),
+            "cwd": det.get("cwd") or "",
+            "returncode": det.get("returncode"),
+            "started_at": det.get("started_at"),
+            "ended_at": det.get("ended_at"),
+            "last_seq": det.get("last_seq") or 1,
+            "stdout": str(det.get("stdout") or "")[-65536:],
+            "stderr": str(det.get("stderr") or "")[-65536:],
+            "stdout_truncated": bool(det.get("stdout_truncated", False)),
+            "stderr_truncated": bool(det.get("stderr_truncated", False)),
+            "reconciled_after_restart": False,
+        }
+        tmp_f = sdir / f"{sid}.snap.tmp"
+        tmp_f.write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.chmod(tmp_f, 0o600)
+        os.replace(tmp_f, sdir / f"{sid}.json")
+except Exception:
+    pass
+PY
+}
+
 cmd_restart() {
+  local force_restart="0"
+  local wait_forever="0"
+  for arg in "$@"; do
+    case "${arg}" in
+      -f|--force) force_restart="1" ;;
+      -w|--wait|--drain) wait_forever="1" ;;
+    esac
+  done
   ensure_unit_installed
   ensure_local_client_json
   sync_tunnel_streamable_http
+  drain_and_snapshot_before_restart "${force_restart}" "${wait_forever}" || exit 1
   IFS='|' read -r port _ _ cert _ _ _ <<<"$(read_cfg_info)"
   echo "==> Restarting ${SERVICE_NAME} ..."
   systemctl --user restart "${SERVICE_NAME}"
@@ -672,7 +797,7 @@ Dots Gateway & Secure MCP Tunnel 运维管理命令行 (${PROG_NAME})
   codex-setup        交互式配置本机 OpenAI Codex CLI 的 API Key (0600 隔离存储，即时生效)
   start              启动网关服务 (及已配置的 Tunnel 服务) 并执行健康检查
   stop               停止网关与 Tunnel 后台服务
-  restart            重启网关与 Tunnel 后台服务并验证就绪状态 (别名: reload)
+  restart            平滑排空活跃会话后重启网关与 Tunnel 服务 (支持 --wait / --force，别名: reload)
   status             查看网关、OpenAI Tunnel (/readyz)、证书及工作区隔离状态 (默认命令)
   logs [tunnel] [-f] 查看服务日志 (默认同时显示网关与 Tunnel；加 tunnel 仅看隧道；加 -f 实时追踪)
   config             打印直连远程 MCP URL 与密钥配置 (别名: mcp-config)
@@ -714,7 +839,7 @@ case "${ACTION}" in
     cmd_stop
     ;;
   restart|reload)
-    cmd_restart
+    cmd_restart "$@"
     ;;
   status)
     cmd_status

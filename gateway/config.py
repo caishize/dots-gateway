@@ -16,14 +16,21 @@ HOME_DIR: str = str(Path.home())
 DEFAULT_WORKSPACE_DIR: str = str(Path.home() / "workspaces")
 DEFAULT_AGY_BIN: str = shutil.which("agy") or str(Path.home() / ".local" / "bin" / "agy")
 DEFAULT_CODEX_BIN: str = shutil.which("codex") or "/usr/local/bin/codex"
+DEFAULT_BWRAP_BIN: str = shutil.which("bwrap") or (
+    "/usr/local/bin/bwrap"
+    if os.path.exists("/usr/local/bin/bwrap")
+    else str(Path.home() / ".local" / "bin" / "bwrap")
+)
 
 
 DEFAULT_ALLOWED_COMMANDS: List[str] = [
-    # Local autonomous coding agents (Antigravity CLI & OpenAI Codex CLI)
+    # Local autonomous coding agents (Antigravity CLI & OpenAI Codex CLI) & nested sandbox runner
     "agy",
     DEFAULT_AGY_BIN,
     "codex",
     DEFAULT_CODEX_BIN,
+    "bwrap",
+    DEFAULT_BWRAP_BIN,
     # Shell & builtins
     "bash",
     "sh",
@@ -122,6 +129,7 @@ DEFAULT_ALLOWED_COMMANDS: List[str] = [
     "ls",
     "tree",
     "cat",
+    "nl",
     "less",
     "more",
     "head",
@@ -230,6 +238,7 @@ DEFAULT_BLOCKED_COMMANDS: List[str] = [
     "podman",
     "nsenter",
     "chroot",
+    "systemd-run",
 ]
 
 DEFAULT_BLOCKED_PATTERNS: List[str] = [
@@ -261,6 +270,7 @@ DEFAULT_PROTECTED_PATHS: List[str] = [
 ]
 
 DEFAULT_AGY_READONLY_ROOTS: List[str] = [
+    "/opt/codex",
     "/opt/uv-python",
     "/opt/uv-tools",
     "/opt/devtools",
@@ -346,6 +356,7 @@ class GatewayConfig:
     agy_extra_workspace_dirs: List[str] = field(default_factory=list)
     agy_extra_readonly_roots: List[str] = field(default_factory=list)
     codex_binary: str = DEFAULT_CODEX_BIN
+    bwrap_binary: str = DEFAULT_BWRAP_BIN
     codex_default_skip_permissions: bool = True
     codex_default_sandbox: str = "workspace-write"
     codex_sandbox_network_access: bool = True
@@ -353,7 +364,9 @@ class GatewayConfig:
     codex_env_file: str = str(Path.home() / ".config" / "dots-gateway" / "codex.env")
     max_concurrent_agy: int = field(default_factory=detect_recommended_max_agy)
     agy_queue_timeout_seconds: float = 1800.0
-    # Execution, connection & memory limits
+    # Execution, connection, session persistence & memory limits
+    session_state_dir: Optional[str] = None
+    max_persisted_sessions: int = 200
     default_timeout_seconds: float = 600.0
     max_timeout_seconds: float = 7200.0
     max_concurrent_sessions: int = 32
@@ -447,6 +460,13 @@ class GatewayConfig:
             ]
         if os.environ.get("GATEWAY_CODEX_BIN"):
             cfg.codex_binary = os.environ["GATEWAY_CODEX_BIN"]
+        if os.environ.get("GATEWAY_BWRAP_BIN"):
+            cfg.bwrap_binary = os.environ["GATEWAY_BWRAP_BIN"]
+        if os.environ.get("GATEWAY_SESSION_STATE_DIR"):
+            raw_ssd = os.environ["GATEWAY_SESSION_STATE_DIR"].strip()
+            cfg.session_state_dir = raw_ssd if raw_ssd else None
+        elif config_path and cfg.session_state_dir is None:
+            cfg.session_state_dir = str(Path.home() / ".config" / "dots-gateway" / "sessions")
         if os.environ.get("GATEWAY_CODEX_SANDBOX"):
             cfg.codex_default_sandbox = os.environ["GATEWAY_CODEX_SANDBOX"].strip()
         if os.environ.get("GATEWAY_CODEX_NETWORK_ACCESS"):
@@ -470,8 +490,16 @@ class GatewayConfig:
             cfg.protected_paths.append(codex_home_str)
         if "agy" in cfg.allowed_commands:
             for c_cmd in ("codex", cfg.codex_binary):
-                if c_cmd and c_cmd not in cfg.allowed_commands:
+                if c_cmd and c_cmd not in cfg.allowed_commands and c_cmd not in cfg.blocked_commands:
                     cfg.allowed_commands.append(c_cmd)
+        if "agy" in cfg.allowed_commands or "git" in cfg.allowed_commands:
+            for extra_cmd in ("bwrap", cfg.bwrap_binary, "nl"):
+                if (
+                    extra_cmd
+                    and extra_cmd not in cfg.allowed_commands
+                    and extra_cmd not in cfg.blocked_commands
+                ):
+                    cfg.allowed_commands.append(extra_cmd)
         if os.environ.get("GATEWAY_TLS_CERT"):
             cfg.tls_certfile = os.environ["GATEWAY_TLS_CERT"]
         if os.environ.get("GATEWAY_TLS_KEY"):

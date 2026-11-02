@@ -55,6 +55,81 @@ _FOR_VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REDIR_PREFIX_RE = re.compile(r"^(?:\d+)?(?:>>?|<<?|[<>]&|&>>?|<>|>\|)(.+)$", re.DOTALL)
 _WORD_BOUNDARY_PREDECESSORS = (" ", "\t", "\n", "\r", ";", "&", "|", "(", ")")
 
+_BWRAP_FORBIDDEN_OPTS = frozenset({"--args", "--cap-add", "--userns", "--userns2", "--pidns"})
+_BWRAP_INFO_ZERO_ARG_OPTS = frozenset({"--help", "--version"})
+_BWRAP_ZERO_ARG_OPTS = frozenset(
+    {
+        "--level-prefix",
+        "--unshare-all",
+        "--share-net",
+        "--unshare-user",
+        "--unshare-user-try",
+        "--unshare-ipc",
+        "--unshare-pid",
+        "--unshare-net",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--unshare-cgroup-try",
+        "--disable-userns",
+        "--assert-userns-disabled",
+        "--clearenv",
+        "--new-session",
+        "--die-with-parent",
+        "--as-pid-1",
+    }
+)
+_BWRAP_ONE_ARG_OPTS = frozenset(
+    {
+        "--argv0",
+        "--uid",
+        "--gid",
+        "--hostname",
+        "--chdir",
+        "--unsetenv",
+        "--lock-file",
+        "--sync-fd",
+        "--remount-ro",
+        "--overlay-src",
+        "--tmp-overlay",
+        "--ro-overlay",
+        "--exec-label",
+        "--file-label",
+        "--proc",
+        "--dev",
+        "--tmpfs",
+        "--mqueue",
+        "--dir",
+        "--seccomp",
+        "--add-seccomp-fd",
+        "--block-fd",
+        "--userns-block-fd",
+        "--info-fd",
+        "--json-status-fd",
+        "--cap-drop",
+        "--perms",
+        "--size",
+    }
+)
+_BWRAP_TWO_ARG_OPTS = frozenset(
+    {
+        "--setenv",
+        "--bind",
+        "--bind-try",
+        "--dev-bind",
+        "--dev-bind-try",
+        "--ro-bind",
+        "--ro-bind-try",
+        "--bind-fd",
+        "--ro-bind-fd",
+        "--file",
+        "--bind-data",
+        "--ro-bind-data",
+        "--symlink",
+        "--chmod",
+    }
+)
+_BWRAP_THREE_ARG_OPTS = frozenset({"--overlay"})
+
 _AUDIT_SECRET_PREFIX_RE = re.compile(
     r"(?:sk-[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}"
     r"|dots_(?:at|rt)\.[A-Za-z0-9._-]+|AIza[0-9A-Za-z_-]{20,})"
@@ -1174,8 +1249,19 @@ class CommandPolicy:
                     if not ok_sub_rm:
                         return PolicyDecision(False, reason=sub_rm_err, resolved_cwd=resolved_cwd)
 
-            # If invoking subshell `bash`/`sh` via `-c`/`-lc` or via heredoc (`bash <<'EOF'`), validate inner script
+            # If invoking `bwrap` (bubblewrap), validate wrapper flags and recursively validate inner command
             effective_exe = seg_tokens[effective_idx]
+            if os.path.basename(effective_exe) == "bwrap":
+                bw_decision = self._validate_bwrap_segment(
+                    seg_tokens[effective_idx:],
+                    resolved_cwd=resolved_cwd,
+                    _depth=_depth,
+                    heredocs=pseg.heredocs,
+                )
+                if not bw_decision.allowed:
+                    return bw_decision
+
+            # If invoking subshell `bash`/`sh` via `-c`/`-lc` or via heredoc (`bash <<'EOF'`), validate inner script
             if os.path.basename(effective_exe) in ("bash", "sh"):
                 b_idx = effective_idx + 1
                 while b_idx < len(seg_tokens):
@@ -1207,11 +1293,13 @@ class CommandPolicy:
                         if not hd_decision.allowed:
                             return hd_decision
 
-        # Resolve 'agy' / 'codex' binary paths automatically if the first token is 'agy' or 'codex'
+        # Resolve 'agy' / 'codex' / 'bwrap' binary paths automatically if the first token matches
         if argv and argv[0] == "agy" and os.path.exists(self.config.agy_binary):
             argv = [self.config.agy_binary] + argv[1:]
         elif argv and argv[0] == "codex" and os.path.exists(self.config.codex_binary):
             argv = [self.config.codex_binary] + argv[1:]
+        elif argv and argv[0] == "bwrap" and os.path.exists(self.config.bwrap_binary):
+            argv = [self.config.bwrap_binary] + argv[1:]
 
         return PolicyDecision(
             allowed=True,
@@ -1220,6 +1308,112 @@ class CommandPolicy:
             resolved_cwd=resolved_cwd,
             requires_shell=requires_shell,
         )
+
+    def _validate_bwrap_segment(
+        self,
+        bwrap_tokens: Sequence[str],
+        resolved_cwd: str,
+        _depth: int,
+        heredocs: Sequence[Any] = (),
+    ) -> PolicyDecision:
+        """Validate `bwrap` sandbox flags fail-closed and recursively validate wrapped command."""
+        b_idx = 1
+        saw_info_flag = False
+        inner_cwd = resolved_cwd
+
+        while b_idx < len(bwrap_tokens):
+            btok = bwrap_tokens[b_idx]
+            if btok == "--":
+                b_idx += 1
+                break
+            if not btok.startswith("-") or btok == "-":
+                break
+
+            opt_name = btok.split("=", 1)[0] if "=" in btok else btok
+            if opt_name in _BWRAP_FORBIDDEN_OPTS:
+                return PolicyDecision(
+                    False,
+                    reason=f"Flag '{opt_name}' on 'bwrap' is forbidden by security policy",
+                    resolved_cwd=resolved_cwd,
+                )
+            if "=" in btok:
+                return PolicyDecision(
+                    False,
+                    reason=f"Unsupported '=' option syntax '{btok}' on 'bwrap'; pass flag and value as separate arguments",
+                    resolved_cwd=resolved_cwd,
+                )
+            if btok in _BWRAP_INFO_ZERO_ARG_OPTS:
+                saw_info_flag = True
+                b_idx += 1
+                continue
+            if btok in _BWRAP_ZERO_ARG_OPTS:
+                b_idx += 1
+                continue
+            if btok in _BWRAP_ONE_ARG_OPTS:
+                if b_idx + 1 >= len(bwrap_tokens):
+                    return PolicyDecision(
+                        False,
+                        reason=f"Missing argument after 'bwrap {btok}'",
+                        resolved_cwd=resolved_cwd,
+                    )
+                arg_val = bwrap_tokens[b_idx + 1]
+                if btok == "--chdir":
+                    ok_cd, _, cand_cwd = self.validate_workdir(arg_val)
+                    if ok_cd and cand_cwd:
+                        inner_cwd = cand_cwd
+                b_idx += 2
+                continue
+            if btok in _BWRAP_TWO_ARG_OPTS:
+                if b_idx + 2 >= len(bwrap_tokens):
+                    return PolicyDecision(
+                        False,
+                        reason=f"Missing arguments after 'bwrap {btok}'",
+                        resolved_cwd=resolved_cwd,
+                    )
+                b_idx += 3
+                continue
+            if btok in _BWRAP_THREE_ARG_OPTS:
+                if b_idx + 3 >= len(bwrap_tokens):
+                    return PolicyDecision(
+                        False,
+                        reason=f"Missing arguments after 'bwrap {btok}'",
+                        resolved_cwd=resolved_cwd,
+                    )
+                b_idx += 4
+                continue
+
+            return PolicyDecision(
+                False,
+                reason=f"Unsupported or unknown bwrap option '{btok}'",
+                resolved_cwd=resolved_cwd,
+            )
+
+        inner_tokens = list(bwrap_tokens[b_idx:])
+        if not inner_tokens:
+            if saw_info_flag:
+                return PolicyDecision(True, reason="ok", resolved_cwd=resolved_cwd)
+            return PolicyDecision(
+                False,
+                reason="Missing target command after 'bwrap' options",
+                resolved_cwd=resolved_cwd,
+            )
+
+        inner_decision = self.validate_command(
+            inner_tokens, cwd=inner_cwd, _depth=_depth + 1
+        )
+        if not inner_decision.allowed:
+            return inner_decision
+
+        if os.path.basename(inner_tokens[0]) in ("bash", "sh"):
+            for hspec in heredocs:
+                if getattr(hspec, "body", "").strip():
+                    hd_decision = self.validate_command(
+                        hspec.body, cwd=inner_cwd, _depth=_depth + 1
+                    )
+                    if not hd_decision.allowed:
+                        return hd_decision
+
+        return PolicyDecision(True, reason="ok", resolved_cwd=resolved_cwd)
 
     def build_agy_argv(
         self,
