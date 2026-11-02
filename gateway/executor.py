@@ -876,6 +876,9 @@ class SessionManager:
             add_dirs=add_dirs,
             cwd=cwd,
         )
+        _, ro_hook_dirs = self.policy.resolve_codex_git_metadata_dirs(
+            cwd=cwd, add_dirs=add_dirs
+        )
         is_stream_json = output_format == "stream-json" or "--output-format=stream-json" in argv
         return await self.create_session(
             command=argv,
@@ -890,6 +893,7 @@ class SessionManager:
             slot_sem=self._agy_sem,
             queue_timeout=self.config.agy_queue_timeout_seconds,
             is_agy=True,
+            readonly_subpaths=ro_hook_dirs,
         )
 
     async def create_codex_session(

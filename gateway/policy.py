@@ -1293,12 +1293,8 @@ class CommandPolicy:
         elif continue_last and "--continue" not in extra and "-c" not in extra:
             argv.append("--continue")
 
-        if add_dirs:
-            for d in add_dirs:
-                ok_dir, dir_err, resolved_dir = self.validate_workdir(str(d))
-                if not ok_dir:
-                    raise PermissionError(dir_err)
-                argv.extend(["--add-dir", resolved_dir])
+        for resolved_dir in self.get_agy_workspace_dirs(cwd=cwd, add_dirs=add_dirs):
+            argv.extend(["--add-dir", resolved_dir])
 
         if input_format and "--input-format" not in extra:
             argv.extend(["--input-format", input_format])
@@ -1331,6 +1327,60 @@ class CommandPolicy:
 
         return argv
 
+    def get_agy_workspace_dirs(
+        self,
+        cwd: Optional[str] = None,
+        add_dirs: Optional[Sequence[str]] = None,
+    ) -> List[str]:
+        """Compute validated `--add-dir` workspace paths for `agy`.
+
+        Ensures `agy` (and `PreToolUse` hooks inspecting `workspacePaths`) approves
+        validated `add_dirs`, configured `agy_extra_workspace_dirs`, configured
+        `allowed_workdirs` (when `agy_include_allowed_workdirs` is enabled, covering
+        sibling evidence folders under `~/workspaces`), and linked Git worktree
+        metadata directories, without duplicating `resolved_cwd`.
+        """
+        ok_cwd, cwd_err, resolved_cwd = self.validate_workdir(cwd)
+        if not ok_cwd:
+            raise PermissionError(cwd_err)
+
+        norm_cwd = os.path.abspath(resolved_cwd)
+        dirs: List[str] = []
+        seen: set[str] = {norm_cwd}
+
+        def _append_valid(cand_path: str) -> None:
+            norm = os.path.abspath(cand_path)
+            if norm in seen or norm == "/":
+                return
+            if self.is_protected_path(norm) or not self.is_within_allowed_workdirs(norm):
+                return
+            seen.add(norm)
+            dirs.append(norm)
+
+        if add_dirs:
+            for d in add_dirs:
+                ok_dir, dir_err, resolved_dir = self.validate_workdir(str(d))
+                if not ok_dir:
+                    raise PermissionError(dir_err)
+                _append_valid(resolved_dir)
+
+        for raw_extra in self.config.agy_extra_workspace_dirs:
+            ok_ex, _, resolved_ex = self.validate_workdir(str(raw_extra))
+            if ok_ex:
+                _append_valid(resolved_ex)
+
+        if self.config.agy_include_allowed_workdirs:
+            for root in self._allowed_roots:
+                _append_valid(root)
+
+        git_rw_dirs, _ = self.resolve_codex_git_metadata_dirs(
+            cwd=resolved_cwd, add_dirs=add_dirs
+        )
+        for git_dir in git_rw_dirs:
+            _append_valid(git_dir)
+
+        return dirs
+
     def get_agy_writable_roots(
         self,
         cwd: Optional[str] = None,
@@ -1340,9 +1390,9 @@ class CommandPolicy:
 
         Includes the validated session `cwd` explicitly (because `agy --sandbox`
         otherwise mounts an active sub-workspace read-only in default/enterprise
-        mode even when a parent directory is writable), alongside all configured
-        `allowed_workdirs`, `add_dirs`, Flutter SDK `bin/cache`, and isolated
-        developer toolchain caches.
+        mode even when a parent directory is writable), alongside all validated
+        `get_agy_workspace_dirs`, configured `allowed_workdirs`, Flutter SDK
+        `bin/cache`, and isolated developer toolchain caches.
         """
         ok_cwd, cwd_err, resolved_cwd = self.validate_workdir(cwd)
         if not ok_cwd:
@@ -1358,6 +1408,8 @@ class CommandPolicy:
                 roots.append(norm)
 
         _add(resolved_cwd)
+        for ws_dir in self.get_agy_workspace_dirs(cwd=cwd, add_dirs=add_dirs):
+            _add(ws_dir)
         for root in self.get_codex_writable_roots(add_dirs=add_dirs, cwd=cwd):
             _add(root)
         return roots

@@ -339,6 +339,43 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "model": {"type": "string"},
                 "effort": {"type": "string"},
+                "mode": {
+                    "type": "string",
+                    "description": "Optional execution mode override when `type='agy'`.",
+                },
+                "conversation_id": {
+                    "type": "string",
+                    "description": "Optional existing `agy` conversation ID to resume when `type='agy'`.",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional existing Codex session ID to resume when `type='codex'`.",
+                },
+                "continue_last": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Resume the most recent `agy` or `codex` session in `cwd`.",
+                },
+                "search": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Enable Codex native web search when `type='codex'`.",
+                },
+                "review": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Run `codex exec review` when `type='codex'`.",
+                },
+                "add_dirs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Additional validated workspace directories to grant access to (`agy` or `codex`).",
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional validated CLI flags passed to `agy` or `codex`.",
+                },
                 "timeout": {"type": "number"},
             },
             "additionalProperties": False,
@@ -1022,6 +1059,7 @@ class MCPHandler:
                     "agy_default_skip_permissions": self.config.agy_default_skip_permissions,
                     "agy_default_sandbox": self.config.agy_default_sandbox,
                     "agy_sandbox_tool_permission": self.config.agy_sandbox_tool_permission,
+                    "agy_include_allowed_workdirs": self.config.agy_include_allowed_workdirs,
                     "agy_readonly_roots": self.policy.get_agy_readonly_roots(),
                     "agy_writable_roots": self.policy.get_agy_writable_roots(),
                     "codex_binary": self.config.codex_binary,
@@ -1163,12 +1201,17 @@ class MCPHandler:
                         prompt=None,
                         cwd=args.get("cwd"),
                         env=args.get("env"),
+                        args=args.get("args"),
                         skip_permissions=args.get("skip_permissions"),
                         print_mode=True,
                         output_format="stream-json",
                         input_format="stream-json",
                         model=args.get("model"),
                         effort=args.get("effort"),
+                        mode=args.get("mode"),
+                        conversation_id=args.get("conversation_id"),
+                        continue_last=bool(args.get("continue_last", False)),
+                        add_dirs=args.get("add_dirs"),
                         use_pty=bool(args.get("use_pty", False)),
                         timeout=args.get("timeout"),
                         close_stdin=False,
@@ -1177,20 +1220,29 @@ class MCPHandler:
                         await session.send_agy_turn(str(args["prompt"]), close_after=False)
                 elif stype == "codex":
                     prompt = args.get("prompt")
-                    if not prompt:
+                    extra_args = args.get("args") or []
+                    review = bool(args.get("review", False))
+                    if not prompt and not extra_args and not review:
                         return _jsonrpc_result(
-                            req_id, _tool_error("Missing 'prompt' for session_start(type='codex')")
+                            req_id,
+                            _tool_error(
+                                "Provide 'prompt', 'review=true', or 'args' for session_start(type='codex')"
+                            ),
                         )
                     session = await self.sessions.create_codex_session(
-                        prompt=str(prompt),
+                        prompt=str(prompt) if prompt is not None else None,
                         cwd=args.get("cwd"),
                         env=args.get("env"),
-                        args=args.get("args"),
+                        args=extra_args,
                         skip_permissions=args.get("skip_permissions"),
                         sandbox_mode=args.get("sandbox_mode"),
                         json_events=True,
                         model=args.get("model"),
                         effort=args.get("effort"),
+                        search=bool(args.get("search", False)),
+                        session_id=args.get("session_id"),
+                        continue_last=bool(args.get("continue_last", False)),
+                        review=review,
                         add_dirs=args.get("add_dirs"),
                         use_pty=bool(args.get("use_pty", False)),
                         timeout=args.get("timeout"),
@@ -1395,6 +1447,7 @@ class MCPHandler:
                     "isolate_mount_namespace": self.config.isolate_mount_namespace,
                     "agy_default_sandbox": self.config.agy_default_sandbox,
                     "agy_sandbox_tool_permission": self.config.agy_sandbox_tool_permission,
+                    "agy_include_allowed_workdirs": self.config.agy_include_allowed_workdirs,
                     "agy_readonly_roots": self.policy.get_agy_readonly_roots(),
                     "agy_writable_roots": self.policy.get_agy_writable_roots(),
                     "codex_default_sandbox": self.config.codex_default_sandbox,

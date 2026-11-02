@@ -342,6 +342,8 @@ class GatewayConfig:
     agy_default_skip_permissions: bool = True
     agy_default_sandbox: bool = True
     agy_sandbox_tool_permission: str = "proceed-in-sandbox"
+    agy_include_allowed_workdirs: bool = True
+    agy_extra_workspace_dirs: List[str] = field(default_factory=list)
     agy_extra_readonly_roots: List[str] = field(default_factory=list)
     codex_binary: str = DEFAULT_CODEX_BIN
     codex_default_skip_permissions: bool = True
@@ -426,6 +428,17 @@ class GatewayConfig:
             cfg.agy_sandbox_tool_permission = os.environ[
                 "GATEWAY_AGY_SANDBOX_TOOL_PERMISSION"
             ].strip()
+        if os.environ.get("GATEWAY_AGY_INCLUDE_ALLOWED_WORKDIRS"):
+            cfg.agy_include_allowed_workdirs = (
+                os.environ["GATEWAY_AGY_INCLUDE_ALLOWED_WORKDIRS"].strip().lower()
+                in ("1", "true", "yes")
+            )
+        if os.environ.get("GATEWAY_AGY_WORKSPACE_DIRS"):
+            cfg.agy_extra_workspace_dirs = [
+                x.strip()
+                for x in os.environ["GATEWAY_AGY_WORKSPACE_DIRS"].split(",")
+                if x.strip()
+            ]
         if os.environ.get("GATEWAY_AGY_READONLY_ROOTS"):
             cfg.agy_extra_readonly_roots = [
                 x.strip()

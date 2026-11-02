@@ -552,6 +552,7 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(default_cfg.allowed_workdirs, [DEFAULT_WORKSPACE_DIR])
         self.assertTrue(default_cfg.isolate_mount_namespace)
         self.assertTrue(default_cfg.agy_default_sandbox)
+        self.assertTrue(default_cfg.agy_include_allowed_workdirs)
         self.assertEqual(default_cfg.agy_sandbox_tool_permission, "proceed-in-sandbox")
         self.assertIn(str(GATEWAY_ROOT), default_cfg.protected_paths)
 
@@ -695,6 +696,27 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         codex_wr = wt_pol.get_codex_writable_roots(cwd=str(wt_subdir))
         self.assertIn(expected_common, codex_wr)
         self.assertIn(expected_wt_gd, codex_wr)
+
+        # Verify agy --add-dir workspace approval covers allowed_workdirs (sibling evidence dirs) & git metadata
+        sibling_evidence = Path(self.tmpdir) / "stripe-topup-session-evidence"
+        agy_ws_dirs = wt_pol.get_agy_workspace_dirs(cwd=str(wt_subdir))
+        self.assertIn(str(Path(self.tmpdir).resolve()), agy_ws_dirs)
+        self.assertIn(expected_common, agy_ws_dirs)
+        self.assertIn(expected_wt_gd, agy_ws_dirs)
+        self.assertNotIn(str(wt_subdir.resolve()), agy_ws_dirs)
+        self.assertEqual(wt_pol.get_agy_workspace_dirs(cwd=self.tmpdir), [])
+
+        narrow_agy_cfg = GatewayConfig(
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            agy_include_allowed_workdirs=False,
+            agy_extra_workspace_dirs=[str(sibling_evidence), str(GATEWAY_ROOT)],
+        )
+        narrow_agy_pol = CommandPolicy(narrow_agy_cfg)
+        narrow_ws_dirs = narrow_agy_pol.get_agy_workspace_dirs(cwd=str(wt_subdir))
+        self.assertIn(str(sibling_evidence.resolve()), narrow_ws_dirs)
+        self.assertNotIn(str(Path(self.tmpdir).resolve()), narrow_ws_dirs)
+        self.assertNotIn(str(GATEWAY_ROOT), narrow_ws_dirs)
 
         # Malicious `.git` pointer targeting outside `allowed_workdirs` MUST be ignored
         evil_wt = Path(self.tmpdir) / "evil_gitdir_escape"

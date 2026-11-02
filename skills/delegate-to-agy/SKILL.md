@@ -5,7 +5,7 @@ description: Delegate multi-file coding, refactoring, and autonomous debugging t
 
 # Delegating Software Engineering Tasks to Local `agy`
 
-The remote host has Google Antigravity CLI (`agy`) installed and authorized by the gateway to run unattended inside `allowed_workdirs` (default: `~/workspaces`) with `--sandbox`, session `toolPermission: "proceed-in-sandbox"`, read-only `/opt` toolchain mounts (`/opt/uv-python`, `/opt/uv-tools`, `/opt/devtools`, `/opt/flutter`), `permissions.deny` command/path guardrails, kernel mount-namespace isolation, and `oh-my-agents` Harness guardrails active.
+The remote host has Google Antigravity CLI (`agy`) installed and authorized by the gateway to run unattended inside `allowed_workdirs` (default: `~/workspaces`) with `--sandbox`, session `toolPermission: "proceed-in-sandbox"`, automatic `--add-dir` workspace approval for configured `allowed_workdirs` (covering sibling evidence folders such as `~/workspaces/<task>-evidence` and linked Git worktree metadata), read-only `/opt` toolchain mounts (`/opt/uv-python`, `/opt/uv-tools`, `/opt/devtools`, `/opt/flutter`), `permissions.deny` command/path guardrails, kernel mount-namespace isolation, and `oh-my-agents` Harness guardrails active.
 
 ## When to Use `run_agy` vs Direct `fs_patch`
 - **Use `fs_read` + `fs_patch` + `exec_command` directly** for quick inspections, targeted 1–2 file edits, git operations, or running a known test command.
@@ -17,7 +17,7 @@ The remote host has Google Antigravity CLI (`agy`) installed and authorized by t
    - `cwd`: Absolute path to the target project on the remote machine.
    - `skip_permissions`: `true` (default; passes `--dangerously-skip-permissions`) or `false` (omits `--dangerously-skip-permissions` while still auto-approving sandboxed commands via session `toolPermission: "proceed-in-sandbox"` and enforcing `permissions.deny`).
    - `prompt`: Include exact requirements, constraints, files of interest, and the test command `agy` must run before finishing.
-   - Optional: Pass `continue_last: true` or `conversation_id` to iterate on `agy`'s previous run.
+   - Optional: Pass `add_dirs` for explicit extra directories inside `allowed_workdirs`, or `continue_last: true` / `conversation_id` to iterate on `agy`'s previous run.
 3. Verify independently afterward using `exec_command` (`git diff --stat` and the project's test suite).
 
 ## Multi-Turn Interactive `agy` Sessions

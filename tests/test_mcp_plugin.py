@@ -1226,6 +1226,87 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             settings_arg = next(
                 a for a in parsed["argv"] if a.startswith("--settings=")
             )
+            agy_add_dirs = [
+                parsed["argv"][i + 1]
+                for i, tok in enumerate(parsed["argv"][:-1])
+                if tok == "--add-dir"
+            ]
+            self.assertIn(str(Path(self.tmpdir).resolve()), agy_add_dirs)
+            self.assertNotIn(str(sub_ws.resolve()), agy_add_dirs)
+
+            # Verify PreToolUse workspacePaths contract allows sibling evidence writes under allowed_workdirs
+            oma_adapter = Path.home() / ".gemini/config/plugins/oh-my-agents/hooks/antigravity-adapter.py"
+            if oma_adapter.is_file():
+                import subprocess as _oma_sp
+
+                ws_paths = [str(sub_ws.resolve()), *agy_add_dirs]
+                sibling_meta = str(
+                    Path(self.tmpdir).resolve()
+                    / "stripe-topup-session-evidence"
+                    / "02-red-proof-bounded.meta.txt"
+                )
+                allow_payload = json.dumps(
+                    {
+                        "conversationId": "c-topup-test",
+                        "workspacePaths": ws_paths,
+                        "toolCall": {
+                            "name": "write_file",
+                            "args": {
+                                "Path": sibling_meta,
+                                "Content": "passed: 4\nfailed: 14\n",
+                                "Overwrite": True,
+                            },
+                        },
+                    }
+                )
+                oma_ok = _oma_sp.run(
+                    [
+                        "python3",
+                        str(oma_adapter),
+                        "PreToolUse",
+                        "safety-check.sh",
+                        "arch-check.sh",
+                        "plan-validation-check.sh",
+                    ],
+                    input=allow_payload,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertEqual(json.loads(oma_ok.stdout)["decision"], "allow", oma_ok.stdout)
+
+                deny_payload = json.dumps(
+                    {
+                        "conversationId": "c-topup-test",
+                        "workspacePaths": ws_paths,
+                        "toolCall": {
+                            "name": "write_file",
+                            "args": {
+                                "Path": "/etc/outside-approved.txt",
+                                "Content": "nope\n",
+                                "Overwrite": True,
+                            },
+                        },
+                    }
+                )
+                oma_deny = _oma_sp.run(
+                    [
+                        "python3",
+                        str(oma_adapter),
+                        "PreToolUse",
+                        "safety-check.sh",
+                        "arch-check.sh",
+                        "plan-validation-check.sh",
+                    ],
+                    input=deny_payload,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                oma_deny_obj = json.loads(oma_deny.stdout)
+                self.assertEqual(oma_deny_obj["decision"], "deny")
+                self.assertIn("outside approved workspacePaths", oma_deny_obj["reason"])
+
             settings_obj = json.loads(settings_arg.split("=", 1)[1])
             self.assertEqual(settings_obj.get("toolPermission"), "proceed-in-sandbox")
             allow_rules = settings_obj["permissions"]["allow"]
@@ -1291,6 +1372,66 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             )
             noskip_settings = json.loads(noskip_settings_arg.split("=", 1)[1])
             self.assertEqual(noskip_settings.get("toolPermission"), "proceed-in-sandbox")
+
+            # Verify MCP session_start(type="agy") accepts add_dirs / continue_last and rejects outside paths
+            sibling_ev_dir = Path(self.tmpdir) / "stripe-topup-session-evidence"
+            s_agy_ok, _ = await asyncio.to_thread(
+                client.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "agy-sess-ok",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "session_start",
+                        "arguments": {
+                            "type": "agy",
+                            "cwd": str(sub_ws),
+                            "continue_last": True,
+                            "add_dirs": [str(sibling_ev_dir)],
+                        },
+                    },
+                },
+            )
+            self.assertFalse(s_agy_ok["result"]["isError"], s_agy_ok)
+            s_agy_sid = s_agy_ok["result"]["structuredContent"]["session_id"]
+            s_agy_argv = s_agy_ok["result"]["structuredContent"]["argv"]
+            self.assertIn("--continue", s_agy_argv)
+            self.assertIn(str(sibling_ev_dir.resolve()), s_agy_argv)
+            self.assertIn(str(Path(self.tmpdir).resolve()), s_agy_argv)
+            await asyncio.to_thread(
+                client.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "agy-sess-poll",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "session_poll",
+                        "arguments": {
+                            "session_id": s_agy_sid,
+                            "wait_seconds": 3,
+                            "wait_for_exit": True,
+                        },
+                    },
+                },
+            )
+
+            s_agy_bad, _ = await asyncio.to_thread(
+                client.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "agy-sess-bad",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "session_start",
+                        "arguments": {
+                            "type": "agy",
+                            "cwd": str(sub_ws),
+                            "add_dirs": ["/etc"],
+                        },
+                    },
+                },
+            )
+            self.assertTrue(s_agy_bad["result"]["isError"])
         finally:
             await agy_srv.stop()
 

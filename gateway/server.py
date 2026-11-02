@@ -473,6 +473,7 @@ class GatewayServer:
                     "agy_default_skip_permissions": self.config.agy_default_skip_permissions,
                     "agy_default_sandbox": self.config.agy_default_sandbox,
                     "agy_sandbox_tool_permission": self.config.agy_sandbox_tool_permission,
+                    "agy_include_allowed_workdirs": self.config.agy_include_allowed_workdirs,
                     "agy_readonly_roots": self.policy.get_agy_readonly_roots(),
                     "agy_writable_roots": self.policy.get_agy_writable_roots(),
                     "codex_binary": self.config.codex_binary,
