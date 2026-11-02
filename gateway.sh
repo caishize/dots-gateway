@@ -161,9 +161,18 @@ try:
                     agy_changed = True
             if tw and agy_data.get("trustedWorkspaces") != tw:
                 agy_data["trustedWorkspaces"] = tw
-            merged_perms = pol.build_agy_sandbox_settings()["permissions"]
-            if agy_data.get("permissions") != merged_perms:
-                agy_data["permissions"] = merged_perms
+            raw_perms = agy_data.get("permissions")
+            perms_dict = dict(raw_perms) if isinstance(raw_perms, dict) else {}
+            allow_list = list(perms_dict.get("allow") or [])
+            allow_changed = False
+            for root in pol.get_agy_writable_roots():
+                rule = f"write_file({root})"
+                if rule not in allow_list:
+                    allow_list.append(rule)
+                    allow_changed = True
+            if allow_changed:
+                perms_dict["allow"] = allow_list
+                agy_data["permissions"] = perms_dict
                 agy_changed = True
             if agy_changed:
                 agy_settings_p.write_text(

@@ -1362,12 +1362,91 @@ class CommandPolicy:
             _add(root)
         return roots
 
+    def get_agy_denied_rules(self) -> List[str]:
+        """Compute `permissions.deny` rules enforced inside `agy` sessions.
+
+        Blocks high-risk commands (`sudo`, `docker`, `shutdown`, etc.) via `command(...)`
+        and blocks sensitive host/gateway paths via `read_file(...)` (which also implicitly
+        denies `write_file(...)` in `agy`), while avoiding broad parent directories
+        (`~/.gemini`, `~/.config`, `~/.local`) required by `agy`'s own runtime and plugins.
+        """
+        rules: List[str] = []
+        seen: set[str] = set()
+
+        def _emit(rule: str) -> None:
+            if rule and rule not in seen:
+                seen.add(rule)
+                rules.append(rule)
+
+        for raw_cmd in self.config.blocked_commands:
+            cmd_str = str(raw_cmd).strip()
+            if not cmd_str:
+                continue
+            base = os.path.basename(cmd_str)
+            if (
+                base
+                and base not in _SHELL_PREFIX_KEYWORDS
+                and base != "time"
+                and ")" not in base
+            ):
+                _emit(f"command({base})")
+            if "/" in cmd_str and ")" not in cmd_str:
+                _emit(f"command({cmd_str})")
+
+        home_lex = os.path.abspath(str(Path.home()))
+        try:
+            home_res = str(Path.home().resolve())
+        except OSError:
+            home_res = home_lex
+        home_variants = {home_lex, home_res}
+
+        agy_runtime_parents = {
+            os.path.join(h, sub)
+            for h in home_variants
+            for sub in (".gemini", ".config", ".local")
+        }
+
+        for raw_prot in self.config.protected_paths:
+            try:
+                p = Path(str(raw_prot)).expanduser()
+                lex_abs = os.path.abspath(str(p))
+                res_abs = str(p.resolve())
+            except OSError:
+                continue
+            if lex_abs in agy_runtime_parents or res_abs in agy_runtime_parents:
+                continue
+            if ")" not in lex_abs:
+                _emit(f"read_file({lex_abs})")
+            if res_abs != lex_abs and ")" not in res_abs:
+                _emit(f"read_file({res_abs})")
+
+        for sensitive_cfg_sub in ("dots-gateway", "tunnel-client", "systemd"):
+            cfg_sub_path = os.path.join(home_res, ".config", sensitive_cfg_sub)
+            if ")" not in cfg_sub_path:
+                _emit(f"read_file({cfg_sub_path})")
+
+        return rules
+
     def build_agy_sandbox_settings(
         self,
         cwd: Optional[str] = None,
         add_dirs: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
-        """Build session `--settings` JSON granting `write_file` mounts inside `agy --sandbox`."""
+        """Build per-session `--settings` JSON for `agy --sandbox`.
+
+        Configures `toolPermission` (default: `"proceed-in-sandbox"`, enabling headless
+        command execution inside `agy --sandbox` even when `skip_permissions=False`),
+        grants `write_file(...)` mounts for validated workspace/toolchain cache roots,
+        and enforces `permissions.deny` (`deny > ask > allow`) on blocked commands and
+        protected paths without mutating the user's global `settings.json`.
+        """
+        tool_perm = str(self.config.agy_sandbox_tool_permission or "").strip()
+        if tool_perm not in ("proceed-in-sandbox", "request-review", "strict"):
+            raise PermissionError(
+                f"Invalid or forbidden agy_sandbox_tool_permission '{tool_perm}'; "
+                "allowed: 'proceed-in-sandbox', 'request-review', 'strict'"
+            )
+
         perms: Dict[str, Any] = {}
         settings_path = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
         try:
@@ -1388,7 +1467,19 @@ class CommandPolicy:
                 allow_seen.add(rule)
                 allow_list.append(rule)
         perms["allow"] = allow_list
-        return {"permissions": perms}
+
+        deny_list: List[str] = list(perms.get("deny") or [])
+        deny_seen = set(deny_list)
+        for rule in self.get_agy_denied_rules():
+            if rule not in deny_seen:
+                deny_seen.add(rule)
+                deny_list.append(rule)
+        perms["deny"] = deny_list
+
+        return {
+            "toolPermission": tool_perm,
+            "permissions": perms,
+        }
 
     def get_codex_writable_roots(
         self, add_dirs: Optional[Sequence[str]] = None

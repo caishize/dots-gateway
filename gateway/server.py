@@ -472,6 +472,7 @@ class GatewayServer:
                     "agy_binary": self.config.agy_binary,
                     "agy_default_skip_permissions": self.config.agy_default_skip_permissions,
                     "agy_default_sandbox": self.config.agy_default_sandbox,
+                    "agy_sandbox_tool_permission": self.config.agy_sandbox_tool_permission,
                     "codex_binary": self.config.codex_binary,
                     "codex_default_skip_permissions": self.config.codex_default_skip_permissions,
                     "codex_default_sandbox": self.config.codex_default_sandbox,

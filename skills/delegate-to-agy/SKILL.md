@@ -1,11 +1,11 @@
 ---
 name: delegate-to-agy
-description: Delegate multi-file coding, refactoring, and autonomous debugging tasks on the remote machine to Google Antigravity CLI (agy --dangerously-skip-permissions) via dots-gateway MCP.
+description: Delegate multi-file coding, refactoring, and autonomous debugging tasks on the remote machine to Google Antigravity CLI (agy --sandbox) via dots-gateway MCP.
 ---
 
 # Delegating Software Engineering Tasks to Local `agy`
 
-The remote host has Google Antigravity CLI (`agy`) installed and authorized by the gateway to run unattended inside `allowed_workdirs` (default: `~/workspaces`) with `--dangerously-skip-permissions --sandbox`, kernel mount-namespace isolation, and `oh-my-agents` Harness guardrails active.
+The remote host has Google Antigravity CLI (`agy`) installed and authorized by the gateway to run unattended inside `allowed_workdirs` (default: `~/workspaces`) with `--sandbox`, session `toolPermission: "proceed-in-sandbox"`, `permissions.deny` command/path guardrails, kernel mount-namespace isolation, and `oh-my-agents` Harness guardrails active.
 
 ## When to Use `run_agy` vs Direct `fs_patch`
 - **Use `fs_read` + `fs_patch` + `exec_command` directly** for quick inspections, targeted 1–2 file edits, git operations, or running a known test command.
@@ -15,7 +15,7 @@ The remote host has Google Antigravity CLI (`agy`) installed and authorized by t
 1. Inspect the repository status first (`exec_command` with `git status --short` in `cwd`).
 2. Invoke `run_agy` with a clear, self-contained engineering specification:
    - `cwd`: Absolute path to the target project on the remote machine.
-   - `skip_permissions`: `true` (enables `--dangerously-skip-permissions`).
+   - `skip_permissions`: `true` (default; passes `--dangerously-skip-permissions`) or `false` (omits `--dangerously-skip-permissions` while still auto-approving sandboxed commands via session `toolPermission: "proceed-in-sandbox"` and enforcing `permissions.deny`).
    - `prompt`: Include exact requirements, constraints, files of interest, and the test command `agy` must run before finishing.
    - Optional: Pass `continue_last: true` or `conversation_id` to iterate on `agy`'s previous run.
 3. Verify independently afterward using `exec_command` (`git diff --stat` and the project's test suite).

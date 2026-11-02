@@ -127,8 +127,8 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "run_agy",
         "title": "Run Local Antigravity Agent (agy)",
         "description": (
-            "Invoke Google Antigravity CLI (`agy --dangerously-skip-permissions`) on the remote "
-            "development machine to autonomously write code, refactor, debug, and run tests."
+            "Invoke Google Antigravity CLI (`agy --sandbox`) on the remote development machine "
+            "to autonomously write code, refactor, debug, and run tests inside the jailed workspace."
         ),
         "inputSchema": {
             "type": "object",
@@ -143,7 +143,11 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "skip_permissions": {
                     "type": "boolean",
-                    "description": "Pass `--dangerously-skip-permissions` for unattended execution (default: true).",
+                    "description": (
+                        "Pass `--dangerously-skip-permissions` (default: true). When false, `agy` "
+                        "still executes sandboxed commands unattended via session "
+                        "`toolPermission='proceed-in-sandbox'` while enforcing `permissions.deny`."
+                    ),
                     "default": True,
                 },
                 "model": {
@@ -1017,6 +1021,7 @@ class MCPHandler:
                     "agy_binary": self.config.agy_binary,
                     "agy_default_skip_permissions": self.config.agy_default_skip_permissions,
                     "agy_default_sandbox": self.config.agy_default_sandbox,
+                    "agy_sandbox_tool_permission": self.config.agy_sandbox_tool_permission,
                     "agy_writable_roots": self.policy.get_agy_writable_roots(),
                     "codex_binary": self.config.codex_binary,
                     "codex_default_skip_permissions": self.config.codex_default_skip_permissions,
@@ -1073,7 +1078,7 @@ class MCPHandler:
                     prompt=prompt,
                     cwd=args.get("cwd"),
                     args=extra_args,
-                    skip_permissions=args.get("skip_permissions", True),
+                    skip_permissions=args.get("skip_permissions"),
                     print_mode=True,
                     model=args.get("model"),
                     effort=args.get("effort"),
@@ -1117,7 +1122,7 @@ class MCPHandler:
                     prompt=prompt,
                     cwd=args.get("cwd"),
                     args=extra_args,
-                    skip_permissions=args.get("skip_permissions", True),
+                    skip_permissions=args.get("skip_permissions"),
                     sandbox_mode=args.get("sandbox_mode"),
                     json_events=bool(args.get("json_events", False)),
                     model=args.get("model"),
@@ -1157,7 +1162,7 @@ class MCPHandler:
                         prompt=None,
                         cwd=args.get("cwd"),
                         env=args.get("env"),
-                        skip_permissions=args.get("skip_permissions", True),
+                        skip_permissions=args.get("skip_permissions"),
                         print_mode=True,
                         output_format="stream-json",
                         input_format="stream-json",
@@ -1179,7 +1184,7 @@ class MCPHandler:
                         prompt=str(prompt),
                         cwd=args.get("cwd"),
                         env=args.get("env"),
-                        skip_permissions=args.get("skip_permissions", True),
+                        skip_permissions=args.get("skip_permissions"),
                         sandbox_mode=args.get("sandbox_mode"),
                         json_events=True,
                         model=args.get("model"),
@@ -1386,6 +1391,7 @@ class MCPHandler:
                     "default_workdir": self.config.default_workdir,
                     "isolate_mount_namespace": self.config.isolate_mount_namespace,
                     "agy_default_sandbox": self.config.agy_default_sandbox,
+                    "agy_sandbox_tool_permission": self.config.agy_sandbox_tool_permission,
                     "agy_writable_roots": self.policy.get_agy_writable_roots(),
                     "codex_default_sandbox": self.config.codex_default_sandbox,
                     "codex_sandbox_network_access": self.config.codex_sandbox_network_access,

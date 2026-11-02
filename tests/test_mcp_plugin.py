@@ -992,12 +992,55 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
                 a for a in parsed["argv"] if a.startswith("--settings=")
             )
             settings_obj = json.loads(settings_arg.split("=", 1)[1])
+            self.assertEqual(settings_obj.get("toolPermission"), "proceed-in-sandbox")
             allow_rules = settings_obj["permissions"]["allow"]
+            deny_rules = settings_obj["permissions"]["deny"]
             self.assertIn(f"write_file({sub_ws.resolve()})", allow_rules)
             self.assertIn(f"write_file({Path(self.tmpdir).resolve()})", allow_rules)
             if os.path.isdir("/opt/flutter/bin/cache"):
                 self.assertIn("write_file(/opt/flutter/bin/cache)", allow_rules)
             self.assertNotIn(f"write_file({GATEWAY_ROOT})", allow_rules)
+            self.assertIn("command(sudo)", deny_rules)
+            self.assertIn("command(docker)", deny_rules)
+            self.assertIn(f"read_file({GATEWAY_ROOT})", deny_rules)
+            home_res = str(Path.home().resolve())
+            self.assertIn(
+                f"read_file({os.path.join(home_res, '.config', 'dots-gateway')})",
+                deny_rules,
+            )
+            self.assertNotIn(f"read_file({os.path.join(home_res, '.gemini')})", deny_rules)
+            self.assertNotIn(f"read_file({os.path.join(home_res, '.config')})", deny_rules)
+            self.assertNotIn(f"read_file({os.path.join(home_res, '.local')})", deny_rules)
+
+            # Verify skip_permissions=False omits --dangerously-skip-permissions while keeping
+            # --sandbox and toolPermission="proceed-in-sandbox" for unattended headless command runs
+            resp_noskip, _ = await asyncio.to_thread(
+                client.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "agy-noskip",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "run_agy",
+                        "arguments": {
+                            "prompt": "git status check",
+                            "cwd": str(sub_ws),
+                            "skip_permissions": False,
+                        },
+                    },
+                },
+            )
+            self.assertFalse(resp_noskip["result"]["isError"], resp_noskip)
+            parsed_noskip = json.loads(
+                resp_noskip["result"]["structuredContent"]["stdout"].strip()
+            )
+            self.assertNotIn("--dangerously-skip-permissions", parsed_noskip["argv"])
+            self.assertIn("--sandbox", parsed_noskip["argv"])
+            noskip_settings_arg = next(
+                a for a in parsed_noskip["argv"] if a.startswith("--settings=")
+            )
+            noskip_settings = json.loads(noskip_settings_arg.split("=", 1)[1])
+            self.assertEqual(noskip_settings.get("toolPermission"), "proceed-in-sandbox")
         finally:
             await agy_srv.stop()
 

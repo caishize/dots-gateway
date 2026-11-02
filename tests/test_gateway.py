@@ -19,6 +19,7 @@ from gateway.config import (
     GatewayConfig,
     hash_password_pbkdf2,
 )
+from gateway.policy import CommandPolicy
 from gateway.server import GatewayServer
 from gateway.tls import ensure_tls_pki
 
@@ -551,7 +552,16 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(default_cfg.allowed_workdirs, [DEFAULT_WORKSPACE_DIR])
         self.assertTrue(default_cfg.isolate_mount_namespace)
         self.assertTrue(default_cfg.agy_default_sandbox)
+        self.assertEqual(default_cfg.agy_sandbox_tool_permission, "proceed-in-sandbox")
         self.assertIn(str(GATEWAY_ROOT), default_cfg.protected_paths)
+
+        bad_perm_cfg = GatewayConfig(
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            agy_sandbox_tool_permission="always-proceed",
+        )
+        with self.assertRaises(PermissionError):
+            CommandPolicy(bad_perm_cfg).build_agy_sandbox_settings(cwd=self.tmpdir)
 
         client = DotsGatewayClient(
             base_url=self.base_url, token="test-secret-token-12345"
