@@ -10,7 +10,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from dots_client import DotsGatewayClient
 from gateway.config import GATEWAY_ROOT, HOME_DIR, GatewayConfig
@@ -997,9 +997,24 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             deny_rules = settings_obj["permissions"]["deny"]
             self.assertIn(f"write_file({sub_ws.resolve()})", allow_rules)
             self.assertIn(f"write_file({Path(self.tmpdir).resolve()})", allow_rules)
-            if os.path.isdir("/opt/flutter/bin/cache"):
+            for opt_ro in (
+                "/opt/uv-python",
+                "/opt/uv-tools",
+                "/opt/devtools",
+                "/opt/flutter",
+            ):
+                if os.path.isdir(opt_ro):
+                    self.assertIn(f"read_file({opt_ro})", allow_rules)
+            if os.path.isdir("/opt/flutter") and os.path.isdir("/opt/flutter/bin/cache"):
+                self.assertIn("write_file(/opt/flutter/bin/cache)", allow_rules)
+                self.assertLess(
+                    allow_rules.index("read_file(/opt/flutter)"),
+                    allow_rules.index("write_file(/opt/flutter/bin/cache)"),
+                )
+            elif os.path.isdir("/opt/flutter/bin/cache"):
                 self.assertIn("write_file(/opt/flutter/bin/cache)", allow_rules)
             self.assertNotIn(f"write_file({GATEWAY_ROOT})", allow_rules)
+            self.assertNotIn(f"read_file({GATEWAY_ROOT})", allow_rules)
             self.assertIn("command(sudo)", deny_rules)
             self.assertIn("command(docker)", deny_rules)
             self.assertIn(f"read_file({GATEWAY_ROOT})", deny_rules)

@@ -5,7 +5,7 @@ description: Delegate multi-file coding, refactoring, and autonomous debugging t
 
 # Delegating Software Engineering Tasks to Local `agy`
 
-The remote host has Google Antigravity CLI (`agy`) installed and authorized by the gateway to run unattended inside `allowed_workdirs` (default: `~/workspaces`) with `--sandbox`, session `toolPermission: "proceed-in-sandbox"`, `permissions.deny` command/path guardrails, kernel mount-namespace isolation, and `oh-my-agents` Harness guardrails active.
+The remote host has Google Antigravity CLI (`agy`) installed and authorized by the gateway to run unattended inside `allowed_workdirs` (default: `~/workspaces`) with `--sandbox`, session `toolPermission: "proceed-in-sandbox"`, read-only `/opt` toolchain mounts (`/opt/uv-python`, `/opt/uv-tools`, `/opt/devtools`, `/opt/flutter`), `permissions.deny` command/path guardrails, kernel mount-namespace isolation, and `oh-my-agents` Harness guardrails active.
 
 ## When to Use `run_agy` vs Direct `fs_patch`
 - **Use `fs_read` + `fs_patch` + `exec_command` directly** for quick inspections, targeted 1–2 file edits, git operations, or running a known test command.

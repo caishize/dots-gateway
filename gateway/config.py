@@ -260,6 +260,13 @@ DEFAULT_PROTECTED_PATHS: List[str] = [
     str(Path.home() / ".bash_profile"),
 ]
 
+DEFAULT_AGY_READONLY_ROOTS: List[str] = [
+    "/opt/uv-python",
+    "/opt/uv-tools",
+    "/opt/devtools",
+    "/opt/flutter",
+]
+
 
 def detect_recommended_max_agy() -> int:
     """Auto-tune default concurrent `agy` limit (~270 MiB RSS each) based on host MemTotal + SwapTotal."""
@@ -335,6 +342,7 @@ class GatewayConfig:
     agy_default_skip_permissions: bool = True
     agy_default_sandbox: bool = True
     agy_sandbox_tool_permission: str = "proceed-in-sandbox"
+    agy_extra_readonly_roots: List[str] = field(default_factory=list)
     codex_binary: str = DEFAULT_CODEX_BIN
     codex_default_skip_permissions: bool = True
     codex_default_sandbox: str = "workspace-write"
@@ -418,6 +426,12 @@ class GatewayConfig:
             cfg.agy_sandbox_tool_permission = os.environ[
                 "GATEWAY_AGY_SANDBOX_TOOL_PERMISSION"
             ].strip()
+        if os.environ.get("GATEWAY_AGY_READONLY_ROOTS"):
+            cfg.agy_extra_readonly_roots = [
+                x.strip()
+                for x in os.environ["GATEWAY_AGY_READONLY_ROOTS"].split(",")
+                if x.strip()
+            ]
         if os.environ.get("GATEWAY_CODEX_BIN"):
             cfg.codex_binary = os.environ["GATEWAY_CODEX_BIN"]
         if os.environ.get("GATEWAY_CODEX_SANDBOX"):

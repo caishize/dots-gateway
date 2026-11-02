@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from .config import GatewayConfig
+from .config import DEFAULT_AGY_READONLY_ROOTS, GatewayConfig
 
 
 @dataclass
@@ -1362,6 +1362,49 @@ class CommandPolicy:
             _add(root)
         return roots
 
+    def get_agy_readonly_roots(self) -> List[str]:
+        """Compute safe `read_file(...)` mount roots for `agy --sandbox`.
+
+        `agy --sandbox` on Linux mounts standard OS system paths (`/usr`, `/etc`, etc.)
+        by default, not `/opt`. Exposing read-only SDK/toolchain directories (`/opt/uv-python`,
+        `/opt/uv-tools`, `/opt/devtools`, `/opt/flutter`, plus configured `agy_extra_readonly_roots`)
+        via `read_file(...)` allows virtualenvs, `pytest`, `mypy`, `ruff`, Node/pnpm, Terraform,
+        Trivy, and Flutter/Dart binaries to execute inside the sandbox while keeping SDK trees
+        read-only.
+        """
+        roots: List[str] = []
+        seen: set[str] = set()
+
+        def _add_candidate(raw_cand: str) -> None:
+            try:
+                p = Path(str(raw_cand)).expanduser()
+                lex = os.path.abspath(str(p))
+                res = str(p.resolve())
+            except OSError:
+                return
+            if self.is_protected_path(lex) or self.is_protected_path(res):
+                return
+            for cand in (lex, res):
+                if ")" not in cand and os.path.isdir(cand) and cand not in seen:
+                    seen.add(cand)
+                    roots.append(cand)
+
+        for default_ro in DEFAULT_AGY_READONLY_ROOTS:
+            _add_candidate(default_ro)
+
+        flutter_bin = shutil.which("flutter")
+        if flutter_bin:
+            try:
+                fl_root = Path(flutter_bin).resolve().parent.parent
+                _add_candidate(str(fl_root))
+            except OSError:
+                pass
+
+        for raw_extra in self.config.agy_extra_readonly_roots:
+            _add_candidate(raw_extra)
+
+        return roots
+
     def get_agy_denied_rules(self) -> List[str]:
         """Compute `permissions.deny` rules enforced inside `agy` sessions.
 
@@ -1436,7 +1479,9 @@ class CommandPolicy:
 
         Configures `toolPermission` (default: `"proceed-in-sandbox"`, enabling headless
         command execution inside `agy --sandbox` even when `skip_permissions=False`),
-        grants `write_file(...)` mounts for validated workspace/toolchain cache roots,
+        grants `read_file(...)` mounts for read-only `/opt` SDK toolchains (ordered before
+        `write_file(...)` so writable child caches such as `/opt/flutter/bin/cache` stay
+        writable), grants `write_file(...)` mounts for validated workspace/cache roots,
         and enforces `permissions.deny` (`deny > ask > allow`) on blocked commands and
         protected paths without mutating the user's global `settings.json`.
         """
@@ -1459,13 +1504,28 @@ class CommandPolicy:
         except Exception:
             pass
 
-        allow_list: List[str] = list(perms.get("allow") or [])
-        allow_seen = set(allow_list)
-        for root in self.get_agy_writable_roots(cwd=cwd, add_dirs=add_dirs):
-            rule = f"write_file({root})"
-            if rule not in allow_seen:
+        writable_roots = self.get_agy_writable_roots(cwd=cwd, add_dirs=add_dirs)
+        writable_set = set(writable_roots)
+
+        allow_list: List[str] = []
+        allow_seen: set[str] = set()
+
+        def _emit_allow(rule: str) -> None:
+            if rule and rule not in allow_seen:
                 allow_seen.add(rule)
                 allow_list.append(rule)
+
+        for ro_root in self.get_agy_readonly_roots():
+            if ro_root not in writable_set and ")" not in ro_root:
+                _emit_allow(f"read_file({ro_root})")
+
+        for existing_rule in perms.get("allow") or []:
+            _emit_allow(str(existing_rule))
+
+        for rw_root in writable_roots:
+            if ")" not in rw_root:
+                _emit_allow(f"write_file({rw_root})")
+
         perms["allow"] = allow_list
 
         deny_list: List[str] = list(perms.get("deny") or [])

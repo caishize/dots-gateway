@@ -595,6 +595,27 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
         extra_ws = Path(self.tmpdir) / "extra_ws"
         extra_ws.mkdir()
+        extra_ro_sdk = Path(self.tmpdir) / "extra_ro_sdk"
+        extra_ro_sdk.mkdir()
+        ro_cfg = GatewayConfig(
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            agy_extra_readonly_roots=[str(extra_ro_sdk), str(GATEWAY_ROOT)],
+        )
+        ro_pol = CommandPolicy(ro_cfg)
+        ro_roots = ro_pol.get_agy_readonly_roots()
+        self.assertIn(str(extra_ro_sdk.resolve()), ro_roots)
+        self.assertNotIn(str(GATEWAY_ROOT), ro_roots)
+        ro_settings = ro_pol.build_agy_sandbox_settings(cwd=self.tmpdir)
+        self.assertIn(
+            f"read_file({extra_ro_sdk.resolve()})",
+            ro_settings["permissions"]["allow"],
+        )
+        self.assertNotIn(
+            f"read_file({GATEWAY_ROOT})",
+            ro_settings["permissions"]["allow"],
+        )
+
         ok_agy = await asyncio.to_thread(
             client.run_agy,
             prompt=None,

@@ -163,15 +163,28 @@ try:
                 agy_data["trustedWorkspaces"] = tw
             raw_perms = agy_data.get("permissions")
             perms_dict = dict(raw_perms) if isinstance(raw_perms, dict) else {}
-            allow_list = list(perms_dict.get("allow") or [])
-            allow_changed = False
-            for root in pol.get_agy_writable_roots():
-                rule = f"write_file({root})"
-                if rule not in allow_list:
-                    allow_list.append(rule)
-                    allow_changed = True
-            if allow_changed:
-                perms_dict["allow"] = allow_list
+            existing_allow = [str(x) for x in (perms_dict.get("allow") or [])]
+            agy_rw_roots = pol.get_agy_writable_roots()
+            agy_rw_set = set(agy_rw_roots)
+            merged_allow = []
+            merged_seen = set()
+
+            def _add_allow(rule: str) -> None:
+                if rule and rule not in merged_seen:
+                    merged_seen.add(rule)
+                    merged_allow.append(rule)
+
+            for ro_root in pol.get_agy_readonly_roots():
+                if ro_root not in agy_rw_set and ")" not in ro_root:
+                    _add_allow(f"read_file({ro_root})")
+            for existing_rule in existing_allow:
+                _add_allow(existing_rule)
+            for rw_root in agy_rw_roots:
+                if ")" not in rw_root:
+                    _add_allow(f"write_file({rw_root})")
+
+            if merged_allow != existing_allow:
+                perms_dict["allow"] = merged_allow
                 agy_data["permissions"] = perms_dict
                 agy_changed = True
             if agy_changed:
