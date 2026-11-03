@@ -278,6 +278,23 @@ DEFAULT_AGY_READONLY_ROOTS: List[str] = [
 ]
 
 
+def detect_default_sandbox_state_dir() -> str:
+    """Prefer persistent large data disk `/mnt/data/dots-sandbox` when writable; else `~/.cache/dots-sandbox`."""
+    data_sb = Path("/mnt/data/dots-sandbox")
+    try:
+        if data_sb.is_dir() and os.access(data_sb, os.W_OK | os.X_OK):
+            return str(data_sb)
+        data_root = Path("/mnt/data")
+        if data_root.is_dir() and os.access(data_root, os.W_OK | os.X_OK):
+            return str(data_sb)
+    except OSError:
+        pass
+    return str(Path.home() / ".cache" / "dots-sandbox")
+
+
+DEFAULT_SANDBOX_STATE_DIR: str = detect_default_sandbox_state_dir()
+
+
 def detect_recommended_max_agy() -> int:
     """Auto-tune default concurrent `agy` limit (~270 MiB RSS each) based on host MemTotal + SwapTotal."""
     try:
@@ -363,12 +380,22 @@ class GatewayConfig:
     codex_extra_writable_roots: List[str] = field(default_factory=list)
     codex_env_file: str = str(Path.home() / ".config" / "dots-gateway" / "codex.env")
     max_concurrent_agy: int = field(default_factory=detect_recommended_max_agy)
-    agy_queue_timeout_seconds: float = 1800.0
+    max_concurrent_codex: int = 6
+    agy_queue_timeout_seconds: float = 28800.0
+    # Isolated sandbox storage location & LRU lifecycle retention policy
+    sandbox_state_dir: str = field(default_factory=detect_default_sandbox_state_dir)
+    sandbox_cleanup_enabled: bool = True
+    sandbox_cleanup_interval_seconds: float = 3600.0
+    sandbox_max_retention_days: float = 30.0
+    sandbox_min_retention_days: float = 7.0
+    sandbox_low_space_free_gb: float = 8.0
+    sandbox_low_space_free_percent: float = 15.0
     # Execution, connection, session persistence & memory limits
     session_state_dir: Optional[str] = None
     max_persisted_sessions: int = 200
-    default_timeout_seconds: float = 600.0
-    max_timeout_seconds: float = 7200.0
+    default_timeout_seconds: float = 21600.0
+    agent_default_timeout_seconds: float = 28800.0
+    max_timeout_seconds: float = 86400.0
     max_concurrent_sessions: int = 32
     max_concurrent_connections: int = 128
     max_output_buffer_events: int = 5000
@@ -484,6 +511,103 @@ class GatewayConfig:
             cfg.codex_env_file = os.environ["GATEWAY_CODEX_ENV_FILE"].strip()
         if os.environ.get("GATEWAY_MAX_AGY"):
             cfg.max_concurrent_agy = max(1, int(os.environ["GATEWAY_MAX_AGY"]))
+        if os.environ.get("GATEWAY_MAX_CODEX"):
+            cfg.max_concurrent_codex = max(1, int(os.environ["GATEWAY_MAX_CODEX"]))
+        if os.environ.get("GATEWAY_SANDBOX_DIR") or os.environ.get("GATEWAY_SANDBOX_STATE_DIR"):
+            cfg.sandbox_state_dir = (
+                os.environ.get("GATEWAY_SANDBOX_STATE_DIR") or os.environ["GATEWAY_SANDBOX_DIR"]
+            ).strip()
+        if os.environ.get("GATEWAY_SANDBOX_CLEANUP") or os.environ.get("GATEWAY_SANDBOX_CLEANUP_ENABLED"):
+            raw_sb_en = (
+                os.environ.get("GATEWAY_SANDBOX_CLEANUP_ENABLED")
+                or os.environ["GATEWAY_SANDBOX_CLEANUP"]
+            )
+            cfg.sandbox_cleanup_enabled = raw_sb_en.strip().lower() in ("1", "true", "yes")
+        if os.environ.get("GATEWAY_SANDBOX_CLEANUP_INTERVAL"):
+            cfg.sandbox_cleanup_interval_seconds = max(
+                10.0, float(os.environ["GATEWAY_SANDBOX_CLEANUP_INTERVAL"])
+            )
+        if os.environ.get("GATEWAY_SANDBOX_MAX_RETENTION_DAYS"):
+            cfg.sandbox_max_retention_days = float(
+                os.environ["GATEWAY_SANDBOX_MAX_RETENTION_DAYS"]
+            )
+        if os.environ.get("GATEWAY_SANDBOX_MIN_RETENTION_DAYS"):
+            cfg.sandbox_min_retention_days = float(
+                os.environ["GATEWAY_SANDBOX_MIN_RETENTION_DAYS"]
+            )
+        if os.environ.get("GATEWAY_SANDBOX_LOW_SPACE_GB") or os.environ.get("GATEWAY_SANDBOX_LOW_SPACE_FREE_GB"):
+            cfg.sandbox_low_space_free_gb = max(
+                0.0,
+                float(
+                    os.environ.get("GATEWAY_SANDBOX_LOW_SPACE_FREE_GB")
+                    or os.environ["GATEWAY_SANDBOX_LOW_SPACE_GB"]
+                ),
+            )
+        if os.environ.get("GATEWAY_SANDBOX_LOW_SPACE_PCT") or os.environ.get("GATEWAY_SANDBOX_LOW_SPACE_FREE_PERCENT"):
+            cfg.sandbox_low_space_free_percent = max(
+                0.0,
+                min(
+                    95.0,
+                    float(
+                        os.environ.get("GATEWAY_SANDBOX_LOW_SPACE_FREE_PERCENT")
+                        or os.environ["GATEWAY_SANDBOX_LOW_SPACE_PCT"]
+                    ),
+                ),
+            )
+        if os.environ.get("GATEWAY_MAX_TIMEOUT"):
+            cfg.max_timeout_seconds = max(60.0, float(os.environ["GATEWAY_MAX_TIMEOUT"]))
+        if os.environ.get("GATEWAY_DEFAULT_TIMEOUT"):
+            cfg.default_timeout_seconds = max(1.0, float(os.environ["GATEWAY_DEFAULT_TIMEOUT"]))
+        if os.environ.get("GATEWAY_AGENT_DEFAULT_TIMEOUT"):
+            cfg.agent_default_timeout_seconds = max(
+                1.0, float(os.environ["GATEWAY_AGENT_DEFAULT_TIMEOUT"])
+            )
+        if os.environ.get("GATEWAY_AGY_QUEUE_TIMEOUT"):
+            cfg.agy_queue_timeout_seconds = max(
+                1.0, float(os.environ["GATEWAY_AGY_QUEUE_TIMEOUT"])
+            )
+
+        cfg.max_timeout_seconds = max(60.0, float(cfg.max_timeout_seconds or 86400.0))
+        cfg.default_timeout_seconds = min(
+            cfg.max_timeout_seconds, max(1.0, float(cfg.default_timeout_seconds or 21600.0))
+        )
+        cfg.agent_default_timeout_seconds = min(
+            cfg.max_timeout_seconds,
+            max(1.0, float(cfg.agent_default_timeout_seconds or 28800.0)),
+        )
+        cfg.agy_queue_timeout_seconds = max(1.0, float(cfg.agy_queue_timeout_seconds or 28800.0))
+        cfg.max_concurrent_codex = max(1, int(cfg.max_concurrent_codex or 6))
+        if not cfg.sandbox_state_dir:
+            cfg.sandbox_state_dir = detect_default_sandbox_state_dir()
+        cfg.sandbox_min_retention_days = max(
+            0.0, float(7.0 if cfg.sandbox_min_retention_days is None else cfg.sandbox_min_retention_days)
+        )
+        cfg.sandbox_max_retention_days = max(
+            cfg.sandbox_min_retention_days,
+            float(30.0 if cfg.sandbox_max_retention_days is None else cfg.sandbox_max_retention_days),
+        )
+        cfg.sandbox_low_space_free_gb = max(
+            0.0, float(8.0 if cfg.sandbox_low_space_free_gb is None else cfg.sandbox_low_space_free_gb)
+        )
+        cfg.sandbox_low_space_free_percent = max(
+            0.0,
+            min(
+                95.0,
+                float(
+                    15.0
+                    if cfg.sandbox_low_space_free_percent is None
+                    else cfg.sandbox_low_space_free_percent
+                ),
+            ),
+        )
+        cfg.sandbox_cleanup_interval_seconds = max(
+            10.0,
+            float(
+                3600.0
+                if cfg.sandbox_cleanup_interval_seconds is None
+                else cfg.sandbox_cleanup_interval_seconds
+            ),
+        )
 
         codex_home_str = str(Path.home() / ".codex")
         if cfg.protected_paths and codex_home_str not in cfg.protected_paths:

@@ -1675,6 +1675,105 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await srv2.stop()
 
+    async def test_independent_agy_and_codex_concurrency_slots_and_status(self) -> None:
+        mock_agy = Path(self.tmpdir) / "mock_slot_agy.py"
+        mock_agy.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, time\n"
+            "t0 = time.monotonic()\n"
+            "time.sleep(0.30)\n"
+            "t1 = time.monotonic()\n"
+            "print(json.dumps({'agent': 'agy', 't0': t0, 't1': t1}))\n",
+            encoding="utf-8",
+        )
+        mock_agy.chmod(0o755)
+
+        mock_codex = Path(self.tmpdir) / "mock_slot_codex.py"
+        mock_codex.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, time\n"
+            "t0 = time.monotonic()\n"
+            "time.sleep(0.30)\n"
+            "t1 = time.monotonic()\n"
+            "print(json.dumps({'agent': 'codex', 't0': t0, 't1': t1}))\n",
+            encoding="utf-8",
+        )
+        mock_codex.chmod(0o755)
+
+        sb_dir = Path(self.tmpdir) / "isolated_sb_store"
+        cfg = GatewayConfig(
+            host="127.0.0.1",
+            port=0,
+            api_tokens=["slot-tok"],
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            agy_binary=str(mock_agy),
+            codex_binary=str(mock_codex),
+            allowed_commands=["python3", str(mock_agy), str(mock_codex)],
+            max_concurrent_agy=1,
+            max_concurrent_codex=1,
+            sandbox_state_dir=str(sb_dir),
+            sandbox_cleanup_enabled=False,
+        )
+        srv = GatewayServer(cfg)
+        h, p = await srv.start()
+        try:
+            client = DotsGatewayClient(base_url=f"http://{h}:{p}", token="slot-tok")
+            st_resp, _ = await asyncio.to_thread(
+                client.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "st-slot",
+                    "method": "tools/call",
+                    "params": {"name": "gateway_status", "arguments": {}},
+                },
+            )
+            sc = st_resp["result"]["structuredContent"]
+            self.assertEqual(sc["max_concurrent_agy"], 1)
+            self.assertEqual(sc["max_concurrent_codex"], 1)
+            self.assertEqual(sc["default_timeout_seconds"], 21600.0)
+            self.assertEqual(sc["agent_default_timeout_seconds"], 28800.0)
+            self.assertEqual(sc["max_timeout_seconds"], 86400.0)
+            self.assertEqual(sc["agy_queue_timeout_seconds"], 28800.0)
+            self.assertEqual(sc["sandbox_state_dir"], str(sb_dir))
+            self.assertEqual(sc["sandbox_lifecycle"]["max_retention_days"], 30.0)
+            self.assertEqual(sc["sandbox_lifecycle"]["min_retention_days"], 7.0)
+
+            async def _run_tool(tool_name: str, req_id: str) -> Dict[str, Any]:
+                r, _ = await asyncio.to_thread(
+                    client.mcp_request,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": tool_name,
+                            "arguments": {"prompt": "check", "cwd": self.tmpdir},
+                        },
+                    },
+                )
+                assert r is not None
+                sid = r["result"]["structuredContent"]["session_id"]
+                sess_obj = srv.sessions.get_session(sid)
+                self.assertEqual(sess_obj.timeout, 28800.0)
+                return json.loads(
+                    r["result"]["structuredContent"]["stdout"].strip().splitlines()[-1]
+                )
+
+            agy_info, cdx_info = await asyncio.gather(
+                _run_tool("run_agy", "a1"),
+                _run_tool("run_codex", "c1"),
+            )
+            # Even with max_concurrent_agy=1, lightweight codex has its own slot and overlaps!
+            overlap = min(agy_info["t1"], cdx_info["t1"]) - max(agy_info["t0"], cdx_info["t0"])
+            self.assertGreater(
+                overlap,
+                0.08,
+                f"Expected agy and codex to run concurrently on separate semaphores: {agy_info} vs {cdx_info}",
+            )
+        finally:
+            await srv.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

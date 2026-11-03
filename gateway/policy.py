@@ -1995,6 +1995,15 @@ class CommandPolicy:
                 abs_cache = os.path.join(home_dir, rel)
                 if self.config.isolate_mount_namespace or os.path.isdir(abs_cache):
                     _add(abs_cache)
+            if not self.config.isolate_mount_namespace and self.config.sandbox_state_dir:
+                try:
+                    sb_tmp = os.path.abspath(
+                        str(Path(self.config.sandbox_state_dir).expanduser() / "tmp")
+                    )
+                    if not self.is_protected_path(sb_tmp) and os.path.isdir(sb_tmp):
+                        _add(sb_tmp)
+                except OSError:
+                    pass
 
         for raw_extra in self.config.codex_extra_writable_roots:
             try:

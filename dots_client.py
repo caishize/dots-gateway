@@ -418,7 +418,7 @@ class DotsGatewayClient:
             payload["stdin"] = stdin
         if timeout is not None:
             payload["timeout"] = timeout
-        return self._request_json("POST", "/v1/exec", payload, timeout=(timeout or 600.0) + 15.0)
+        return self._request_json("POST", "/v1/exec", payload, timeout=(timeout or 21600.0) + 30.0)
 
     def stream_exec(
         self,
@@ -446,7 +446,7 @@ class DotsGatewayClient:
             payload["stdin"] = stdin
         if timeout is not None:
             payload["timeout"] = timeout
-        yield from self._stream_sse("POST", "/v1/exec", payload, timeout=(timeout or 600.0) + 30.0)
+        yield from self._stream_sse("POST", "/v1/exec", payload, timeout=(timeout or 21600.0) + 30.0)
 
     def run_agy(
         self,
@@ -487,7 +487,7 @@ class DotsGatewayClient:
             payload["add_dirs"] = list(add_dirs)
         if timeout is not None:
             payload["timeout"] = timeout
-        return self._request_json("POST", "/v1/agy", payload, timeout=(timeout or 1800.0) + 30.0)
+        return self._request_json("POST", "/v1/agy", payload, timeout=(timeout or 28800.0) + 30.0)
 
     def stream_agy(
         self,
@@ -528,7 +528,7 @@ class DotsGatewayClient:
             payload["add_dirs"] = list(add_dirs)
         if timeout is not None:
             payload["timeout"] = timeout
-        yield from self._stream_sse("POST", "/v1/agy", payload, timeout=(timeout or 1800.0) + 30.0)
+        yield from self._stream_sse("POST", "/v1/agy", payload, timeout=(timeout or 28800.0) + 30.0)
 
     def run_codex(
         self,
@@ -571,7 +571,7 @@ class DotsGatewayClient:
             payload["add_dirs"] = list(add_dirs)
         if timeout is not None:
             payload["timeout"] = timeout
-        return self._request_json("POST", "/v1/codex", payload, timeout=(timeout or 1800.0) + 30.0)
+        return self._request_json("POST", "/v1/codex", payload, timeout=(timeout or 28800.0) + 30.0)
 
     def stream_codex(
         self,
@@ -614,14 +614,14 @@ class DotsGatewayClient:
             payload["add_dirs"] = list(add_dirs)
         if timeout is not None:
             payload["timeout"] = timeout
-        yield from self._stream_sse("POST", "/v1/codex", payload, timeout=(timeout or 1800.0) + 30.0)
+        yield from self._stream_sse("POST", "/v1/codex", payload, timeout=(timeout or 28800.0) + 30.0)
 
     def create_session(self, **kwargs: Any) -> Dict[str, Any]:
         """Start an interactive session via REST (`POST /v1/sessions`)."""
         return self._request_json("POST", "/v1/sessions", kwargs)
 
     def stream_session_events(
-        self, session_id: str, after_seq: int = 0, timeout: float = 3600.0
+        self, session_id: str, after_seq: int = 0, timeout: float = 28800.0
     ) -> Iterator[Dict[str, Any]]:
         """Resume/subscribe to SSE events of a running or completed session from `after_seq`."""
         yield from self._stream_sse(

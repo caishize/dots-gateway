@@ -1049,6 +1049,180 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await legacy_srv.stop()
 
+    async def test_custom_sandbox_store_and_lru_lifecycle_retention(self) -> None:
+        from gateway.sandbox import SANDBOX_SUBDIRS, cleanup_sandbox_state
+
+        sb_root = Path(tempfile.mkdtemp(prefix="dots_sb_store_"))
+        ws_dir = Path(tempfile.mkdtemp(prefix="dots_sb_ws_", dir="/var/tmp"))
+        try:
+            sb_cfg = GatewayConfig(
+                host="127.0.0.1",
+                port=0,
+                api_tokens=["sb-tok"],
+                allowed_workdirs=[str(ws_dir)],
+                default_workdir=str(ws_dir),
+                sandbox_state_dir=str(sb_root),
+                sandbox_cleanup_enabled=False,
+                sandbox_max_retention_days=30.0,
+                sandbox_min_retention_days=7.0,
+                sandbox_low_space_free_gb=8.0,
+                sandbox_low_space_free_percent=15.0,
+            )
+            sb_srv = GatewayServer(sb_cfg)
+            h, p = await sb_srv.start()
+            try:
+                client = DotsGatewayClient(base_url=f"http://{h}:{p}", token="sb-tok")
+                pol = await asyncio.to_thread(client.policy)
+                self.assertEqual(pol["sandbox_state_dir"], str(sb_root))
+                self.assertEqual(pol["sandbox_lifecycle"]["max_retention_days"], 30.0)
+                self.assertEqual(pol["sandbox_lifecycle"]["min_retention_days"], 7.0)
+
+                if sb_cfg.isolate_mount_namespace:
+                    probe_res = await asyncio.to_thread(
+                        client.exec_command,
+                        [
+                            "python3",
+                            "-c",
+                            (
+                                "import json, os, pathlib\n"
+                                "pathlib.Path('/tmp/sb_tmp_probe.txt').write_text('tmp_on_data_disk')\n"
+                                "pathlib.Path(os.path.expanduser('~/.cache/sb_cache_probe.txt')).write_text('cache_on_data_disk')\n"
+                                "print(json.dumps({'tmpdir': os.environ.get('TMPDIR')}))\n"
+                            ),
+                        ],
+                        cwd=str(ws_dir),
+                    )
+                    self.assertEqual(probe_res["returncode"], 0, probe_res["stderr"])
+                    self.assertEqual(
+                        json.loads(probe_res["stdout"].strip())["tmpdir"], "/tmp"
+                    )
+                    self.assertEqual(
+                        (sb_root / "tmp" / "sb_tmp_probe.txt").read_text(encoding="utf-8"),
+                        "tmp_on_data_disk",
+                    )
+                    self.assertEqual(
+                        (sb_root / "cache" / "sb_cache_probe.txt").read_text(encoding="utf-8"),
+                        "cache_on_data_disk",
+                    )
+            finally:
+                await sb_srv.stop()
+
+            # Reset sandbox store to test deterministic 2-tier LRU lifecycle rules
+            shutil.rmtree(sb_root, ignore_errors=True)
+            for sub in SANDBOX_SUBDIRS:
+                (sb_root / sub).mkdir(parents=True, exist_ok=True)
+
+            now_ts = 1_800_000_000.0
+            mib = 1024 * 1024
+            gib = 1024 ** 3
+
+            def _make_entry(rel_path: str, age_days: float, size_bytes: int) -> Path:
+                target = sb_root / rel_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"X" * size_bytes)
+                ts = now_ts - age_days * 86400.0
+                os.utime(target, (ts, ts))
+                os.utime(target.parent, (ts, ts))
+                return target
+
+            p_expired_35d = _make_entry("tmp/expired_35d/blob.bin", 35.0, 4 * mib)
+            p_older_22d = _make_entry("tmp/older_22d/blob.bin", 22.0, 4 * mib)
+            p_older_15d = _make_entry("cache/older_15d/blob.bin", 15.0, 4 * mib)
+            p_pkg_10d = _make_entry(
+                "pub_cache/hosted/pub.dev/pkg_10d-1.0.0/lib.dart", 10.0, 4 * mib
+            )
+            p_pkg_10d_hash = _make_entry(
+                "pub_cache/hosted-hashes/pub.dev/pkg_10d-1.0.0.sha256", 10.0, 64
+            )
+            # Directory inode looks 25d old, but a child file inside was read/modified 2d ago (<7d!)
+            p_nested_active = _make_entry("tmp/nested_recent_dir/active.txt", 2.0, 2 * mib)
+            old_dir_ts = now_ts - 25.0 * 86400.0
+            os.utime(p_nested_active.parent, (old_dir_ts, old_dir_ts))
+            p_recent_5d = _make_entry("tmp/recent_5d/blob.bin", 5.0, 4 * mib)
+            p_recent_1d = _make_entry("cache/recent_1d/blob.bin", 1.0, 4 * mib)
+
+            def _dir_bytes(root_p: Path) -> int:
+                tot = 0
+                for dirpath, _, filenames in os.walk(root_p, followlinks=False):
+                    for fn in filenames:
+                        try:
+                            tot += os.lstat(os.path.join(dirpath, fn)).st_size
+                        except OSError:
+                            pass
+                return tot
+
+            # Phase A: Plenty of free space (30 GiB / 50 GiB) -> keep <=30d, delete >30d only
+            res_plenty = cleanup_sandbox_state(
+                sb_root,
+                max_retention_days=30.0,
+                min_retention_days=7.0,
+                low_space_free_gb=8.0,
+                low_space_free_percent=15.0,
+                now=now_ts,
+                disk_usage_fn=lambda _: (50 * gib, 30 * gib),
+            )
+            self.assertEqual(res_plenty["deleted_expired_count"], 1)
+            self.assertEqual(res_plenty["deleted_low_space_count"], 0)
+            self.assertFalse(p_expired_35d.parent.exists())
+            self.assertTrue(p_older_22d.exists())
+            self.assertTrue(p_older_15d.exists())
+            self.assertTrue(p_pkg_10d.exists())
+            self.assertTrue(p_nested_active.exists())
+            self.assertTrue(p_recent_5d.exists())
+            self.assertTrue(p_recent_1d.exists())
+
+            # Phase B: Tight disk space (~5.5 MiB short of 8 GiB) -> evict oldest (22d, 15d) and keep newer 10d + <7d
+            baseline_used = _dir_bytes(sb_root)
+            start_avail_tight = 8 * gib - int(5.5 * mib)
+
+            def _tight_usage(root_p: Path) -> tuple[int, int]:
+                reclaimed_now = max(0, baseline_used - _dir_bytes(root_p))
+                return (50 * gib, start_avail_tight + reclaimed_now)
+
+            res_tight = cleanup_sandbox_state(
+                sb_root,
+                max_retention_days=30.0,
+                min_retention_days=7.0,
+                low_space_free_gb=8.0,
+                low_space_free_percent=15.0,
+                now=now_ts,
+                disk_usage_fn=_tight_usage,
+            )
+            self.assertTrue(res_tight["low_space_before"])
+            self.assertFalse(res_tight["low_space_after"])
+            self.assertEqual(res_tight["deleted_low_space_count"], 2)
+            self.assertFalse(p_older_22d.parent.exists())
+            self.assertFalse(p_older_15d.parent.exists())
+            # Newer 10d package was preserved because space recovered above 8 GiB!
+            self.assertTrue(p_pkg_10d.exists())
+            self.assertTrue(p_pkg_10d_hash.exists())
+            self.assertTrue(p_nested_active.exists())
+            self.assertTrue(p_recent_5d.exists())
+            self.assertTrue(p_recent_1d.exists())
+
+            # Phase C: Severe disk pressure (1 GiB free) -> evicts remaining >7d (10d + hash), NEVER deletes <=7d!
+            res_severe = cleanup_sandbox_state(
+                sb_root,
+                max_retention_days=30.0,
+                min_retention_days=7.0,
+                low_space_free_gb=8.0,
+                low_space_free_percent=15.0,
+                now=now_ts,
+                disk_usage_fn=lambda _: (50 * gib, 1 * gib),
+            )
+            self.assertEqual(res_severe["deleted_low_space_count"], 1)
+            self.assertFalse(p_pkg_10d.parent.exists())
+            self.assertFalse(p_pkg_10d_hash.exists())
+            # All <=7d entries (including directory with 2d nested activity) MUST remain untouched
+            self.assertTrue(p_nested_active.exists())
+            self.assertTrue(p_recent_5d.exists())
+            self.assertTrue(p_recent_1d.exists())
+            for sub in SANDBOX_SUBDIRS:
+                self.assertTrue((sb_root / sub).is_dir())
+        finally:
+            shutil.rmtree(sb_root, ignore_errors=True)
+            shutil.rmtree(ws_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

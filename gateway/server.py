@@ -49,6 +49,7 @@ class GatewayServer:
         self.sessions = SessionManager(config, self.policy)
         self._server: Optional[asyncio.AbstractServer] = None
         self._loopback_server: Optional[asyncio.AbstractServer] = None
+        self._cleanup_task: Optional[asyncio.Task[None]] = None
         self._conn_sem = asyncio.Semaphore(max(1, config.max_concurrent_connections))
         self._started_at = time.time()
         self.mcp = MCPHandler(
@@ -97,9 +98,49 @@ class GatewayServer:
                 self.config.loopback_http_port,
             )
 
+        if self.config.sandbox_cleanup_enabled and self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._sandbox_cleanup_loop())
+
         return self.config.host, bound_port
 
+    async def _sandbox_cleanup_loop(self) -> None:
+        initial_delay = min(5.0, max(0.5, float(self.config.sandbox_cleanup_interval_seconds)))
+        try:
+            await asyncio.sleep(initial_delay)
+            while True:
+                try:
+                    res = await self.sessions.run_sandbox_cleanup()
+                    evicted = int(res.get("deleted_expired_count", 0)) + int(
+                        res.get("deleted_low_space_count", 0)
+                    )
+                    if evicted > 0 or res.get("low_space_after"):
+                        logger.info(
+                            "Sandbox lifecycle sweep (%s): evicted=%s (expired=%s, low_space=%s), "
+                            "reclaimed=%.2f MiB, free=%.2f GiB (%.1f%%)",
+                            res.get("sandbox_state_dir"),
+                            evicted,
+                            res.get("deleted_expired_count"),
+                            res.get("deleted_low_space_count"),
+                            float(res.get("reclaimed_bytes", 0)) / (1024 * 1024),
+                            float(res.get("free_gb", 0.0)),
+                            float(res.get("free_percent", 0.0)),
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Sandbox lifecycle cleanup sweep failed")
+                await asyncio.sleep(max(10.0, float(self.config.sandbox_cleanup_interval_seconds)))
+        except asyncio.CancelledError:
+            return
+
     async def stop(self) -> None:
+        if self._cleanup_task is not None:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._cleanup_task = None
         self.sessions.flush_all()
         if self._loopback_server is not None:
             self._loopback_server.close()
@@ -473,6 +514,14 @@ class GatewayServer:
                     "protected_paths": self.config.protected_paths,
                     "default_workdir": self.config.default_workdir,
                     "isolate_mount_namespace": self.config.isolate_mount_namespace,
+                    "max_concurrent_agy": self.config.max_concurrent_agy,
+                    "max_concurrent_codex": self.config.max_concurrent_codex,
+                    "default_timeout_seconds": self.config.default_timeout_seconds,
+                    "agent_default_timeout_seconds": self.config.agent_default_timeout_seconds,
+                    "max_timeout_seconds": self.config.max_timeout_seconds,
+                    "agy_queue_timeout_seconds": self.config.agy_queue_timeout_seconds,
+                    "sandbox_state_dir": self.config.sandbox_state_dir,
+                    "sandbox_lifecycle": self.sessions.get_sandbox_lifecycle_info(),
                     "agy_binary": self.config.agy_binary,
                     "agy_default_skip_permissions": self.config.agy_default_skip_permissions,
                     "agy_default_sandbox": self.config.agy_default_sandbox,

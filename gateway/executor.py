@@ -32,7 +32,11 @@ from typing import (
 
 from .config import GatewayConfig
 from .policy import CommandPolicy
-from .sandbox import build_mount_ns_argv
+from .sandbox import (
+    build_mount_ns_argv,
+    cleanup_sandbox_state,
+    get_sandbox_disk_status,
+)
 
 STREAM_LINE_LIMIT = 16 * 1024 * 1024  # 16 MiB asyncio StreamReader buffer limit
 _PERSISTED_TAIL_CHARS = 65536  # Max stdout/stderr characters retained in on-disk session ledger
@@ -378,9 +382,10 @@ class ExecutionSession:
             self.status = "queued"
             if initial_stdin is not None:
                 self._pending_stdin.append((initial_stdin.encode("utf-8"), close_stdin))
+            slot_kind = "codex" if self.is_codex else "agy"
             self._emit(
                 "queued",
-                {"message": "Waiting for available agy concurrency slot", "cwd": self.cwd},
+                {"message": f"Waiting for available {slot_kind} concurrency slot", "cwd": self.cwd},
             )
             self._notify_persist(force=True)
             self._watch_tasks.append(
@@ -1129,6 +1134,9 @@ class SessionManager:
         self._sessions: Dict[str, ExecutionSession] = {}
         self._persisted: Dict[str, PersistedSession] = {}
         self._agy_sem = asyncio.Semaphore(max(1, config.max_concurrent_agy))
+        self._codex_sem = asyncio.Semaphore(max(1, config.max_concurrent_codex))
+        self._sandbox_cleanup_lock = asyncio.Lock()
+        self._last_sandbox_cleanup: Optional[Dict[str, Any]] = None
         self._state_dir: Optional[Path] = (
             Path(config.session_state_dir).expanduser()
             if config.session_state_dir
@@ -1277,6 +1285,38 @@ class SessionManager:
             self._write_ledger_record(s.session_id, s.to_persisted_dict())
         self._prune_ledger_files()
 
+    def get_sandbox_lifecycle_info(self) -> Dict[str, Any]:
+        """Return configured sandbox storage location, disk status, retention rules, and last sweep."""
+        disk = get_sandbox_disk_status(
+            self.config.sandbox_state_dir,
+            low_space_free_gb=self.config.sandbox_low_space_free_gb,
+            low_space_free_percent=self.config.sandbox_low_space_free_percent,
+        )
+        return {
+            **disk,
+            "cleanup_enabled": self.config.sandbox_cleanup_enabled,
+            "cleanup_interval_seconds": self.config.sandbox_cleanup_interval_seconds,
+            "max_retention_days": self.config.sandbox_max_retention_days,
+            "min_retention_days": self.config.sandbox_min_retention_days,
+            "low_space_free_gb": self.config.sandbox_low_space_free_gb,
+            "low_space_free_percent": self.config.sandbox_low_space_free_percent,
+            "last_cleanup": self._last_sandbox_cleanup,
+        }
+
+    async def run_sandbox_cleanup(self) -> Dict[str, Any]:
+        """Run non-blocking sandbox LRU lifecycle sweep in a worker thread."""
+        async with self._sandbox_cleanup_lock:
+            summary = await asyncio.to_thread(
+                cleanup_sandbox_state,
+                self.config.sandbox_state_dir,
+                self.config.sandbox_max_retention_days,
+                self.config.sandbox_min_retention_days,
+                self.config.sandbox_low_space_free_gb,
+                self.config.sandbox_low_space_free_percent,
+            )
+            self._last_sandbox_cleanup = summary
+            return summary
+
     def _prepare_env(self, extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         env = {
             k: v
@@ -1292,6 +1332,15 @@ class SessionManager:
         env["PATH"] = os.pathsep.join(parts)
         if env.get("TERM") in (None, "", "dumb"):
             env["TERM"] = "xterm-256color"
+        if self.config.isolate_mount_namespace:
+            env["TMPDIR"] = "/tmp"
+        elif self.config.sandbox_state_dir:
+            try:
+                sb_tmp_p = Path(self.config.sandbox_state_dir).expanduser().resolve() / "tmp"
+                sb_tmp_p.mkdir(parents=True, exist_ok=True)
+                env["TMPDIR"] = str(sb_tmp_p)
+            except OSError:
+                pass
         if extra_env:
             for k, v in extra_env.items():
                 env[str(k)] = str(v)
@@ -1457,6 +1506,7 @@ class SessionManager:
                 is_agy=is_agy,
                 is_codex=is_codex,
                 readonly_subpaths=readonly_subpaths,
+                sandbox_state_dir=self.config.sandbox_state_dir,
             )
 
         self._cleanup_old_sessions()
@@ -1530,6 +1580,11 @@ class SessionManager:
             cwd=cwd, add_dirs=add_dirs
         )
         is_stream_json = output_format == "stream-json" or "--output-format=stream-json" in argv
+        eff_timeout = (
+            self.config.agent_default_timeout_seconds
+            if timeout is None
+            else float(timeout)
+        )
         return await self.create_session(
             command=argv,
             cwd=cwd,
@@ -1537,7 +1592,7 @@ class SessionManager:
             shell=False,
             use_pty=use_pty,
             stream_json=is_stream_json,
-            timeout=timeout,
+            timeout=eff_timeout,
             initial_stdin=initial_stdin,
             close_stdin=close_stdin,
             slot_sem=self._agy_sem,
@@ -1595,7 +1650,11 @@ class SessionManager:
             for k, v in env.items():
                 merged_env[str(k)] = str(v)
         is_stream_json = json_events or "--json" in argv
-        eff_timeout = 1800.0 if timeout is None else float(timeout)
+        eff_timeout = (
+            self.config.agent_default_timeout_seconds
+            if timeout is None
+            else float(timeout)
+        )
         return await self.create_session(
             command=argv,
             cwd=cwd,
@@ -1606,7 +1665,7 @@ class SessionManager:
             timeout=eff_timeout,
             initial_stdin=initial_stdin,
             close_stdin=close_stdin,
-            slot_sem=self._agy_sem,
+            slot_sem=self._codex_sem,
             queue_timeout=self.config.agy_queue_timeout_seconds,
             is_codex=True,
             readonly_subpaths=ro_hook_dirs,

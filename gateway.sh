@@ -99,6 +99,39 @@ if "codex_extra_writable_roots" not in d:
 if not d.get("codex_env_file"):
     d["codex_env_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "codex.env")
     changed = True
+if d.get("max_concurrent_codex") is None or int(d.get("max_concurrent_codex") or 0) <= 2:
+    d["max_concurrent_codex"] = 6
+    changed = True
+default_sb = "/mnt/data/dots-sandbox" if pathlib.Path("/mnt/data").is_dir() and os.access("/mnt/data", os.W_OK | os.X_OK) else (
+    "/mnt/data/dots-sandbox" if pathlib.Path("/mnt/data/dots-sandbox").is_dir() and os.access("/mnt/data/dots-sandbox", os.W_OK | os.X_OK)
+    else str(pathlib.Path.home() / ".cache" / "dots-sandbox")
+)
+if not d.get("sandbox_state_dir"):
+    d["sandbox_state_dir"] = default_sb
+    changed = True
+for sb_k, sb_v in (
+    ("sandbox_cleanup_enabled", True),
+    ("sandbox_cleanup_interval_seconds", 3600.0),
+    ("sandbox_max_retention_days", 30.0),
+    ("sandbox_min_retention_days", 7.0),
+    ("sandbox_low_space_free_gb", 8.0),
+    ("sandbox_low_space_free_percent", 15.0),
+):
+    if d.get(sb_k) is None:
+        d[sb_k] = sb_v
+        changed = True
+if d.get("agent_default_timeout_seconds") is None or float(d.get("agent_default_timeout_seconds") or 0) < 21600.0:
+    d["agent_default_timeout_seconds"] = 28800.0
+    changed = True
+if d.get("default_timeout_seconds") is None or float(d.get("default_timeout_seconds") or 0) <= 600.0:
+    d["default_timeout_seconds"] = 21600.0
+    changed = True
+if d.get("max_timeout_seconds") is None or float(d.get("max_timeout_seconds") or 0) <= 7200.0:
+    d["max_timeout_seconds"] = 86400.0
+    changed = True
+if d.get("agy_queue_timeout_seconds") is None or float(d.get("agy_queue_timeout_seconds") or 0) <= 1800.0:
+    d["agy_queue_timeout_seconds"] = 28800.0
+    changed = True
 ac = d.get("allowed_commands")
 if isinstance(ac, list):
     for c in ("codex", d["codex_binary"], "node", "npm", "npx", "pnpm", "pnpx", "corepack", "terraform", "trivy"):
@@ -376,6 +409,27 @@ cmd_status() {
   echo "============================================================================"
   echo "  Gateway Service  : ${SERVICE_NAME} (${state}) | PID=${pid} (${mem_mib})"
   echo "  Workspace Jail   : ${wdir} (mount_ns=${mns}, agy_sandbox=${sbx})"
+  local sb_info
+  sb_info="$(python3 - "${CONFIG_FILE}" <<'PY'
+import json, os, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+d = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+sb_dir = d.get("sandbox_state_dir") or ("/mnt/data/dots-sandbox" if pathlib.Path("/mnt/data/dots-sandbox").is_dir() else str(pathlib.Path.home() / ".cache" / "dots-sandbox"))
+min_d = d.get("sandbox_min_retention_days", 7)
+max_d = d.get("sandbox_max_retention_days", 30)
+max_agy = d.get("max_concurrent_agy", 3)
+max_cdx = d.get("max_concurrent_codex", 6)
+agt_to_h = float(d.get("agent_default_timeout_seconds", 28800.0)) / 3600.0
+max_to_h = float(d.get("max_timeout_seconds", 86400.0)) / 3600.0
+try:
+    st = os.statvfs(sb_dir if os.path.exists(sb_dir) else os.path.dirname(sb_dir))
+    free_gb = (st.f_frsize * st.f_bavail) / (1024 ** 3)
+    print(f"{sb_dir} (free={free_gb:.1f} GiB, retention={min_d:g}d..{max_d:g}d, agy={max_agy}, codex={max_cdx}, timeout={agt_to_h:g}h..{max_to_h:g}h)")
+except OSError:
+    print(f"{sb_dir} (retention={min_d:g}d..{max_d:g}d, agy={max_agy}, codex={max_cdx}, timeout={agt_to_h:g}h..{max_to_h:g}h)")
+PY
+)"
+  echo "  Sandbox Store    : ${sb_info}"
   local codex_ver codex_auth_state
   codex_ver="$(/usr/local/bin/codex --version 2>/dev/null || echo 'not installed')"
   if is_codex_auth_configured; then
