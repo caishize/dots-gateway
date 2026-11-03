@@ -369,7 +369,15 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
             self.assertFalse(status_call["result"]["isError"])
-            self.assertTrue(status_call["result"]["structuredContent"]["tls_enabled"])
+            sc_status = status_call["result"]["structuredContent"]
+            self.assertTrue(sc_status["tls_enabled"])
+            self.assertIn("allowed_commands", sc_status)
+            self.assertIn("set", sc_status["allowed_commands"])
+            self.assertEqual(
+                sc_status["allowed_commands_count"], len(sc_status["allowed_commands"])
+            )
+            self.assertIn("blocked_commands", sc_status)
+            self.assertIn("systemd-run", sc_status["blocked_commands"])
 
             exec_call = await _rpc(
                 {

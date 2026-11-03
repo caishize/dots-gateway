@@ -488,6 +488,27 @@ class GatewayConfig:
         codex_home_str = str(Path.home() / ".codex")
         if cfg.protected_paths and codex_home_str not in cfg.protected_paths:
             cfg.protected_paths.append(codex_home_str)
+        for b_cmd in DEFAULT_BLOCKED_COMMANDS:
+            if b_cmd not in cfg.blocked_commands and b_cmd not in cfg.allowed_commands:
+                cfg.blocked_commands.append(b_cmd)
+        if "bash" in cfg.allowed_commands or "sh" in cfg.allowed_commands:
+            for sh_builtin in (
+                "cd",
+                "set",
+                "export",
+                "unset",
+                "true",
+                "false",
+                "test",
+                "[",
+                "source",
+                ".",
+            ):
+                if (
+                    sh_builtin not in cfg.allowed_commands
+                    and sh_builtin not in cfg.blocked_commands
+                ):
+                    cfg.allowed_commands.append(sh_builtin)
         if "agy" in cfg.allowed_commands:
             for c_cmd in ("codex", cfg.codex_binary):
                 if c_cmd and c_cmd not in cfg.allowed_commands and c_cmd not in cfg.blocked_commands:

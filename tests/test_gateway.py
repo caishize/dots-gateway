@@ -961,6 +961,94 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 "Detached grandchild inside bwrap --unshare-pid --die-with-parent must be killed when leader exits",
             )
 
+    async def test_legacy_config_set_backfill_and_shell_set_security(self) -> None:
+        legacy_cfg_path = Path(self.tmpdir) / "legacy_config.json"
+        legacy_cfg_path.write_text(
+            json.dumps(
+                {
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "api_tokens": ["legacy-tok"],
+                    "allowed_workdirs": [self.tmpdir],
+                    "default_workdir": self.tmpdir,
+                    "allowed_commands": ["bash", "sh", "python3", "git", "echo"],
+                    "blocked_commands": ["sudo", "docker"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        loaded_cfg = GatewayConfig.load(legacy_cfg_path)
+        self.assertIn("set", loaded_cfg.allowed_commands)
+        self.assertIn("systemd-run", loaded_cfg.blocked_commands)
+
+        # Minimal non-shell custom allowlist must NOT be bloated with shell builtins
+        minimal_cfg_path = Path(self.tmpdir) / "minimal_config.json"
+        minimal_cfg_path.write_text(
+            json.dumps(
+                {
+                    "allowed_commands": ["python3"],
+                    "blocked_commands": ["sudo"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        minimal_cfg = GatewayConfig.load(minimal_cfg_path)
+        self.assertNotIn("set", minimal_cfg.allowed_commands)
+        self.assertIn("systemd-run", minimal_cfg.blocked_commands)
+
+        # Operator explicit block of 'set' must be respected
+        blocked_set_path = Path(self.tmpdir) / "blocked_set_config.json"
+        blocked_set_path.write_text(
+            json.dumps(
+                {
+                    "allowed_commands": ["bash", "python3"],
+                    "blocked_commands": ["sudo", "set"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        blocked_set_cfg = GatewayConfig.load(blocked_set_path)
+        self.assertNotIn("set", blocked_set_cfg.allowed_commands)
+
+        legacy_srv = GatewayServer(loaded_cfg)
+        h, p = await legacy_srv.start()
+        try:
+            client = DotsGatewayClient(base_url=f"http://{h}:{p}", token="legacy-tok")
+            manifest_script = (
+                "set -e\n"
+                "python3 - <<'PY'\n"
+                "import hashlib, json\n"
+                "payload = b'super-ai-manifest-ok'\n"
+                "print(json.dumps({'ok': True, 'sha256': hashlib.sha256(payload).hexdigest()[:12]}))\n"
+                "PY\n"
+            )
+            res_ok = await asyncio.to_thread(
+                client.exec_command, manifest_script, cwd=self.tmpdir
+            )
+            self.assertEqual(res_ok["returncode"], 0, res_ok["stderr"])
+            self.assertTrue(json.loads(res_ok["stdout"].strip())["ok"])
+
+            res_pos = await asyncio.to_thread(
+                client.exec_command,
+                'set -- alpha beta && echo "$1:$2"',
+                cwd=self.tmpdir,
+            )
+            self.assertEqual(res_pos["returncode"], 0, res_pos["stderr"])
+            self.assertEqual(res_pos["stdout"].strip(), "alpha:beta")
+
+            for bad_set_cmd in [
+                f"set -- {GATEWAY_ROOT / 'config.json'}",
+                "set -- ../outside_workspace",
+                'set -- sudo; "$1" id',
+            ]:
+                with self.assertRaises(RuntimeError) as ctx:
+                    await asyncio.to_thread(
+                        client.exec_command, bad_set_cmd, cwd=self.tmpdir
+                    )
+                self.assertIn("403", str(ctx.exception), f"Expected 403 for {bad_set_cmd!r}")
+        finally:
+            await legacy_srv.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

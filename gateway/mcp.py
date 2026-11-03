@@ -57,7 +57,8 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "title": "Check Remote Gateway Status & Policy",
         "description": (
             "Return live health diagnostics, uptime, active sessions, default working directory, "
-            "allowed workspace roots, and command policy of the remote development gateway."
+            "allowed workspace roots, and command policy (including `allowed_commands` and "
+            "`blocked_commands`) of the remote development gateway."
         ),
         "inputSchema": {
             "type": "object",
@@ -1059,6 +1060,8 @@ class MCPHandler:
                     "isolate_mount_namespace": self.config.isolate_mount_namespace,
                     "enforce_allowlist": self.config.enforce_allowlist,
                     "allowed_commands_count": len(self.config.allowed_commands),
+                    "allowed_commands": list(self.config.allowed_commands),
+                    "blocked_commands": list(self.config.blocked_commands),
                     "agy_binary": self.config.agy_binary,
                     "agy_default_skip_permissions": self.config.agy_default_skip_permissions,
                     "agy_default_sandbox": self.config.agy_default_sandbox,
