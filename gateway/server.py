@@ -529,6 +529,7 @@ class GatewayServer:
                     "agy_include_allowed_workdirs": self.config.agy_include_allowed_workdirs,
                     "agy_readonly_roots": self.policy.get_agy_readonly_roots(),
                     "agy_writable_roots": self.policy.get_agy_writable_roots(),
+                    "agy_auth": self.sessions.get_agy_auth_info(),
                     "codex_binary": self.config.codex_binary,
                     "codex_default_skip_permissions": self.config.codex_default_skip_permissions,
                     "codex_default_sandbox": self.config.codex_default_sandbox,

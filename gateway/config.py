@@ -372,6 +372,7 @@ class GatewayConfig:
     agy_include_allowed_workdirs: bool = True
     agy_extra_workspace_dirs: List[str] = field(default_factory=list)
     agy_extra_readonly_roots: List[str] = field(default_factory=list)
+    agy_env_file: str = str(Path.home() / ".config" / "dots-gateway" / "agy.env")
     codex_binary: str = DEFAULT_CODEX_BIN
     bwrap_binary: str = DEFAULT_BWRAP_BIN
     codex_default_skip_permissions: bool = True
@@ -485,6 +486,8 @@ class GatewayConfig:
                 for x in os.environ["GATEWAY_AGY_READONLY_ROOTS"].split(",")
                 if x.strip()
             ]
+        if os.environ.get("GATEWAY_AGY_ENV_FILE"):
+            cfg.agy_env_file = os.environ["GATEWAY_AGY_ENV_FILE"].strip()
         if os.environ.get("GATEWAY_CODEX_BIN"):
             cfg.codex_binary = os.environ["GATEWAY_CODEX_BIN"]
         if os.environ.get("GATEWAY_BWRAP_BIN"):

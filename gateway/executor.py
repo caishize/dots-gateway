@@ -208,6 +208,8 @@ _STRIPPED_ENV_KEYS = {
     "OPENAI_API_" + "KEY",
     "CODEX_API_" + "KEY",
     "CODEX_ACCESS_TOKEN",
+    "AGY_ADC_AUTH",
+    "GOOGLE_CLOUD_QUOTA_PROJECT",
 }
 
 
@@ -1355,6 +1357,76 @@ class SessionManager:
                 env[np_key] = ",".join(existing_np)
         return env
 
+    def _load_agy_env(self) -> Dict[str, str]:
+        """Load hot-reloadable Antigravity (`agy`) auth/env overrides from `agy_env_file` (`0600`)."""
+        out: Dict[str, str] = {}
+        raw_path = (self.config.agy_env_file or "").strip()
+        if not raw_path:
+            return out
+        env_p = Path(raw_path).expanduser()
+        if not env_p.is_file():
+            return out
+        try:
+            for raw_line in env_p.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("unset "):
+                    ukey = line[6:].strip()
+                    if ukey:
+                        out.pop(ukey, None)
+                    continue
+                if "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                if not k:
+                    continue
+                if v:
+                    out[k] = v
+                else:
+                    out.pop(k, None)
+        except OSError:
+            pass
+        if "AGY_ADC_AUTH" in out and out["AGY_ADC_AUTH"].strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            out.pop("AGY_ADC_AUTH", None)
+            out.pop("GOOGLE_CLOUD_QUOTA_PROJECT", None)
+        return out
+
+    def get_agy_auth_info(self) -> Dict[str, Any]:
+        """Return live Antigravity (`agy`) authentication mode & ADC status from `agy.env`."""
+        env_map = self._load_agy_env()
+        adc_raw = env_map.get("AGY_ADC_AUTH", "").strip().lower()
+        adc_enabled = adc_raw in ("1", "true", "yes", "on")
+        quota_project = env_map.get("GOOGLE_CLOUD_QUOTA_PROJECT") or None
+        adc_json = (
+            Path.home()
+            / ".config"
+            / "gcloud"
+            / "application_default_credentials.json"
+        )
+        try:
+            adc_creds_present = adc_json.is_file() and adc_json.stat().st_size > 10
+        except OSError:
+            adc_creds_present = False
+        return {
+            "mode": "adc" if adc_enabled else "oauth",
+            "adc_enabled": adc_enabled,
+            "quota_project": quota_project,
+            "adc_credentials_present": adc_creds_present,
+            "env_file": self.config.agy_env_file,
+        }
+
     def _load_codex_env(self) -> Dict[str, str]:
         """Load isolated Codex credentials/env overrides from `codex_env_file` (`0600`)."""
         out: Dict[str, str] = {}
@@ -1579,6 +1651,20 @@ class SessionManager:
         _, ro_hook_dirs = self.policy.resolve_codex_git_metadata_dirs(
             cwd=cwd, add_dirs=add_dirs
         )
+        merged_env = self._load_agy_env()
+        if env:
+            for k, v in env.items():
+                ks = str(k)
+                vs = "" if v is None else str(v)
+                if not vs or (
+                    ks == "AGY_ADC_AUTH"
+                    and vs.strip().lower() in ("0", "false", "no", "off")
+                ):
+                    merged_env.pop(ks, None)
+                    if ks == "AGY_ADC_AUTH":
+                        merged_env.pop("GOOGLE_CLOUD_QUOTA_PROJECT", None)
+                else:
+                    merged_env[ks] = vs
         is_stream_json = output_format == "stream-json" or "--output-format=stream-json" in argv
         eff_timeout = (
             self.config.agent_default_timeout_seconds
@@ -1588,7 +1674,7 @@ class SessionManager:
         return await self.create_session(
             command=argv,
             cwd=cwd,
-            env=env,
+            env=merged_env,
             shell=False,
             use_pty=use_pty,
             stream_json=is_stream_json,

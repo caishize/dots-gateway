@@ -24,6 +24,7 @@ CONFIG_FILE="${GATEWAY_DIR}/config.json"
 CLIENT_CONFIG_DIR="${HOME}/.config/dots-gateway"
 TUNNEL_ENV_FILE="${CLIENT_CONFIG_DIR}/tunnel.env"
 CODEX_ENV_FILE="${CLIENT_CONFIG_DIR}/codex.env"
+AGY_ENV_FILE="${CLIENT_CONFIG_DIR}/agy.env"
 TUNNEL_HEALTH_URL="http://127.0.0.1:18766"
 
 is_tunnel_configured() {
@@ -98,6 +99,9 @@ if "codex_extra_writable_roots" not in d:
     changed = True
 if not d.get("codex_env_file"):
     d["codex_env_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "codex.env")
+    changed = True
+if not d.get("agy_env_file"):
+    d["agy_env_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "agy.env")
     changed = True
 if d.get("max_concurrent_codex") is None or int(d.get("max_concurrent_codex") or 0) <= 2:
     d["max_concurrent_codex"] = 6
@@ -430,14 +434,39 @@ except OSError:
 PY
 )"
   echo "  Sandbox Store    : ${sb_info}"
-  local codex_ver codex_auth_state
+  local agy_auth_summary codex_ver codex_auth_state
+  agy_auth_summary="$(python3 - "${AGY_ENV_FILE}" <<'PY'
+import pathlib, sys
+env_p = pathlib.Path(sys.argv[1])
+vals = {}
+if env_p.is_file():
+    for raw in env_p.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("unset "):
+            vals.pop(s[6:].strip(), None)
+            continue
+        if s.startswith("export "):
+            s = s[7:].strip()
+        if "=" in s:
+            k, v = s.split("=", 1)
+            vals[k.strip()] = v.strip().strip("'").strip('"')
+adc_on = vals.get("AGY_ADC_AUTH", "").lower() in ("1", "true", "yes", "on")
+proj = vals.get("GOOGLE_CLOUD_QUOTA_PROJECT", "")
+if adc_on:
+    print(f"auth=adc{f', project={proj}' if proj else ''}")
+else:
+    print("auth=oauth")
+PY
+)"
   codex_ver="$(/usr/local/bin/codex --version 2>/dev/null || echo 'not installed')"
   if is_codex_auth_configured; then
     codex_auth_state="auth=configured"
   else
     codex_auth_state="auth=pending (run 'dots-gateway codex-setup')"
   fi
-  echo "  Local Agents     : agy + ${codex_ver} (${codex_auth_state})"
+  echo "  Local Agents     : agy (${agy_auth_summary}) + ${codex_ver} (${codex_auth_state})"
 
   if is_tunnel_configured; then
     local t_state t_pid t_ready t_id
@@ -819,6 +848,197 @@ cmd_codex_setup() {
   echo "✅ Codex CLI 凭证已安全保存至 ${CODEX_ENV_FILE} (0600) 及 ~/.codex/auth.json (即时生效，无需重启网关)。"
 }
 
+cmd_agy_auth() {
+  ensure_local_client_json
+  mkdir -p "${CLIENT_CONFIG_DIR}"
+  chmod 700 "${CLIENT_CONFIG_DIR}"
+
+  local subcmd="${1:-}"
+  local arg_proj="${2:-}"
+
+  # Read current state and auto-detect quota project
+  local cur_mode cur_proj adc_file_status adc_json_proj
+  IFS='|' read -r cur_mode cur_proj adc_file_status adc_json_proj <<<"$(python3 - "${AGY_ENV_FILE}" <<'PY'
+import json, os, pathlib, sys
+env_p = pathlib.Path(sys.argv[1])
+vals = {}
+last_proj = ""
+if env_p.is_file():
+    for raw in env_p.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = raw.strip()
+        if s.startswith("# LAST_QUOTA_PROJECT="):
+            last_proj = s.split("=", 1)[1].strip()
+            continue
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("unset "):
+            vals.pop(s[6:].strip(), None)
+            continue
+        if s.startswith("export "):
+            s = s[7:].strip()
+        if "=" in s:
+            k, v = s.split("=", 1)
+            vals[k.strip()] = v.strip().strip("'").strip('"')
+
+adc_json = pathlib.Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+adc_ok = "missing"
+json_proj = ""
+if adc_json.is_file():
+    try:
+        d = json.loads(adc_json.read_text(encoding="utf-8"))
+        adc_ok = f"present ({d.get('type', 'unknown')})"
+        json_proj = str(d.get("quota_project_id") or "").strip()
+    except Exception:
+        adc_ok = "present"
+
+adc_on = vals.get("AGY_ADC_AUTH", "").lower() in ("1", "true", "yes", "on")
+mode = "adc" if adc_on else "oauth"
+proj = vals.get("GOOGLE_CLOUD_QUOTA_PROJECT") or last_proj or json_proj or os.environ.get("GOOGLE_CLOUD_QUOTA_PROJECT", "")
+print(f"{mode}|{proj}|{adc_ok}|{json_proj}")
+PY
+)"
+
+  print_agy_auth_status() {
+    echo "============================================================================"
+    echo "  Antigravity CLI (agy) Authentication Profile (Hot-Reload / 免重启切换)"
+    echo "============================================================================"
+    if [[ "${cur_mode}" == "adc" ]]; then
+      echo "  Current Mode     : ADC (Google Cloud Application Default Credentials)"
+      echo "  AGY_ADC_AUTH     : true"
+      echo "  Quota Project    : ${cur_proj:-<unset>}"
+    else
+      echo "  Current Mode     : OAuth (Default ~/.gemini OAuth login)"
+      echo "  AGY_ADC_AUTH     : <unset>"
+      echo "  Saved ADC Project: ${cur_proj:-<unset>}"
+    fi
+    echo "  ADC Credentials  : ~/.config/gcloud/application_default_credentials.json (${adc_file_status})"
+    echo "  Hot-Reload File  : ${AGY_ENV_FILE}"
+    echo "----------------------------------------------------------------------------"
+    echo "  快速切换命令 (即时生效，无需重启网关):"
+    echo "    ${PROG_NAME} agy-auth adc [PROJECT_ID]  # 切换为 Google Cloud ADC 认证"
+    echo "    ${PROG_NAME} agy-auth oauth             # 切换回默认 OAuth 认证"
+    echo "    ${PROG_NAME} agy-auth toggle            # 在 ADC 与 OAuth 之间一键切换"
+    echo "    ${PROG_NAME} agy-auth status            # 查看当前认证状态"
+    echo "============================================================================"
+  }
+
+  if [[ -z "${subcmd}" ]]; then
+    print_agy_auth_status
+    if [[ ! -t 0 ]]; then
+      return 0
+    fi
+    local choice=""
+    read -rp "请选择要切换的认证模式 [1=ADC, 2=OAuth, t=一键切换, 直接回车保持不变]: " choice
+    choice="$(printf "%s" "${choice}" | tr -d '[:space:]')"
+    case "${choice}" in
+      1|adc|ADC) subcmd="adc" ;;
+      2|oauth|OAUTH) subcmd="oauth" ;;
+      t|T|toggle|switch) subcmd="toggle" ;;
+      "") return 0 ;;
+      *)
+        echo "ERROR: 无效选项 '${choice}'" >&2
+        exit 1
+        ;;
+    esac
+  fi
+
+  case "${subcmd}" in
+    status|show|info)
+      print_agy_auth_status
+      return 0
+      ;;
+    toggle|switch)
+      if [[ "${cur_mode}" == "adc" ]]; then
+        subcmd="oauth"
+      else
+        subcmd="adc"
+      fi
+      ;;
+  esac
+
+  case "${subcmd}" in
+    adc|gcloud|on|enable)
+      local target_proj="${arg_proj:-${cur_proj:-${adc_json_proj:-}}}"
+      if [[ -z "${target_proj}" ]] && command -v gcloud >/dev/null 2>&1; then
+        target_proj="$(gcloud config get-value project 2>/dev/null | tr -d '[:space:]' || true)"
+        [[ "${target_proj}" == "(unset)" ]] && target_proj=""
+      fi
+      if [[ -z "${target_proj}" && -t 0 ]]; then
+        read -rp "请输入 GOOGLE_CLOUD_QUOTA_PROJECT (例如 my-gcp-project): " target_proj
+        target_proj="$(printf "%s" "${target_proj}" | tr -d '[:space:]')"
+      fi
+      umask 077
+      {
+        printf "# Isolated Antigravity CLI (agy) auth profile (0600, hot-reloaded per run_agy session)\n"
+        printf "# Mode: adc\n"
+        if [[ -n "${target_proj}" ]]; then
+          printf "# LAST_QUOTA_PROJECT=%s\n" "${target_proj}"
+        fi
+        printf "export AGY_ADC_AUTH=true\n"
+        if [[ -n "${target_proj}" ]]; then
+          printf "export GOOGLE_CLOUD_QUOTA_PROJECT=%s\n" "${target_proj}"
+        fi
+      } > "${AGY_ENV_FILE}"
+      chmod 600 "${AGY_ENV_FILE}"
+      cur_mode="adc"
+      cur_proj="${target_proj}"
+      ;;
+    oauth|default|off|disable|reset)
+      umask 077
+      {
+        printf "# Isolated Antigravity CLI (agy) auth profile (0600, hot-reloaded per run_agy session)\n"
+        printf "# Mode: oauth\n"
+        if [[ -n "${cur_proj}" ]]; then
+          printf "# LAST_QUOTA_PROJECT=%s\n" "${cur_proj}"
+        fi
+        printf "unset AGY_ADC_AUTH\n"
+        printf "unset GOOGLE_CLOUD_QUOTA_PROJECT\n"
+      } > "${AGY_ENV_FILE}"
+      chmod 600 "${AGY_ENV_FILE}"
+      cur_mode="oauth"
+      ;;
+    *)
+      echo "ERROR: 未知的 agy-auth 子命令 '${subcmd}' (可选: adc | oauth | toggle | status)" >&2
+      exit 1
+      ;;
+  esac
+
+  # Ensure ~/.bashrc dynamically sources ~/.config/dots-gateway/agy.env instead of hardcoding exports
+  python3 - "${HOME}/.bashrc" "${AGY_ENV_FILE}" <<'PY'
+import pathlib, re, sys
+rc_p = pathlib.Path(sys.argv[1])
+if not rc_p.is_file():
+    raise SystemExit(0)
+raw = rc_p.read_text(encoding="utf-8")
+lines = []
+for ln in raw.splitlines():
+    s = ln.strip()
+    if re.match(r"^(export\s+)?(AGY_ADC_AUTH|GOOGLE_CLOUD_QUOTA_PROJECT)=", s):
+        continue
+    if s == "# Antigravity CLI auth profile (managed by 'dots-gateway agy-auth')":
+        continue
+    if "dots-gateway/agy.env" in s:
+        continue
+    lines.append(ln)
+while lines and not lines[-1].strip():
+    lines.pop()
+lines.append("")
+lines.append("# Antigravity CLI auth profile (managed by 'dots-gateway agy-auth')")
+lines.append('[ -f "$HOME/.config/dots-gateway/agy.env" ] && . "$HOME/.config/dots-gateway/agy.env"')
+rc_p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+
+  if [[ "${cur_mode}" == "adc" ]]; then
+    if [[ ! -f "${HOME}/.config/gcloud/application_default_credentials.json" ]]; then
+      echo "⚠️  提示: 未检测到 ~/.config/gcloud/application_default_credentials.json，请先执行 'gcloud auth application-default login'。" >&2
+    fi
+    echo "✅ Antigravity (agy) 已切换为 [ADC 认证模式] (AGY_ADC_AUTH=true${cur_proj:+, GOOGLE_CLOUD_QUOTA_PROJECT=${cur_proj}}) — 网关侧即时生效，无需重启！"
+  else
+    echo "✅ Antigravity (agy) 已切换回 [默认 OAuth 认证模式] (已清除 AGY_ADC_AUTH) — 网关侧即时生效，无需重启！"
+  fi
+  echo "💡 当前交互终端如需同步更新环境变量，可执行: source ~/.bashrc"
+}
+
 cmd_config() {
   (cd "${GATEWAY_DIR}" && python3 main.py --print-plugin-config)
 }
@@ -848,6 +1068,7 @@ Dots Gateway & Secure MCP Tunnel 运维管理命令行 (${PROG_NAME})
 
 核心命令:
   tunnel-setup [ID]  交互式配置并启动 OpenAI 官方 Secure MCP Tunnel (tunnel-client 后台常驻)
+  agy-auth [mode]    免重启切换 Antigravity CLI 认证方式: adc [PROJECT_ID] | oauth | toggle | status
   codex-setup        交互式配置本机 OpenAI Codex CLI 的 API Key (0600 隔离存储，即时生效)
   start              启动网关服务 (及已配置的 Tunnel 服务) 并执行健康检查
   stop               停止网关与 Tunnel 后台服务
@@ -885,6 +1106,9 @@ case "${ACTION}" in
     ;;
   codex-setup|setup-codex)
     cmd_codex_setup "$@"
+    ;;
+  agy-auth|auth-agy|agy-setup|setup-agy)
+    cmd_agy_auth "$@"
     ;;
   start)
     cmd_start

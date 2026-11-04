@@ -1179,6 +1179,10 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             "    'has_ssh_dir': os.path.exists(os.path.expanduser('~/.ssh')),\n"
             f"    'has_gw_dir': os.path.exists({str(GATEWAY_ROOT)!r}),\n"
             "    'has_gw_cfg': os.path.exists(os.path.expanduser('~/.config/dots-gateway')),\n"
+            "    'has_gcloud_dir': os.path.isdir(os.path.expanduser('~/.config/gcloud')),\n"
+            "    'gcloud_dir_writable': os.access(os.path.expanduser('~/.config/gcloud'), os.W_OK) if os.path.isdir(os.path.expanduser('~/.config/gcloud')) else None,\n"
+            "    'agy_adc_auth': os.environ.get('AGY_ADC_AUTH'),\n"
+            "    'quota_project': os.environ.get('GOOGLE_CLOUD_QUOTA_PROJECT'),\n"
             "    'flutter_bin_writable': os.access('/opt/flutter/bin/flutter', os.W_OK) if os.path.exists('/opt/flutter/bin/flutter') else None,\n"
             "    'flutter_cache_writable': os.access('/opt/flutter/bin/cache', os.W_OK) if os.path.isdir('/opt/flutter/bin/cache') else None,\n"
             "}\n"
@@ -1187,6 +1191,13 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         )
         mock_agy.chmod(0o755)
 
+        agy_env = Path(self.tmpdir) / "isolated_agy.env"
+        agy_env.write_text(
+            "export AGY_ADC_AUTH=true\nexport GOOGLE_CLOUD_QUOTA_PROJECT=demo-gcp-project\n",
+            encoding="utf-8",
+        )
+        agy_env.chmod(0o600)
+
         agy_cfg = GatewayConfig(
             host="127.0.0.1",
             port=0,
@@ -1194,6 +1205,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
             agy_binary=str(mock_agy),
+            agy_env_file=str(agy_env),
             allowed_commands=["python3", "env", str(mock_agy)],
         )
         agy_srv = GatewayServer(agy_cfg)
@@ -1224,9 +1236,41 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(parsed["has_ssh_dir"])
             self.assertFalse(parsed["has_gw_dir"])
             self.assertFalse(parsed["has_gw_cfg"])
+            self.assertEqual(parsed["agy_adc_auth"], "true")
+            self.assertEqual(parsed["quota_project"], "demo-gcp-project")
+            if os.path.isdir(os.path.expanduser("~/.config/gcloud")):
+                self.assertTrue(parsed["has_gcloud_dir"])
+                self.assertFalse(parsed["gcloud_dir_writable"])
             for host in ("localhost", "127.0.0.1", "::1"):
                 self.assertIn(host, parsed["no_proxy"].split(","))
                 self.assertIn(host, parsed["no_proxy_lower"].split(","))
+
+            # Verify zero-restart hot-reload switching from ADC -> OAuth via agy_env_file
+            agy_env.write_text(
+                "unset AGY_ADC_AUTH\nunset GOOGLE_CLOUD_QUOTA_PROJECT\n",
+                encoding="utf-8",
+            )
+            resp_oauth, _ = await asyncio.to_thread(
+                client.mcp_request,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "agy-oauth",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "run_agy",
+                        "arguments": {
+                            "prompt": "verify oauth hot reload",
+                            "cwd": str(sub_ws),
+                        },
+                    },
+                },
+            )
+            self.assertFalse(resp_oauth["result"]["isError"], resp_oauth)
+            parsed_oauth = json.loads(
+                resp_oauth["result"]["structuredContent"]["stdout"].strip()
+            )
+            self.assertIsNone(parsed_oauth["agy_adc_auth"])
+            self.assertIsNone(parsed_oauth["quota_project"])
             if os.path.isdir("/opt/flutter/bin/cache"):
                 self.assertFalse(parsed["flutter_bin_writable"])
                 self.assertTrue(parsed["flutter_cache_writable"])

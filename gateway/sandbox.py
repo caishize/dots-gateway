@@ -353,6 +353,19 @@ def build_mount_ns_argv(
                     ]
                 )
 
+            # Read-only ~/.config/gcloud so `AGY_ADC_AUTH=true` can read application_default_credentials.json
+            gcloud_cfg_dir = os.path.join(home_dir, ".config", "gcloud")
+            if os.path.isdir(gcloud_cfg_dir):
+                q_gc_dir = shlex.quote(gcloud_cfg_dir)
+                q_dst_gc_dir = shlex.quote(f"{stage_dir}{gcloud_cfg_dir}")
+                lines.extend(
+                    [
+                        f"mkdir -p {q_dst_gc_dir}",
+                        f"{q_mount} --bind {q_gc_dir} {q_dst_gc_dir}",
+                        f"{q_mount} -o remount,bind,ro {q_dst_gc_dir} 2>/dev/null || {q_mount} -o bind,remount,ro {q_dst_gc_dir}",
+                    ]
+                )
+
         if is_codex:
             # OpenAI Codex CLI requires ~/.codex (for auth.json, config.toml, session history &
             # codex-linux-sandbox helper) while ~/gateway, ~/.gemini, ~/.ssh, and ~/.config/* stay hidden.

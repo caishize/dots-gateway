@@ -27,6 +27,7 @@
   "agy_default_sandbox": true,
   "agy_sandbox_tool_permission": "proceed-in-sandbox",
   "agy_extra_readonly_roots": [],
+  "agy_env_file": "/home/<your-user>/.config/dots-gateway/agy.env",
   "codex_binary": "/usr/local/bin/codex",
   "codex_default_skip_permissions": true,
   "codex_default_sandbox": "workspace-write",
