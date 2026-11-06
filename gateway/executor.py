@@ -1139,6 +1139,8 @@ class SessionManager:
         self._codex_sem = asyncio.Semaphore(max(1, config.max_concurrent_codex))
         self._sandbox_cleanup_lock = asyncio.Lock()
         self._last_sandbox_cleanup: Optional[Dict[str, Any]] = None
+        self._agy_models_lock = asyncio.Lock()
+        self._agy_models_cache: Optional[Tuple[float, Tuple[str, str], Dict[str, Any]]] = None
         self._state_dir: Optional[Path] = (
             Path(config.session_state_dir).expanduser()
             if config.session_state_dir
@@ -1419,13 +1421,119 @@ class SessionManager:
             adc_creds_present = adc_json.is_file() and adc_json.stat().st_size > 10
         except OSError:
             adc_creds_present = False
+        default_model, default_source = self.get_agy_default_model()
         return {
             "mode": "adc" if adc_enabled else "oauth",
             "adc_enabled": adc_enabled,
             "quota_project": quota_project,
             "adc_credentials_present": adc_creds_present,
             "env_file": self.config.agy_env_file,
+            "default_model": default_model,
+            "default_model_source": default_source,
         }
+
+    def get_agy_default_model(self) -> Tuple[Optional[str], str]:
+        """Return `(model, source)` used when callers omit `model` (hot-reloaded per call).
+
+        Precedence: `agy_model_file` (written by `dots-gateway agy-model`) >
+        `agy_default_model` (config.json) > agy's own `settings.json` selection.
+        """
+        raw_path = (self.config.agy_model_file or "").strip()
+        if raw_path:
+            model_p = Path(raw_path).expanduser()
+            try:
+                if model_p.is_file():
+                    for raw_line in model_p.read_text(encoding="utf-8").splitlines():
+                        cand = raw_line.strip()
+                        if cand and not cand.startswith("#"):
+                            return cand[:128], "agy_model_file"
+            except OSError:
+                pass
+        cfg_model = (self.config.agy_default_model or "").strip()
+        if cfg_model:
+            return cfg_model[:128], "config"
+        return None, "agy_settings"
+
+    async def list_agy_models(self, refresh: bool = False) -> Dict[str, Any]:
+        """List models available to `agy` under the current (hot-reloaded) auth profile.
+
+        Runs the fixed host-side command `agy models` (no caller-supplied arguments) and
+        caches results per `(auth_mode, quota_project)` for `agy_models_cache_seconds`.
+        """
+        auth = self.get_agy_auth_info()
+        cache_key = (str(auth.get("mode") or ""), str(auth.get("quota_project") or ""))
+        default_model, default_source = self.get_agy_default_model()
+        ttl = max(0.0, float(self.config.agy_models_cache_seconds or 0.0))
+
+        async with self._agy_models_lock:
+            now_m = time.monotonic()
+            cached = self._agy_models_cache
+            if (
+                not refresh
+                and cached is not None
+                and cached[1] == cache_key
+                and (now_m - cached[0]) < ttl
+            ):
+                payload = dict(cached[2])
+                payload["cached"] = True
+            else:
+                agy_bin = (
+                    self.config.agy_binary
+                    if os.path.exists(self.config.agy_binary)
+                    else "agy"
+                )
+                env = self._prepare_env(self._load_agy_env())
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        agy_bin,
+                        "models",
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env,
+                        cwd=str(Path.home()),
+                    )
+                    try:
+                        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                        raise RuntimeError("`agy models` timed out after 60s")
+                except FileNotFoundError as exc:
+                    raise RuntimeError(f"agy binary not found: {agy_bin}") from exc
+
+                out_txt = out_b.decode("utf-8", errors="replace")
+                err_txt = err_b.decode("utf-8", errors="replace")
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"`agy models` exited with code {proc.returncode}: "
+                        f"{(err_txt or out_txt).strip()[-500:]}"
+                    )
+                models: List[Dict[str, str]] = []
+                for line in out_txt.splitlines():
+                    if "\t" not in line:
+                        continue
+                    mid, _, mname = line.partition("\t")
+                    mid, mname = mid.strip(), mname.strip()
+                    if mid:
+                        models.append({"id": mid, "name": mname or mid})
+                payload = {
+                    "models": models,
+                    "auth_mode": cache_key[0],
+                    "quota_project": cache_key[1] or None,
+                    "fetched_at": time.time(),
+                    "cached": False,
+                }
+                self._agy_models_cache = (now_m, cache_key, dict(payload))
+
+        payload["default_model"] = default_model
+        payload["default_model_source"] = default_source
+        ids = {m["id"] for m in payload.get("models", [])}
+        names = {m["name"] for m in payload.get("models", [])}
+        payload["default_model_available"] = (
+            None if default_model is None else (default_model in ids or default_model in names)
+        )
+        return payload
 
     def _load_codex_env(self) -> Dict[str, str]:
         """Load isolated Codex credentials/env overrides from `codex_env_file` (`0600`)."""
@@ -1633,6 +1741,10 @@ class SessionManager:
         close_stdin: bool = True,
     ) -> ExecutionSession:
         """Create a dedicated `agy` session with `--dangerously-skip-permissions` enabled by default."""
+        if not model and not any(
+            str(a) == "--model" or str(a).startswith("--model=") for a in (args or [])
+        ):
+            model, _ = self.get_agy_default_model()
         argv = self.policy.build_agy_argv(
             prompt=prompt,
             args=args,

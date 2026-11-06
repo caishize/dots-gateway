@@ -501,6 +501,16 @@ class GatewayServer:
             await self._handle_http_mcp(req, writer)
             return
 
+        if req.method == "GET" and path == "/v1/agy/models":
+            refresh = str((query.get("refresh") or ["0"])[0]).lower() in ("1", "true", "yes")
+            try:
+                data = await self.sessions.list_agy_models(refresh=refresh)
+            except RuntimeError as exc:
+                await send_json_response(writer, 502, {"ok": False, "error": str(exc)})
+                return
+            await send_json_response(writer, 200, {"ok": True, **data})
+            return
+
         if req.method == "GET" and path == "/v1/policy":
             await send_json_response(
                 writer,

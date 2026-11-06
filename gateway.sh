@@ -25,6 +25,7 @@ CLIENT_CONFIG_DIR="${HOME}/.config/dots-gateway"
 TUNNEL_ENV_FILE="${CLIENT_CONFIG_DIR}/tunnel.env"
 CODEX_ENV_FILE="${CLIENT_CONFIG_DIR}/codex.env"
 AGY_ENV_FILE="${CLIENT_CONFIG_DIR}/agy.env"
+AGY_MODEL_FILE="${CLIENT_CONFIG_DIR}/agy.model"
 TUNNEL_HEALTH_URL="http://127.0.0.1:18766"
 
 is_tunnel_configured() {
@@ -102,6 +103,9 @@ if not d.get("codex_env_file"):
     changed = True
 if not d.get("agy_env_file"):
     d["agy_env_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "agy.env")
+    changed = True
+if not d.get("agy_model_file"):
+    d["agy_model_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "agy.model")
     changed = True
 if d.get("max_concurrent_codex") is None or int(d.get("max_concurrent_codex") or 0) <= 2:
     d["max_concurrent_codex"] = 6
@@ -466,7 +470,7 @@ PY
   else
     codex_auth_state="auth=pending (run 'dots-gateway codex-setup')"
   fi
-  echo "  Local Agents     : agy (${agy_auth_summary}) + ${codex_ver} (${codex_auth_state})"
+  echo "  Local Agents     : agy (${agy_auth_summary}, model=$(current_agy_model_label)) + ${codex_ver} (${codex_auth_state})"
 
   if is_tunnel_configured; then
     local t_state t_pid t_ready t_id
@@ -1039,6 +1043,169 @@ PY
   echo "💡 当前交互终端如需同步更新环境变量，可执行: source ~/.bashrc"
 }
 
+# Print the effective gateway default agy model (agy.model > config.json agy_default_model > agy settings.json)
+current_agy_model_label() {
+  python3 - "${AGY_MODEL_FILE}" "${CONFIG_FILE}" <<'PY'
+import json, pathlib, sys
+mf = pathlib.Path(sys.argv[1])
+if mf.is_file():
+    for ln in mf.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = ln.strip()
+        if s and not s.startswith("#"):
+            print(s)
+            raise SystemExit(0)
+try:
+    d = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+    m = str(d.get("agy_default_model") or "").strip()
+    if m:
+        print(f"{m} (config.json)")
+        raise SystemExit(0)
+except (OSError, ValueError):
+    pass
+sp = pathlib.Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
+try:
+    m = str(json.loads(sp.read_text(encoding="utf-8")).get("model") or "").strip()
+except (OSError, ValueError):
+    m = ""
+print(f"follow-agy-settings{f': {m}' if m else ''}")
+PY
+}
+
+# Run `agy models` with the gateway's agy auth profile; prints "id<TAB>name" lines
+fetch_agy_models() {
+  (
+    set +u
+    if [[ -f "${AGY_ENV_FILE}" ]]; then
+      # shellcheck disable=SC1090
+      . "${AGY_ENV_FILE}"
+    fi
+    timeout 60 "${HOME}/.local/bin/agy" models 2>/dev/null | grep $'\t' || true
+  )
+}
+
+cmd_agy_model() {
+  ensure_local_client_json
+  mkdir -p "${CLIENT_CONFIG_DIR}"
+  chmod 700 "${CLIENT_CONFIG_DIR}"
+
+  local subcmd="${1:-}"
+  local target="${2:-}"
+
+  print_agy_model_status() {
+    echo "============================================================================"
+    echo "  Antigravity CLI (agy) Gateway Default Model (Hot-Reload / 免重启切换)"
+    echo "============================================================================"
+    echo "  Default Model    : $(current_agy_model_label)"
+    echo "  Hot-Reload File  : ${AGY_MODEL_FILE}"
+    echo "  优先级           : run_agy 的 model 参数 > agy.model > config.json agy_default_model > agy settings.json"
+    echo "----------------------------------------------------------------------------"
+    echo "  快速切换命令 (即时生效，无需重启网关):"
+    echo "    ${PROG_NAME} agy-model list              # 列出当前认证下可用模型"
+    echo "    ${PROG_NAME} agy-model set <MODEL_ID>    # 设置网关默认模型 (可简写为 agy-model <MODEL_ID>)"
+    echo "    ${PROG_NAME} agy-model reset             # 清除网关默认值, 跟随本地 agy 的 /model 选择"
+    echo "    ${PROG_NAME} agy-model status            # 查看当前默认模型"
+    echo "============================================================================"
+  }
+
+  case "${subcmd}" in
+    ""|status|show|info)
+      print_agy_model_status
+      if [[ -z "${subcmd}" && -t 0 ]]; then
+        local models choice idx=0
+        models="$(fetch_agy_models)"
+        if [[ -z "${models}" ]]; then
+          echo "⚠️  无法获取可用模型列表 (请检查 'dots-gateway agy-auth status')。" >&2
+          return 0
+        fi
+        local -a ids=()
+        while IFS=$'\t' read -r mid mname; do
+          [[ -z "${mid}" ]] && continue
+          idx=$((idx + 1))
+          ids+=("${mid}")
+          printf "  %2d) %-28s %s\n" "${idx}" "${mid}" "${mname}"
+        done <<<"${models}"
+        echo "   0) 跟随本地 agy settings.json (reset)"
+        read -rp "请选择默认模型编号 (直接回车保持不变): " choice
+        choice="$(printf "%s" "${choice}" | tr -d '[:space:]')"
+        [[ -z "${choice}" ]] && return 0
+        if [[ "${choice}" == "0" ]]; then
+          subcmd="reset"
+        elif [[ "${choice}" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ids[@]} )); then
+          subcmd="set"
+          target="${ids[$((choice - 1))]}"
+        else
+          echo "ERROR: 无效选项 '${choice}'" >&2
+          exit 1
+        fi
+      else
+        return 0
+      fi
+      ;;
+    list|ls|models)
+      local models
+      models="$(fetch_agy_models)"
+      if [[ -z "${models}" ]]; then
+        echo "ERROR: 无法获取可用模型列表 (请检查 'dots-gateway agy-auth status')。" >&2
+        exit 1
+      fi
+      local cur
+      cur="$(current_agy_model_label)"
+      echo "可用模型 (当前网关默认: ${cur}):"
+      while IFS=$'\t' read -r mid mname; do
+        [[ -z "${mid}" ]] && continue
+        local mark="  "
+        [[ "${cur}" == "${mid}" ]] && mark="* "
+        printf "  %s%-28s %s\n" "${mark}" "${mid}" "${mname}"
+      done <<<"${models}"
+      return 0
+      ;;
+  esac
+
+  case "${subcmd}" in
+    set|use)
+      ;;
+    reset|clear|default|unset)
+      rm -f "${AGY_MODEL_FILE}"
+      echo "✅ 已清除网关默认模型，run_agy 未指定 model 时将跟随本地 agy 选择 ($(current_agy_model_label)) — 即时生效，无需重启！"
+      return 0
+      ;;
+    *)
+      # Shorthand: `agy-model <MODEL_ID>`
+      target="${subcmd}"
+      ;;
+  esac
+
+  target="$(printf "%s" "${target}" | tr -d '[:space:]')"
+  if [[ -z "${target}" ]]; then
+    echo "ERROR: 请指定模型 ID，例如: ${PROG_NAME} agy-model set claude-sonnet-4-5" >&2
+    exit 1
+  fi
+  if [[ ! "${target}" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+    echo "ERROR: 模型 ID '${target}' 含非法字符 (仅允许字母、数字、. _ -)。" >&2
+    exit 1
+  fi
+
+  local models
+  models="$(fetch_agy_models)"
+  if [[ -n "${models}" ]] && ! cut -f1 <<<"${models}" | grep -qxF "${target}"; then
+    echo "ERROR: 模型 '${target}' 不在当前认证可用列表中。可用模型:" >&2
+    cut -f1 <<<"${models}" | sed 's/^/    /' >&2
+    exit 1
+  elif [[ -z "${models}" ]]; then
+    echo "⚠️  无法获取可用模型列表，跳过校验直接写入。" >&2
+  fi
+
+  umask 077
+  local tmp_f="${AGY_MODEL_FILE}.tmp.$$"
+  {
+    printf "# Gateway default agy model (managed by 'dots-gateway agy-model', hot-reloaded per run_agy)\n"
+    printf "%s\n" "${target}"
+  } > "${tmp_f}"
+  chmod 600 "${tmp_f}"
+  mv -f "${tmp_f}" "${AGY_MODEL_FILE}"
+  echo "✅ 网关默认 agy 模型已设置为 [${target}] — 即时生效，无需重启！(run_agy 显式传入 model 时仍以调用参数为准)"
+}
+
 cmd_config() {
   (cd "${GATEWAY_DIR}" && python3 main.py --print-plugin-config)
 }
@@ -1069,6 +1236,7 @@ Dots Gateway & Secure MCP Tunnel 运维管理命令行 (${PROG_NAME})
 核心命令:
   tunnel-setup [ID]  交互式配置并启动 OpenAI 官方 Secure MCP Tunnel (tunnel-client 后台常驻)
   agy-auth [mode]    免重启切换 Antigravity CLI 认证方式: adc [PROJECT_ID] | oauth | toggle | status
+  agy-model [cmd]    免重启切换网关 agy 默认模型: list | set <MODEL_ID> | reset | status
   codex-setup        交互式配置本机 OpenAI Codex CLI 的 API Key (0600 隔离存储，即时生效)
   start              启动网关服务 (及已配置的 Tunnel 服务) 并执行健康检查
   stop               停止网关与 Tunnel 后台服务
@@ -1109,6 +1277,9 @@ case "${ACTION}" in
     ;;
   agy-auth|auth-agy|agy-setup|setup-agy)
     cmd_agy_auth "$@"
+    ;;
+  agy-model|agy-models|model)
+    cmd_agy_model "$@"
     ;;
   start)
     cmd_start

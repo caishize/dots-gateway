@@ -53,6 +53,32 @@ SERVER_INSTRUCTIONS = (
 
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
+        "name": "list_agy_models",
+        "title": "List Available Antigravity (agy) Models",
+        "description": (
+            "List model IDs available to `run_agy` under the gateway's current agy auth "
+            "profile (ADC or OAuth), plus the gateway default model used when `model` is "
+            "omitted. Results are cached briefly; pass `refresh=true` to re-query."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "refresh": {
+                    "type": "boolean",
+                    "description": "Bypass the cache and re-run `agy models`.",
+                    "default": False,
+                },
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        },
+    },
+    {
         "name": "gateway_status",
         "title": "Check Remote Gateway Status & Policy",
         "description": (
@@ -153,7 +179,11 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional model override for `agy`.",
+                    "description": (
+                        "Optional model override for `agy` (e.g. `claude-sonnet-4-5`, "
+                        "`gemini-2.5-pro`). Call `list_agy_models` for valid IDs. When "
+                        "omitted, the gateway default (`dots-gateway agy-model`) is used."
+                    ),
                 },
                 "effort": {
                     "type": "string",
@@ -1125,6 +1155,15 @@ class MCPHandler:
                         ),
                     )
                 return _jsonrpc_result(req_id, _tool_success(result_data))
+
+            if tool_name == "list_agy_models":
+                try:
+                    data = await self.sessions.list_agy_models(
+                        refresh=bool(args.get("refresh", False))
+                    )
+                except RuntimeError as exc:
+                    return _jsonrpc_result(req_id, _tool_error(str(exc)))
+                return _jsonrpc_result(req_id, _tool_success(data))
 
             if tool_name == "run_agy":
                 prompt = args.get("prompt")

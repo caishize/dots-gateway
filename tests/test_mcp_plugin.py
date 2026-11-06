@@ -134,6 +134,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         )
         tool_names = {t["name"] for t in tools_resp["result"]["tools"]}
         for expected in (
+            "list_agy_models",
             "gateway_status",
             "exec_command",
             "run_agy",
@@ -1486,6 +1487,104 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(s_agy_bad["result"]["isError"])
         finally:
             await agy_srv.stop()
+
+
+    async def test_agy_default_model_hot_reload_and_list_agy_models(self) -> None:
+        mock_agy = Path(self.tmpdir) / "mock_agy_models.py"
+        mock_agy.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "if sys.argv[1:] == ['models']:\n"
+            "    print('Fetching available models...')\n"
+            "    mode = 'adc' if os.environ.get('AGY_ADC_AUTH') == 'true' else 'oauth'\n"
+            "    print('gemini-2.5-pro\\tGemini 2.5 Pro')\n"
+            "    if mode == 'adc':\n"
+            "        print('claude-sonnet-4-5\\tClaude Sonnet 4.5')\n"
+            "    sys.exit(0)\n"
+            "print(json.dumps({'argv': sys.argv[1:]}))\n",
+            encoding="utf-8",
+        )
+        mock_agy.chmod(0o755)
+        agy_env = Path(self.tmpdir) / "models_agy.env"
+        agy_env.write_text("export AGY_ADC_AUTH=true\n", encoding="utf-8")
+        model_file = Path(self.tmpdir) / "agy.model"
+
+        cfg = GatewayConfig(
+            host="127.0.0.1",
+            port=0,
+            api_tokens=["mdl-tok"],
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            agy_binary=str(mock_agy),
+            agy_env_file=str(agy_env),
+            agy_model_file=str(model_file),
+            agy_default_model="gemini-2.5-pro",
+            allowed_commands=["python3", str(mock_agy)],
+        )
+        srv = GatewayServer(cfg)
+        h, p = await srv.start()
+        try:
+            client = DotsGatewayClient(base_url=f"http://{h}:{p}", token="mdl-tok")
+
+            async def _call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+                resp, _ = await asyncio.to_thread(
+                    client.mcp_request,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": name,
+                        "method": "tools/call",
+                        "params": {"name": name, "arguments": arguments},
+                    },
+                )
+                self.assertFalse(resp["result"]["isError"], resp)
+                return resp["result"]["structuredContent"]
+
+            def _model_of(sc: Dict[str, Any]) -> Optional[str]:
+                argv = json.loads(sc["stdout"].strip())["argv"]
+                return argv[argv.index("--model") + 1] if "--model" in argv else None
+
+            # 1. config.json default applies when model omitted
+            sc = await _call("run_agy", {"prompt": "hi", "cwd": self.tmpdir})
+            self.assertEqual(_model_of(sc), "gemini-2.5-pro")
+
+            # 2. agy.model hot-reload overrides config default without restart
+            model_file.write_text("# comment\nclaude-sonnet-4-5\n", encoding="utf-8")
+            sc = await _call("run_agy", {"prompt": "hi", "cwd": self.tmpdir})
+            self.assertEqual(_model_of(sc), "claude-sonnet-4-5")
+
+            # 3. explicit per-call model always wins
+            sc = await _call(
+                "run_agy",
+                {"prompt": "hi", "cwd": self.tmpdir, "model": "gemini-2.5-pro"},
+            )
+            self.assertEqual(_model_of(sc), "gemini-2.5-pro")
+
+            # 4. list_agy_models reports auth-dependent models + default
+            listed = await _call("list_agy_models", {"refresh": True})
+            ids = [m["id"] for m in listed["models"]]
+            self.assertEqual(ids, ["gemini-2.5-pro", "claude-sonnet-4-5"])
+            self.assertEqual(listed["auth_mode"], "adc")
+            self.assertEqual(listed["default_model"], "claude-sonnet-4-5")
+            self.assertEqual(listed["default_model_source"], "agy_model_file")
+            self.assertTrue(listed["default_model_available"])
+            cached = await _call("list_agy_models", {})
+            self.assertTrue(cached["cached"])
+
+            # 5. auth switch invalidates cache (keyed by auth mode)
+            agy_env.write_text("unset AGY_ADC_AUTH\n", encoding="utf-8")
+            listed2 = await _call("list_agy_models", {})
+            self.assertFalse(listed2["cached"])
+            self.assertEqual(listed2["auth_mode"], "oauth")
+            self.assertEqual([m["id"] for m in listed2["models"]], ["gemini-2.5-pro"])
+            self.assertFalse(listed2["default_model_available"])
+
+            # 6. removing agy.model and config default -> no --model (follow agy settings)
+            model_file.unlink()
+            cfg.agy_default_model = None
+            sc = await _call("run_agy", {"prompt": "hi", "cwd": self.tmpdir})
+            self.assertIsNone(_model_of(sc))
+        finally:
+            await srv.stop()
 
     async def test_session_ledger_persistence_and_restart_reconciliation(self) -> None:
         import signal
