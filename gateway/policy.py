@@ -11,7 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from .config import DEFAULT_AGY_READONLY_ROOTS, GatewayConfig
+from .config import (
+    DEFAULT_AGY_READONLY_ROOTS,
+    DOCKER_CLI_BASENAMES,
+    GatewayConfig,
+    docker_access_enabled,
+)
 
 
 @dataclass
@@ -824,6 +829,10 @@ class CommandPolicy:
 
     def _check_single_executable(self, exe: str, resolved_cwd: str) -> Tuple[bool, str]:
         base = os.path.basename(exe)
+        # Docker CLI is unblocked only while gateway Docker access is ON (hot-reloaded); the
+        # daemon is then reached exclusively through the policy-filtering proxy socket.
+        if base in DOCKER_CLI_BASENAMES and docker_access_enabled(self.config):
+            return True, ""
         if base in self._blocked_basenames or exe in self.config.blocked_commands:
             return False, f"Command '{exe}' is explicitly blocked by security policy"
 
@@ -957,9 +966,15 @@ class CommandPolicy:
             if m_redir:
                 candidates.append(m_redir.group(1))
             if tok.startswith("-") and "=" in tok:
-                candidates = [tok.split("=", 1)[1]]
+                flag_name, flag_val = tok.split("=", 1)
+                if flag_name in ("-v", "--volume") and ":" in flag_val:
+                    candidates = [flag_val.split(":", 1)[0]]
+                else:
+                    candidates = [flag_val]
             elif tok.startswith("-"):
                 continue
+            elif idx > 1 and tok_list[idx - 1] in ("-v", "--volume") and ":" in tok:
+                candidates = [tok.split(":", 1)[0]]
 
             for val in candidates:
                 if not val or "://" in val or val.startswith("git@"):
@@ -1667,11 +1682,14 @@ class CommandPolicy:
                 seen.add(rule)
                 rules.append(rule)
 
+        docker_on = docker_access_enabled(self.config)
         for raw_cmd in self.config.blocked_commands:
             cmd_str = str(raw_cmd).strip()
             if not cmd_str:
                 continue
             base = os.path.basename(cmd_str)
+            if docker_on and base in DOCKER_CLI_BASENAMES:
+                continue
             if (
                 base
                 and base not in _SHELL_PREFIX_KEYWORDS
@@ -1991,6 +2009,8 @@ class CommandPolicy:
                 ".npm",
                 os.path.join(".local", "share"),
                 os.path.join(".config", "gh"),
+                # Isolated per-sandbox Docker CLI config (buildx state, registry logins)
+                ".docker",
             ):
                 abs_cache = os.path.join(home_dir, rel)
                 if self.config.isolate_mount_namespace or os.path.isdir(abs_cache):

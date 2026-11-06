@@ -30,7 +30,7 @@ from typing import (
     Union,
 )
 
-from .config import GatewayConfig
+from .config import GatewayConfig, docker_access_enabled, docker_access_state
 from .policy import CommandPolicy
 from .sandbox import (
     build_mount_ns_argv,
@@ -210,6 +210,11 @@ _STRIPPED_ENV_KEYS = {
     "CODEX_ACCESS_TOKEN",
     "AGY_ADC_AUTH",
     "GOOGLE_CLOUD_QUOTA_PROJECT",
+    # Never let host Docker endpoints leak into sandboxed sessions (daemon access goes via proxy)
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
 }
 
 
@@ -1141,6 +1146,8 @@ class SessionManager:
         self._last_sandbox_cleanup: Optional[Dict[str, Any]] = None
         self._agy_models_lock = asyncio.Lock()
         self._agy_models_cache: Optional[Tuple[float, Tuple[str, str], Dict[str, Any]]] = None
+        # Optional policy-filtering Docker proxy (duck-typed: `.is_listening`, `.socket_path`, `.status()`)
+        self.docker_proxy: Optional[Any] = None
         self._state_dir: Optional[Path] = (
             Path(config.session_state_dir).expanduser()
             if config.session_state_dir
@@ -1345,8 +1352,17 @@ class SessionManager:
                 env["TMPDIR"] = str(sb_tmp_p)
             except OSError:
                 pass
+        docker_sock = self._active_docker_proxy_socket()
+        if docker_sock:
+            env["DOCKER_HOST"] = (
+                "unix:///var/run/docker.sock"
+                if self.config.isolate_mount_namespace
+                else f"unix://{docker_sock}"
+            )
         if extra_env:
             for k, v in extra_env.items():
+                if str(k) in ("DOCKER_HOST", "DOCKER_CONTEXT"):
+                    continue
                 env[str(k)] = str(v)
         # Ensure loopback traffic (e.g. Flutter `flutter_tester` WebSocket on `127.0.0.1:<port>`)
         # bypasses outbound sandbox HTTP proxies (`agy --sandbox`'s `HTTP_PROXY`/`connectd`)
@@ -1404,6 +1420,43 @@ class SessionManager:
             out.pop("AGY_ADC_AUTH", None)
             out.pop("GOOGLE_CLOUD_QUOTA_PROJECT", None)
         return out
+
+    def attach_docker_proxy(self, proxy: Optional[Any]) -> None:
+        """Register the gateway Docker filtering proxy used for new sandboxed sessions."""
+        self.docker_proxy = proxy
+
+    def _active_docker_proxy_socket(self) -> Optional[str]:
+        """Proxy socket path when Docker access is ON (hot-reloaded) and the proxy is listening."""
+        proxy = self.docker_proxy
+        if proxy is None or not getattr(proxy, "is_listening", False):
+            return None
+        if not docker_access_enabled(self.config):
+            return None
+        return str(getattr(proxy, "socket_path", "") or "") or None
+
+    def get_docker_info(self) -> Dict[str, Any]:
+        """Return live Docker access state for status endpoints."""
+        state = docker_access_state(self.config)
+        info: Dict[str, Any] = {
+            "enabled": bool(state["enabled"]),
+            "source": state["source"],
+            "upstream_socket": self.config.docker_upstream_socket,
+            "upstream_present": os.path.exists(self.config.docker_upstream_socket),
+            "proxy_socket": self.config.docker_proxy_socket,
+            "proxy_listening": bool(
+                self.docker_proxy is not None and getattr(self.docker_proxy, "is_listening", False)
+            ),
+            "masked_paths": list(self.config.docker_mask_paths),
+            "force_loopback_ports": bool(self.config.docker_force_loopback_ports),
+            "allow_host_network": bool(self.config.docker_allow_host_network),
+            "allowed_capabilities": list(self.config.docker_allowed_capabilities),
+        }
+        if self.docker_proxy is not None and hasattr(self.docker_proxy, "stats"):
+            try:
+                info["proxy_stats"] = dict(self.docker_proxy.stats)
+            except Exception:
+                pass
+        return info
 
     def get_agy_auth_info(self) -> Dict[str, Any]:
         """Return live Antigravity (`agy`) authentication mode & ADC status from `agy.env`."""
@@ -1687,6 +1740,8 @@ class SessionManager:
                 is_codex=is_codex,
                 readonly_subpaths=readonly_subpaths,
                 sandbox_state_dir=self.config.sandbox_state_dir,
+                docker_mask_paths=self.config.docker_mask_paths,
+                docker_proxy_socket=self._active_docker_proxy_socket(),
             )
 
         self._cleanup_old_sessions()

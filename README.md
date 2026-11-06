@@ -79,6 +79,26 @@ dots-gateway tunnel-setup
 # Configure OpenAI API Key for local Codex CLI (`run_codex`, stored 0600, effective immediately)
 dots-gateway codex-setup
 
+# Hot-toggle policy-filtered Docker access for sandboxed exec_command / run_agy / run_codex
+dots-gateway docker on|off|status|test
+```
+
+### Sandbox Docker Access (`dots-gateway docker`)
+
+The host `docker.sock` (root-equivalent) is **always masked** inside the mount-namespace jail.
+When `dots-gateway docker on` is set (hot-reloaded per session, no restart), sessions instead get a
+gateway-owned filtering proxy socket at `/var/run/docker.sock`, so `docker` / `docker compose` /
+`docker build` work from `exec_command`, scripts, `run_agy`, and `run_codex` with these rules:
+
+- bind mounts (and bind-backed volumes) only inside `allowed_workdirs` (+ `docker_extra_bind_roots`), never in `protected_paths`, symlinks resolved and re-checked at `start`;
+- no `--privileged`, `--device`, `--cap-add` (unless in `docker_allowed_capabilities`), `--pid/--ipc/--uts/--userns=host`, custom runtimes, unconfined security options;
+- only containers/volumes/networks created through the proxy (label `io.dots-gateway.managed=true`) can be inspected, exec'd, attached, or removed — host containers stay invisible;
+- published ports are rewritten to `127.0.0.1` (`docker_force_loopback_ports`); swarm, plugins, and unknown API routes are denied.
+
+> Note: files written by root inside containers to bind-mounted workspaces become root-owned; run containers with `--user "$(id -u):$(id -g)"` when needed.
+
+```bash
+
 # Issue auto-renewing Let's Encrypt bare-IP + sslip.io TLS certificate (optional, for direct HTTPS)
 dots-gateway sync-ip
 

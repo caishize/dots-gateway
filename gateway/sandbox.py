@@ -30,6 +30,7 @@ SANDBOX_SUBDIRS: Tuple[str, ...] = (
     "flutter_cfg",
     "dart_tool",
     "dart_server",
+    "docker_cfg",
 )
 SANDBOX_MANAGED_SUBDIRS: Tuple[str, ...] = (
     "tmp",
@@ -107,6 +108,43 @@ def _select_stage_mountpoint(source_paths: Sequence[str]) -> str:
     return "/dev/shm"
 
 
+def _docker_socket_mask_lines(
+    stage_dir: str,
+    q_mount: str,
+    mask_paths: Sequence[str],
+    proxy_socket: Optional[str],
+) -> List[str]:
+    """Shell lines masking host container-runtime sockets (optionally swapping in the proxy)."""
+    lines: List[str] = []
+    seen: set[str] = set()
+    proxy_src: Optional[str] = None
+    if proxy_socket:
+        try:
+            cand = str(Path(proxy_socket).expanduser().resolve())
+            if stat.S_ISSOCK(os.stat(cand).st_mode):
+                proxy_src = cand
+        except OSError:
+            proxy_src = None
+    proxy_used = False
+    for raw in mask_paths:
+        try:
+            host_path = os.path.realpath(str(raw))
+        except OSError:
+            continue
+        if not host_path.startswith("/") or host_path in seen:
+            continue
+        seen.add(host_path)
+        q_dst = shlex.quote(f"{stage_dir}{host_path}")
+        src = "/dev/null"
+        if proxy_src and not proxy_used and os.path.basename(host_path) == "docker.sock":
+            src = proxy_src
+            proxy_used = True
+        lines.append(
+            f"if [ -e {q_dst} ] && [ ! -d {q_dst} ]; then {q_mount} --bind {shlex.quote(src)} {q_dst}; fi"
+        )
+    return lines
+
+
 def build_mount_ns_argv(
     target_argv: Sequence[str],
     cwd: str,
@@ -116,8 +154,16 @@ def build_mount_ns_argv(
     is_codex: bool = False,
     readonly_subpaths: Optional[Sequence[str]] = None,
     sandbox_state_dir: Optional[str] = None,
+    docker_mask_paths: Optional[Sequence[str]] = None,
+    docker_proxy_socket: Optional[str] = None,
 ) -> List[str]:
-    """Wrap `target_argv` in an unprivileged user+mount namespace `pivot_root` jail."""
+    """Wrap `target_argv` in an unprivileged user+mount namespace `pivot_root` jail.
+
+    Container-runtime sockets listed in `docker_mask_paths` are always masked (bind `/dev/null`)
+    because the caller's supplementary `docker` group would otherwise grant root-equivalent daemon
+    access. When `docker_proxy_socket` is given, it is bind-mounted over the first existing
+    `docker.sock` mask path so `docker`/`docker compose` reach only the gateway filtering proxy.
+    """
     if not can_use_mount_namespace():
         raise RuntimeError(
             "Linux mount-namespace isolation is enabled (isolate_mount_namespace=True), "
@@ -216,6 +262,9 @@ def build_mount_ns_argv(
             f'  {q_mount} -t tmpfs -o size=8m,mode=0755 tmpfs {shlex.quote(f"{stage_dir}/run/user")}',
             f'  mkdir -p "{stage_dir}/run/user/$(id -u)" && chmod 0700 "{stage_dir}/run/user/$(id -u)"',
             "fi",
+            *_docker_socket_mask_lines(
+                stage_dir, q_mount, docker_mask_paths or (), docker_proxy_socket
+            ),
             f"mkdir -p {shlex.quote(f'{stage_dir}/tmp')} {shlex.quote(f'{stage_dir}/mnt')} {shlex.quote(f'{stage_dir}/media')} {shlex.quote(f'{stage_dir}/home')}",
             f"chmod 1777 {shlex.quote(f'{stage_dir}/tmp')}",
         ]
@@ -271,6 +320,7 @@ def build_mount_ns_argv(
             ("flutter_cfg", os.path.join(".config", "flutter")),
             ("dart_tool", ".dart-tool"),
             ("dart_server", ".dartServer"),
+            ("docker_cfg", ".docker"),
         ):
             q_src = shlex.quote(str(sandbox_state / src_sub))
             q_dst = shlex.quote(f"{stage_dir}{os.path.join(home_dir, dst_rel)}")

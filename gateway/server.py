@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 from . import __version__
 from .auth import Authenticator, extract_mcp_path_token
 from .config import GatewayConfig
+from .docker_proxy import DockerProxy
 from .executor import ExecutionSession, SessionManager
 from .files import FileService
 from .mcp import MCPHandler
@@ -47,6 +48,8 @@ class GatewayServer:
         self.policy = CommandPolicy(config)
         self.files = FileService(self.policy)
         self.sessions = SessionManager(config, self.policy)
+        self.docker_proxy = DockerProxy(config, self.policy)
+        self.sessions.attach_docker_proxy(self.docker_proxy)
         self._server: Optional[asyncio.AbstractServer] = None
         self._loopback_server: Optional[asyncio.AbstractServer] = None
         self._cleanup_task: Optional[asyncio.Task[None]] = None
@@ -101,6 +104,9 @@ class GatewayServer:
         if self.config.sandbox_cleanup_enabled and self._cleanup_task is None:
             self._cleanup_task = asyncio.create_task(self._sandbox_cleanup_loop())
 
+        if not self.docker_proxy.is_listening:
+            await self.docker_proxy.start()
+
         return self.config.host, bound_port
 
     async def _sandbox_cleanup_loop(self) -> None:
@@ -142,6 +148,7 @@ class GatewayServer:
                 pass
             self._cleanup_task = None
         self.sessions.flush_all()
+        await self.docker_proxy.stop()
         if self._loopback_server is not None:
             self._loopback_server.close()
             await self._loopback_server.wait_closed()
@@ -540,6 +547,7 @@ class GatewayServer:
                     "agy_readonly_roots": self.policy.get_agy_readonly_roots(),
                     "agy_writable_roots": self.policy.get_agy_writable_roots(),
                     "agy_auth": self.sessions.get_agy_auth_info(),
+                    "docker": self.sessions.get_docker_info(),
                     "codex_binary": self.config.codex_binary,
                     "codex_default_skip_permissions": self.config.codex_default_skip_permissions,
                     "codex_default_sandbox": self.config.codex_default_sandbox,

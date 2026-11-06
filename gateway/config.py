@@ -386,6 +386,27 @@ class GatewayConfig:
     codex_sandbox_network_access: bool = True
     codex_extra_writable_roots: List[str] = field(default_factory=list)
     codex_env_file: str = str(Path.home() / ".config" / "dots-gateway" / "codex.env")
+    # Policy-filtered Docker access for sandboxed sessions (exec_command / run_agy / run_codex).
+    # The real daemon socket is ALWAYS masked inside the mount-namespace jail; when enabled, a
+    # gateway-owned filtering proxy socket is bind-mounted at `/run/docker.sock` instead.
+    # Precedence: hot-reload `docker_mode_file` ("on"/"off") > `docker_enabled`.
+    docker_enabled: bool = False
+    docker_mode_file: str = field(
+        default_factory=lambda: os.environ.get("GATEWAY_DOCKER_MODE_FILE")
+        or str(Path.home() / ".config" / "dots-gateway" / "docker.mode")
+    )
+    docker_upstream_socket: str = "/var/run/docker.sock"
+    docker_proxy_socket: str = field(
+        default_factory=lambda: os.environ.get("GATEWAY_DOCKER_PROXY_SOCKET")
+        or str(Path.home() / ".config" / "dots-gateway" / "docker-proxy.sock")
+    )
+    docker_mask_paths: List[str] = field(
+        default_factory=lambda: ["/run/docker.sock", "/run/containerd/containerd.sock", "/run/podman/podman.sock"]
+    )
+    docker_force_loopback_ports: bool = True
+    docker_allow_host_network: bool = True
+    docker_allowed_capabilities: List[str] = field(default_factory=list)
+    docker_extra_bind_roots: List[str] = field(default_factory=list)
     max_concurrent_agy: int = field(default_factory=detect_recommended_max_agy)
     max_concurrent_codex: int = 6
     agy_queue_timeout_seconds: float = 28800.0
@@ -498,6 +519,19 @@ class GatewayConfig:
             cfg.agy_default_model = os.environ["GATEWAY_AGY_DEFAULT_MODEL"].strip() or None
         if os.environ.get("GATEWAY_AGY_MODEL_FILE"):
             cfg.agy_model_file = os.environ["GATEWAY_AGY_MODEL_FILE"].strip()
+        if os.environ.get("GATEWAY_DOCKER_ENABLED"):
+            cfg.docker_enabled = os.environ["GATEWAY_DOCKER_ENABLED"].strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        if os.environ.get("GATEWAY_DOCKER_MODE_FILE"):
+            cfg.docker_mode_file = os.environ["GATEWAY_DOCKER_MODE_FILE"].strip()
+        if os.environ.get("GATEWAY_DOCKER_SOCKET"):
+            cfg.docker_upstream_socket = os.environ["GATEWAY_DOCKER_SOCKET"].strip()
+        if os.environ.get("GATEWAY_DOCKER_PROXY_SOCKET"):
+            cfg.docker_proxy_socket = os.environ["GATEWAY_DOCKER_PROXY_SOCKET"].strip()
         if os.environ.get("GATEWAY_CODEX_BIN"):
             cfg.codex_binary = os.environ["GATEWAY_CODEX_BIN"]
         if os.environ.get("GATEWAY_BWRAP_BIN"):
@@ -707,3 +741,38 @@ class GatewayConfig:
         if save_path and generated:
             self.save(save_path)
         return generated
+
+
+DOCKER_CLI_BASENAMES = frozenset({"docker", "docker-compose"})
+_DOCKER_ON_VALUES = ("1", "true", "yes", "on", "enable", "enabled")
+_DOCKER_OFF_VALUES = ("0", "false", "no", "off", "disable", "disabled")
+
+
+def docker_access_state(cfg: "GatewayConfig") -> Dict[str, object]:
+    """Return hot-reloaded Docker access state `{"enabled": bool, "source": str}`.
+
+    Precedence: `docker_mode_file` (first non-comment line `on`/`off`, written by
+    `dots-gateway docker on|off`) > `cfg.docker_enabled`. Read on every call so toggling
+    takes effect for new sessions without restarting the gateway.
+    """
+    mode_file = str(getattr(cfg, "docker_mode_file", "") or "").strip()
+    if mode_file:
+        try:
+            raw = Path(mode_file).expanduser().read_text(encoding="utf-8")
+        except OSError:
+            raw = ""
+        for line in raw.splitlines():
+            val = line.split("#", 1)[0].strip().lower()
+            if not val:
+                continue
+            if val in _DOCKER_ON_VALUES:
+                return {"enabled": True, "source": mode_file}
+            if val in _DOCKER_OFF_VALUES:
+                return {"enabled": False, "source": mode_file}
+            break
+    return {"enabled": bool(getattr(cfg, "docker_enabled", False)), "source": "config.docker_enabled"}
+
+
+def docker_access_enabled(cfg: "GatewayConfig") -> bool:
+    """Shorthand for `docker_access_state(cfg)["enabled"]`."""
+    return bool(docker_access_state(cfg)["enabled"])

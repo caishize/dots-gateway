@@ -26,6 +26,8 @@ TUNNEL_ENV_FILE="${CLIENT_CONFIG_DIR}/tunnel.env"
 CODEX_ENV_FILE="${CLIENT_CONFIG_DIR}/codex.env"
 AGY_ENV_FILE="${CLIENT_CONFIG_DIR}/agy.env"
 AGY_MODEL_FILE="${CLIENT_CONFIG_DIR}/agy.model"
+DOCKER_MODE_FILE="${CLIENT_CONFIG_DIR}/docker.mode"
+DOCKER_PROXY_SOCKET="${CLIENT_CONFIG_DIR}/docker-proxy.sock"
 TUNNEL_HEALTH_URL="http://127.0.0.1:18766"
 
 is_tunnel_configured() {
@@ -471,6 +473,7 @@ PY
     codex_auth_state="auth=pending (run 'dots-gateway codex-setup')"
   fi
   echo "  Local Agents     : agy (${agy_auth_summary}, model=$(current_agy_model_label)) + ${codex_ver} (${codex_auth_state})"
+  echo "  Docker Access    : $(docker_access_summary)"
 
   if is_tunnel_configured; then
     local t_state t_pid t_ready t_id
@@ -1206,6 +1209,127 @@ cmd_agy_model() {
   echo "✅ 网关默认 agy 模型已设置为 [${target}] — 即时生效，无需重启！(run_agy 显式传入 model 时仍以调用参数为准)"
 }
 
+resolve_docker_paths() {
+  # Honour optional config.json overrides (docker_mode_file / docker_proxy_socket)
+  local out
+  out="$(python3 - "${CONFIG_FILE}" <<'PY' 2>/dev/null || true
+import json, os, sys
+try:
+    c = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    c = {}
+print(os.path.expanduser(c.get("docker_mode_file") or ""))
+print(os.path.expanduser(c.get("docker_proxy_socket") or ""))
+PY
+)"
+  local mf ps
+  mf="$(sed -n 1p <<<"${out}")"
+  ps="$(sed -n 2p <<<"${out}")"
+  [[ -n "${mf}" ]] && DOCKER_MODE_FILE="${mf}"
+  [[ -n "${ps}" ]] && DOCKER_PROXY_SOCKET="${ps}"
+  return 0
+}
+
+current_docker_mode() {
+  local v=""
+  if [[ -f "${DOCKER_MODE_FILE}" ]]; then
+    v="$(grep -v '^[[:space:]]*#' "${DOCKER_MODE_FILE}" | sed 's/#.*//' | tr -d '[:space:]' | head -n1 | tr '[:upper:]' '[:lower:]')"
+  fi
+  case "${v}" in
+    1|true|yes|on|enable|enabled) echo "on" ;;
+    0|false|no|off|disable|disabled) echo "off" ;;
+    *)
+      if python3 -c "import json,sys; sys.exit(0 if json.load(open('${CONFIG_FILE}')).get('docker_enabled') else 1)" 2>/dev/null; then
+        echo "on"
+      else
+        echo "off"
+      fi
+      ;;
+  esac
+}
+
+docker_proxy_listening() {
+  [[ -S "${DOCKER_PROXY_SOCKET}" ]] || return 1
+  curl -s -o /dev/null --max-time 3 --unix-socket "${DOCKER_PROXY_SOCKET}" http://docker/_ping
+}
+
+docker_access_summary() {
+  resolve_docker_paths
+  local mode proxy daemon
+  mode="$(current_docker_mode)"
+  if docker_proxy_listening; then proxy="proxy=listening"; else proxy="proxy=down"; fi
+  if [[ -S /var/run/docker.sock ]]; then daemon="daemon=present"; else daemon="daemon=absent"; fi
+  echo "${mode} (${proxy}, ${daemon}; host socket masked in sandbox)"
+}
+
+write_docker_mode() {
+  local mode="$1"
+  mkdir -p "$(dirname "${DOCKER_MODE_FILE}")"
+  chmod 700 "$(dirname "${DOCKER_MODE_FILE}")" 2>/dev/null || true
+  local tmp_f="${DOCKER_MODE_FILE}.tmp.$$"
+  {
+    printf "# Gateway sandbox Docker access (managed by 'dots-gateway docker', hot-reloaded per session)\n"
+    printf "%s\n" "${mode}"
+  } > "${tmp_f}"
+  chmod 600 "${tmp_f}"
+  mv -f "${tmp_f}" "${DOCKER_MODE_FILE}"
+}
+
+cmd_docker() {
+  resolve_docker_paths
+  local subcmd="${1:-status}"
+  case "${subcmd}" in
+    on|enable)
+      write_docker_mode on
+      echo "✅ 网关沙箱 Docker 访问已开启 — 新会话即时生效，无需重启。"
+      echo "   exec_command / run_agy / run_codex 中的 docker / docker compose 将经由策略过滤代理访问 daemon"
+      echo "   (仅允许挂载工作区目录；禁止 --privileged / --cap-add / --device / --pid=host 等；端口默认仅绑定 127.0.0.1)"
+      docker_proxy_listening || echo "⚠️  代理 socket 未就绪 (${DOCKER_PROXY_SOCKET})：如为首次升级，请执行 '${PROG_NAME} restart'。"
+      ;;
+    off|disable)
+      write_docker_mode off
+      echo "✅ 网关沙箱 Docker 访问已关闭 — 新会话即时生效 (宿主 docker.sock 在沙箱中始终被屏蔽)。"
+      ;;
+    toggle)
+      if [[ "$(current_docker_mode)" == "on" ]]; then cmd_docker off; else cmd_docker on; fi
+      ;;
+    status)
+      echo "Docker Access : $(current_docker_mode)  (mode file: ${DOCKER_MODE_FILE})"
+      if docker_proxy_listening; then
+        echo "Proxy Socket  : ${DOCKER_PROXY_SOCKET} (listening)"
+      else
+        echo "Proxy Socket  : ${DOCKER_PROXY_SOCKET} (down — '${PROG_NAME} restart' 以加载代理)"
+      fi
+      if [[ -S /var/run/docker.sock ]]; then
+        echo "Docker Daemon : $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo 'present (host user cannot query)')"
+      else
+        echo "Docker Daemon : not installed / socket absent"
+      fi
+      ;;
+    test)
+      if ! docker_proxy_listening; then
+        echo "ERROR: 代理 socket 未就绪 (${DOCKER_PROXY_SOCKET})" >&2
+        exit 1
+      fi
+      local v code
+      v="$(curl -s --max-time 10 --unix-socket "${DOCKER_PROXY_SOCKET}" http://docker/version)"
+      echo "GET /version           -> ${v:0:160}"
+      code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --unix-socket "${DOCKER_PROXY_SOCKET}" \
+        -H 'Content-Type: application/json' -d '{"Image":"alpine","HostConfig":{"Privileged":true}}' \
+        http://docker/containers/create)"
+      echo "privileged create      -> HTTP ${code} (期望 403)"
+      code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --unix-socket "${DOCKER_PROXY_SOCKET}" \
+        -H 'Content-Type: application/json' -d '{"Image":"alpine","HostConfig":{"Binds":["/:/host"]}}' \
+        http://docker/containers/create)"
+      echo "bind / create          -> HTTP ${code} (期望 403)"
+      ;;
+    *)
+      echo "ERROR: 未知的 docker 子命令 '${subcmd}' (可选: on | off | toggle | status | test)" >&2
+      exit 1
+      ;;
+  esac
+}
+
 cmd_config() {
   (cd "${GATEWAY_DIR}" && python3 main.py --print-plugin-config)
 }
@@ -1237,6 +1361,7 @@ Dots Gateway & Secure MCP Tunnel 运维管理命令行 (${PROG_NAME})
   tunnel-setup [ID]  交互式配置并启动 OpenAI 官方 Secure MCP Tunnel (tunnel-client 后台常驻)
   agy-auth [mode]    免重启切换 Antigravity CLI 认证方式: adc [PROJECT_ID] | oauth | toggle | status
   agy-model [cmd]    免重启切换网关 agy 默认模型: list | set <MODEL_ID> | reset | status
+  docker [cmd]       免重启开关沙箱 Docker 访问 (策略过滤代理): on | off | toggle | status | test
   codex-setup        交互式配置本机 OpenAI Codex CLI 的 API Key (0600 隔离存储，即时生效)
   start              启动网关服务 (及已配置的 Tunnel 服务) 并执行健康检查
   stop               停止网关与 Tunnel 后台服务
@@ -1280,6 +1405,9 @@ case "${ACTION}" in
     ;;
   agy-model|agy-models|model)
     cmd_agy_model "$@"
+    ;;
+  docker|docker-access)
+    cmd_docker "$@"
     ;;
   start)
     cmd_start

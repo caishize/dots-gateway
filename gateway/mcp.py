@@ -105,7 +105,10 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "Execute an allowlisted command, compound shell pipeline, or multi-line heredoc script "
             "(e.g., `git status`, `pytest -v`, `cd ~/proj && npm test`, "
             "`python3 - <<'PY'\\nimport sys\\nprint(sys.version)\\nPY`, or `./scripts/build.sh`) "
-            "on the remote machine and return stdout, stderr, and exit code."
+            "on the remote machine and return stdout, stderr, and exit code. When gateway Docker "
+            "access is ON (see `gateway_status` -> `docker.enabled`), `docker` / `docker compose` "
+            "work via a policy-filtering proxy (workspace-only bind mounts, no privileged/host "
+            "namespaces, ports bound to 127.0.0.1)."
         ),
         "inputSchema": {
             "type": "object",
@@ -1110,6 +1113,7 @@ class MCPHandler:
                     "agy_readonly_roots": self.policy.get_agy_readonly_roots(),
                     "agy_writable_roots": self.policy.get_agy_writable_roots(),
                     "agy_auth": self.sessions.get_agy_auth_info(),
+                    "docker": self.sessions.get_docker_info(),
                     "codex_binary": self.config.codex_binary,
                     "codex_default_skip_permissions": self.config.codex_default_skip_permissions,
                     "codex_default_sandbox": self.config.codex_default_sandbox,
@@ -1492,6 +1496,7 @@ class MCPHandler:
                     "max_timeout_seconds": self.config.max_timeout_seconds,
                     "agy_queue_timeout_seconds": self.config.agy_queue_timeout_seconds,
                     "agy_auth": self.sessions.get_agy_auth_info(),
+                    "docker": self.sessions.get_docker_info(),
                     "codex_auth_configured": self.sessions.has_codex_auth(),
                     "session_persistence_enabled": bool(self.config.session_state_dir),
                     "persisted_sessions": len(self.sessions._persisted),
