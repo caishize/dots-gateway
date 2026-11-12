@@ -15,12 +15,12 @@ Use this workflow whenever you need to inspect code, edit files, run builds/test
 ## 2. Atomic File Reading & Editing
 - **Read files**: Use `fs_read` (`encoding="utf-8"` for source files, `encoding="base64"` for binary assets; use `offset` and `limit` for large logs).
 - **Create or overwrite files**: Use `fs_write` (`mkdir_parents=true` is enabled by default; set `mode="0755"` when writing executable scripts).
-- **Modify existing files**: Prefer `fs_patch` with exact `target` / `replacement` pairs instead of `sed` or heredoc shell commands to avoid quoting corruption.
+- **Modify existing files**: Prefer `fs_patch` with exact `target` / `replacement` pairs instead of `sed` or heredoc shell commands to avoid quoting corruption (`replace_all=false` by default requires a unique match; pass `replace_all=true` to replace multiple occurrences intentionally).
 
 ## 3. Running Commands, Builds & Tests
 - Use `exec_command` for allowlisted development tools (`git`, `pytest`, `python3`, `ruff`, `mypy`, `npm`, `pnpm`, `tsc`, `vitest`, `cargo`, `go`, `make`, `./scripts/...`, `.venv/bin/...`).
 - Compound pipelines (`cd subproj && pytest -v | tee test.log`) and multi-line heredoc scripts (`python3 - <<'PY'\nimport ...\nPY`) are supported automatically inside `allowed_workdirs` (default: `~/workspaces`).
-- All commands execute inside an isolated Linux mount namespace (`unshare` + `pivot_root`) confined strictly to `allowed_workdirs`; parent `$HOME` directories (`~/gateway`, `~/.ssh`, `~/.gemini`, `~/.config`), host `/tmp`, and privilege-escalation commands (`sudo`, `docker`, `mkfs`, `shutdown`, etc.) are blocked by both policy and kernel VFS isolation.
+- All commands execute inside an isolated Linux mount namespace (`unshare` + `pivot_root`) confined strictly to `allowed_workdirs`; parent `$HOME` directories (`~/gateway`, `~/.ssh`, `~/.gemini`, `~/.config`), host `/tmp`, and privilege-escalation commands (`sudo`, `mkfs`, `shutdown`, etc.) are blocked by both policy and kernel VFS isolation (`docker` / `docker compose` is blocked unless policy-filtered Docker proxy access is enabled on the gateway via `dots-gateway docker on`, checkable in `gateway_status.docker.enabled`).
 
 ## 4. Long-Running & Interactive Processes
 When running commands that require interactive `stdin`, long-running dev servers, or incremental log monitoring:

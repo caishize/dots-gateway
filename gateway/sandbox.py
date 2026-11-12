@@ -17,6 +17,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -156,6 +157,7 @@ def build_mount_ns_argv(
     sandbox_state_dir: Optional[str] = None,
     docker_mask_paths: Optional[Sequence[str]] = None,
     docker_proxy_socket: Optional[str] = None,
+    mount_gcloud_adc: bool = True,
 ) -> List[str]:
     """Wrap `target_argv` in an unprivileged user+mount namespace `pivot_root` jail.
 
@@ -403,9 +405,9 @@ def build_mount_ns_argv(
                     ]
                 )
 
-            # Read-only ~/.config/gcloud so `AGY_ADC_AUTH=true` can read application_default_credentials.json
+            # Read-only ~/.config/gcloud only when `AGY_ADC_AUTH=true` needs application_default_credentials.json
             gcloud_cfg_dir = os.path.join(home_dir, ".config", "gcloud")
-            if os.path.isdir(gcloud_cfg_dir):
+            if mount_gcloud_adc and os.path.isdir(gcloud_cfg_dir):
                 q_gc_dir = shlex.quote(gcloud_cfg_dir)
                 q_dst_gc_dir = shlex.quote(f"{stage_dir}{gcloud_cfg_dir}")
                 lines.extend(
@@ -590,7 +592,9 @@ def get_sandbox_disk_status(
     }
 
 
-def _scan_entry_activity(path: Path) -> Tuple[float, int]:
+def _scan_entry_activity(
+    path: Path, cancel_event: Optional[threading.Event] = None
+) -> Tuple[float, int]:
     """Compute `(last_active_at, total_size_bytes)` without following symlinks."""
     st = os.lstat(path)
     latest = max(float(st.st_mtime), float(st.st_atime))
@@ -600,9 +604,15 @@ def _scan_entry_activity(path: Path) -> Tuple[float, int]:
         return latest, int(st.st_size) if stat.S_ISREG(st.st_mode) else 0
 
     total_bytes = 0
+    dirs_scanned = 0
     stack: List[str] = [str(path)]
     while stack:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         cur_dir = stack.pop()
+        dirs_scanned += 1
+        if dirs_scanned % 1024 == 0:
+            time.sleep(0)
         try:
             with os.scandir(cur_dir) as it:
                 for entry in it:
@@ -664,7 +674,9 @@ def _remove_path_safe(target: Path, protected_mounts: set[str]) -> bool:
 
 
 def _collect_sandbox_candidates(
-    sandbox_root: Path, protected_mounts: set[str]
+    sandbox_root: Path,
+    protected_mounts: set[str],
+    cancel_event: Optional[threading.Event] = None,
 ) -> List[_SandboxCandidate]:
     """Enumerate coherent, cache-integrity-safe candidate entries inside `sandbox_root`."""
     candidates: List[_SandboxCandidate] = []
@@ -672,6 +684,8 @@ def _collect_sandbox_candidates(
     def _add_candidate(
         entry_p: Path, category: str, companions: Tuple[Path, ...] = ()
     ) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            return
         abs_e = os.path.abspath(str(entry_p))
         if abs_e in protected_mounts or os.path.ismount(abs_e):
             if entry_p.is_dir() and not entry_p.is_symlink():
@@ -683,13 +697,15 @@ def _collect_sandbox_candidates(
                     pass
             return
         try:
-            last_active, size_b = _scan_entry_activity(entry_p)
+            last_active, size_b = _scan_entry_activity(entry_p, cancel_event=cancel_event)
         except OSError:
+            return
+        if cancel_event is not None and cancel_event.is_set():
             return
         for comp in companions:
             try:
                 if os.path.lexists(comp):
-                    c_ts, c_sz = _scan_entry_activity(comp)
+                    c_ts, c_sz = _scan_entry_activity(comp, cancel_event=cancel_event)
                     if c_ts > last_active:
                         last_active = c_ts
                     size_b += c_sz
@@ -706,6 +722,8 @@ def _collect_sandbox_candidates(
         )
 
     for sub in SANDBOX_MANAGED_SUBDIRS:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         sub_dir = sandbox_root / sub
         if sub_dir.is_symlink() or not sub_dir.is_dir():
             continue
@@ -771,6 +789,7 @@ def cleanup_sandbox_state(
     low_space_free_percent: float = 15.0,
     now: Optional[float] = None,
     disk_usage_fn: Optional[Callable[[Path], Tuple[int, int]]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
     """Enforce two-tier LRU (`last_active_at`) lifecycle policy on `sandbox_dir`.
 
@@ -814,7 +833,29 @@ def cleanup_sandbox_state(
         }
 
     protected_mounts = _discover_protected_mount_dirs(sandbox_root)
-    candidates = _collect_sandbox_candidates(sandbox_root, protected_mounts)
+    candidates = _collect_sandbox_candidates(
+        sandbox_root, protected_mounts, cancel_event=cancel_event
+    )
+    if cancel_event is not None and cancel_event.is_set():
+        aborted_status = get_sandbox_disk_status(
+            sandbox_root,
+            low_space_free_gb=low_space_free_gb,
+            low_space_free_percent=low_space_free_percent,
+            disk_usage_fn=usage_getter,
+        )
+        return {
+            **aborted_status,
+            "checked_entries": len(candidates),
+            "deleted_expired_count": 0,
+            "deleted_low_space_count": 0,
+            "reclaimed_bytes": 0,
+            "retained_entries": len(candidates),
+            "protected_recent_entries": 0,
+            "low_space_before": aborted_status["low_space"],
+            "low_space_after": aborted_status["low_space"],
+            "cancelled": True,
+            "last_run_at": round(eff_now, 3),
+        }
     # Sort strictly by last active timestamp ascending (oldest inactive first, newest active last)
     candidates.sort(key=lambda c: (c.last_active_at, str(c.path)))
 
@@ -832,6 +873,9 @@ def cleanup_sandbox_state(
 
     # Phase 1: Always evict entries inactive longer than max_retention_days (30d)
     for cand in candidates:
+        if cancel_event is not None and cancel_event.is_set():
+            remaining.append(cand)
+            continue
         if cand.last_active_at < max_cutoff:
             if _evict(cand):
                 deleted_expired += 1
@@ -851,10 +895,14 @@ def cleanup_sandbox_state(
     low_space_before = pre_status["low_space"]
     still_kept: List[_SandboxCandidate] = []
 
-    if low_space_before:
+    if low_space_before and not (cancel_event is not None and cancel_event.is_set()):
         need_more_space = True
         for cand in remaining:
-            if not need_more_space or cand.last_active_at >= min_cutoff:
+            if (
+                not need_more_space
+                or cand.last_active_at >= min_cutoff
+                or (cancel_event is not None and cancel_event.is_set())
+            ):
                 still_kept.append(cand)
                 continue
             if _evict(cand):

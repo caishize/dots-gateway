@@ -394,11 +394,19 @@ class DockerRequestPolicy:
 class DockerProxy:
     """Asyncio unix-socket server forwarding policy-approved requests to the Docker daemon."""
 
-    def __init__(self, config: GatewayConfig, policy: CommandPolicy) -> None:
+    def __init__(
+        self,
+        config: GatewayConfig,
+        policy: CommandPolicy,
+        client_head_timeout: float = 15.0,
+        client_body_timeout: float = 60.0,
+    ) -> None:
         self.config = config
         self.rules = DockerRequestPolicy(config, policy)
         self.socket_path = str(Path(config.docker_proxy_socket).expanduser())
         self.upstream_path = str(config.docker_upstream_socket)
+        self.client_head_timeout = client_head_timeout
+        self.client_body_timeout = client_body_timeout
         self._server: Optional[asyncio.AbstractServer] = None
         self._conn_sem = asyncio.Semaphore(64)
         self.stats: Dict[str, int] = {"requests": 0, "denied": 0, "errors": 0}
@@ -455,7 +463,11 @@ class DockerProxy:
             _r, w = await asyncio.wait_for(asyncio.open_unix_connection(path), timeout=2.0)
         except (OSError, asyncio.TimeoutError):
             return False
-        w.close()
+        try:
+            w.close()
+            await w.wait_closed()
+        except Exception:
+            pass
         return True
 
     async def stop(self) -> None:
@@ -515,7 +527,11 @@ class DockerProxy:
 
     async def _read_request(self, reader: asyncio.StreamReader) -> Optional[_Request]:
         try:
-            head = await reader.readuntil(b"\r\n\r\n")
+            head = await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"), timeout=self.client_head_timeout
+            )
+        except asyncio.TimeoutError as exc:
+            raise DockerPolicyError("request header read timed out", 408) from exc
         except asyncio.IncompleteReadError as exc:
             if not exc.partial:
                 return None
@@ -554,32 +570,51 @@ class DockerProxy:
             return "length", int(cl)
         return "none", 0
 
-    @staticmethod
-    async def _read_body(reader: asyncio.StreamReader, mode: str, length: int, limit: int) -> bytes:
+    async def _read_body(self, reader: asyncio.StreamReader, mode: str, length: int, limit: int) -> bytes:
         if mode == "none":
             return b""
-        if mode == "length":
-            if length > limit:
-                raise DockerPolicyError("request body too large for policy inspection", 413)
-            return await reader.readexactly(length)
-        chunks: List[bytes] = []
-        total = 0
-        while True:
-            size_line = await reader.readuntil(b"\r\n")
-            try:
-                size = int(size_line.split(b";", 1)[0].strip(), 16)
-            except ValueError as exc:
-                raise DockerPolicyError("malformed chunk size", 400) from exc
-            if size == 0:
-                while (await reader.readuntil(b"\r\n")) != b"\r\n":
-                    pass
-                return b"".join(chunks)
-            total += size
-            if total > limit:
-                raise DockerPolicyError("request body too large for policy inspection", 413)
-            chunks.append(await reader.readexactly(size))
-            if await reader.readexactly(2) != b"\r\n":
-                raise DockerPolicyError("malformed chunk terminator", 400)
+        try:
+            if mode == "length":
+                if length > limit:
+                    raise DockerPolicyError("request body too large for policy inspection", 413)
+                return await asyncio.wait_for(
+                    reader.readexactly(length), timeout=self.client_body_timeout
+                )
+            chunks: List[bytes] = []
+            total = 0
+            while True:
+                size_line = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n"), timeout=self.client_body_timeout
+                )
+                try:
+                    size = int(size_line.split(b";", 1)[0].strip(), 16)
+                except ValueError as exc:
+                    raise DockerPolicyError("malformed chunk size", 400) from exc
+                if size == 0:
+                    while (
+                        await asyncio.wait_for(
+                            reader.readuntil(b"\r\n"), timeout=self.client_body_timeout
+                        )
+                    ) != b"\r\n":
+                        pass
+                    return b"".join(chunks)
+                total += size
+                if total > limit:
+                    raise DockerPolicyError("request body too large for policy inspection", 413)
+                chunks.append(
+                    await asyncio.wait_for(
+                        reader.readexactly(size), timeout=self.client_body_timeout
+                    )
+                )
+                if (
+                    await asyncio.wait_for(
+                        reader.readexactly(2), timeout=self.client_body_timeout
+                    )
+                    != b"\r\n"
+                ):
+                    raise DockerPolicyError("malformed chunk terminator", 400)
+        except asyncio.TimeoutError as exc:
+            raise DockerPolicyError("request body read timed out", 408) from exc
 
     @staticmethod
     async def _relay_body(
@@ -670,7 +705,11 @@ class DockerProxy:
                 if len(raw) > _MAX_JSON_BODY_BYTES * 2:
                     raise DockerPolicyError("upstream inspect response too large", 502)
         finally:
-            up_w.close()
+            try:
+                up_w.close()
+                await up_w.wait_closed()
+            except Exception:
+                pass
         head, sep, body = raw.partition(b"\r\n\r\n")
         if not sep:
             raise DockerPolicyError("malformed upstream response", 502)
@@ -790,7 +829,7 @@ class DockerProxy:
                     return "json", None, "exec_create", False
                 if rest == ["update"] and m == "POST":
                     return "json", None, "container_update", False
-                if rest == ["start"] and m == "POST":
+                if rest in (["start"], ["restart"], ["unpause"]) and m == "POST":
                     self.rules.revalidate_inspected_container(data)
                     return "stream", None, None, False
                 if rest in (["attach"], ["attach", "ws"]):
@@ -928,5 +967,6 @@ class DockerProxy:
         finally:
             try:
                 up_w.close()
+                await up_w.wait_closed()
             except Exception:
                 pass

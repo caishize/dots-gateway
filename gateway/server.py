@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import ssl
+import threading
 import time
 from typing import Any, Dict, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -53,6 +54,7 @@ class GatewayServer:
         self._server: Optional[asyncio.AbstractServer] = None
         self._loopback_server: Optional[asyncio.AbstractServer] = None
         self._cleanup_task: Optional[asyncio.Task[None]] = None
+        self._stop_event = threading.Event()
         self._conn_sem = asyncio.Semaphore(max(1, config.max_concurrent_connections))
         self._started_at = time.time()
         self.mcp = MCPHandler(
@@ -101,6 +103,7 @@ class GatewayServer:
                 self.config.loopback_http_port,
             )
 
+        self._stop_event.clear()
         if self.config.sandbox_cleanup_enabled and self._cleanup_task is None:
             self._cleanup_task = asyncio.create_task(self._sandbox_cleanup_loop())
 
@@ -110,12 +113,12 @@ class GatewayServer:
         return self.config.host, bound_port
 
     async def _sandbox_cleanup_loop(self) -> None:
-        initial_delay = min(5.0, max(0.5, float(self.config.sandbox_cleanup_interval_seconds)))
+        initial_delay = min(30.0, max(0.5, float(self.config.sandbox_cleanup_interval_seconds)))
         try:
             await asyncio.sleep(initial_delay)
-            while True:
+            while not self._stop_event.is_set():
                 try:
-                    res = await self.sessions.run_sandbox_cleanup()
+                    res = await self.sessions.run_sandbox_cleanup(cancel_event=self._stop_event)
                     evicted = int(res.get("deleted_expired_count", 0)) + int(
                         res.get("deleted_low_space_count", 0)
                     )
@@ -140,6 +143,7 @@ class GatewayServer:
             return
 
     async def stop(self) -> None:
+        self._stop_event.set()
         if self._cleanup_task is not None:
             self._cleanup_task.cancel()
             try:
@@ -466,7 +470,9 @@ class GatewayServer:
                     )
                     return True
                 form_str = req.body.decode("utf-8", errors="replace") if req.body else ""
-                status, redirect_loc, err_html = self.oauth.handle_authorize_submit(form_str)
+                status, redirect_loc, err_html = await asyncio.to_thread(
+                    self.oauth.handle_authorize_submit, form_str
+                )
                 if status == 401:
                     self.auth._record_failure(effective_ip, now)
                 if status == 302 and redirect_loc:
@@ -595,7 +601,13 @@ class GatewayServer:
                 return
 
             if req.method == "GET" and subaction is None:
-                after_seq = int((query.get("after_seq") or ["0"])[0])
+                try:
+                    after_seq = int((query.get("after_seq") or ["0"])[0])
+                except ValueError:
+                    await send_json_response(
+                        writer, 400, {"ok": False, "error": "Invalid integer parameter 'after_seq'"}
+                    )
+                    return
                 await send_json_response(
                     writer,
                     200,
@@ -604,7 +616,13 @@ class GatewayServer:
                 return
 
             if req.method == "GET" and subaction == "events":
-                after_seq = int((query.get("after_seq") or ["0"])[0])
+                try:
+                    after_seq = int((query.get("after_seq") or ["0"])[0])
+                except ValueError:
+                    await send_json_response(
+                        writer, 400, {"ok": False, "error": "Invalid integer parameter 'after_seq'"}
+                    )
+                    return
                 await self._stream_session_sse(session, writer, after_seq=after_seq)
                 return
 
@@ -711,7 +729,12 @@ class GatewayServer:
 
         accept = req.headers.get("accept", "").lower()
         if "text/event-stream" in accept and self.mcp.should_stream_sse(payload):
-            init_hdrs = {"Mcp-Session-Id": mcp_sid} if mcp_sid else None
+            init_hdrs: Dict[str, str] = {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "Mcp-Session-Id, MCP-Protocol-Version",
+            }
+            if mcp_sid:
+                init_hdrs["Mcp-Session-Id"] = mcp_sid
             sse = SSEWriter(writer, extra_headers=init_hdrs)
             await sse.start()
 

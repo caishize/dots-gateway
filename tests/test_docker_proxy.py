@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+import conftest  # noqa: F401
 from gateway.config import GatewayConfig, docker_access_enabled
 from gateway.docker_proxy import MANAGED_FILTER, MANAGED_LABEL, DockerProxy
 from gateway.policy import CommandPolicy
@@ -53,6 +54,12 @@ class _FakeDaemon:
                 "HostConfig": {"Binds": [], "NetworkMode": "bridge", "CgroupnsMode": "host"},
                 "Mounts": [],
             }
+        elif path == "/containers/managed_bad_mount/json":
+            payload = {
+                "Config": {"Labels": {MANAGED_LABEL: "true"}},
+                "HostConfig": {"Binds": ["/etc:/escaped"], "NetworkMode": "bridge"},
+                "Mounts": [{"Type": "bind", "Source": "/etc", "Destination": "/escaped"}],
+            }
         elif path == "/containers/foreign/json":
             payload = {"Config": {"Labels": {}}, "HostConfig": {"Privileged": True}}
         elif path.startswith("/containers/missing"):
@@ -68,6 +75,7 @@ class _FakeDaemon:
         )
         await w.drain()
         w.close()
+        await w.wait_closed()
 
 
 async def _call(sock: str, method: str, target: str, body: Any = None) -> Tuple[int, Any]:
@@ -80,6 +88,7 @@ async def _call(sock: str, method: str, target: str, body: Any = None) -> Tuple[
     await w.drain()
     resp = await asyncio.wait_for(r.read(), timeout=10)
     w.close()
+    await w.wait_closed()
     head_b, _, payload = resp.partition(b"\r\n\r\n")
     status = int(head_b.split(b" ")[1])
     try:
@@ -251,6 +260,49 @@ class DockerProxyTests(unittest.IsolatedAsyncioTestCase):
         )
         script = argv[argv.index("-c") + 1]
         self.assertIn(f"--bind {self.sock}", script)
+
+    async def test_chunked_body_restart_revalidation_and_head_timeout(self) -> None:
+        # 1. Multi-chunk `Transfer-Encoding: chunked` JSON body on create
+        payload_bytes = json.dumps({"Image": "alpine", "Labels": {"c": "d"}}).encode("utf-8")
+        c1, c2 = payload_bytes[:12], payload_bytes[12:]
+        chunked_wire = (
+            b"POST /v1.47/containers/create?name=chunked1 HTTP/1.1\r\n"
+            b"Host: docker\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            + f"{len(c1):x}\r\n".encode("ascii")
+            + c1
+            + b"\r\n"
+            + f"{len(c2):x}\r\n".encode("ascii")
+            + c2
+            + b"\r\n0\r\n\r\n"
+        )
+        r, w = await asyncio.open_unix_connection(self.sock)
+        w.write(chunked_wire)
+        await w.drain()
+        resp = await asyncio.wait_for(r.read(), timeout=5.0)
+        w.close()
+        await w.wait_closed()
+        self.assertIn(b"200", resp.splitlines()[0])
+        fwd = self._forwarded("/v1.47/containers/create?name=chunked1")
+        self.assertEqual(len(fwd), 1)
+        self.assertEqual(json.loads(fwd[0]["body"])["Labels"][MANAGED_LABEL], "true")
+
+        # 2. `restart` and `unpause` revalidate bind mounts against TOCTOU symlink swaps
+        for action in ("restart", "unpause"):
+            status, body = await _call(self.sock, "POST", f"/v1.47/containers/managed_bad_mount/{action}")
+            self.assertEqual(status, 403, body)
+            self.assertEqual(self._forwarded(f"/v1.47/containers/managed_bad_mount/{action}"), [])
+
+        # 3. Idle client header timeout returns 408 instead of holding proxy connection slot forever
+        self.proxy.client_head_timeout = 0.25
+        r_idle, w_idle = await asyncio.open_unix_connection(self.sock)
+        w_idle.write(b"GET /v1.47/version HTTP/1.1\r\n")
+        await w_idle.drain()
+        idle_resp = await asyncio.wait_for(r_idle.read(), timeout=3.0)
+        w_idle.close()
+        await w_idle.wait_closed()
+        self.assertIn(b"408", idle_resp.splitlines()[0])
 
 
 if __name__ == "__main__":

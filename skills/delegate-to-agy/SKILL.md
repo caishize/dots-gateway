@@ -12,9 +12,10 @@ The remote host has Google Antigravity CLI (`agy`) installed and authorized by t
 - **Use `run_agy`** when implementing multi-file features, large refactors, unfamiliar codebase exploration, or iterative build-fix loops where executing an agent locally next to the filesystem avoids cross-network round-trips.
 
 ## Standard Single-Shot Delegation (`run_agy`)
-1. Inspect the repository status first (`exec_command` with `git status --short` in `cwd`).
+1. Inspect the repository status first (`exec_command` with `git status --short` in `cwd`). Optionally call `list_agy_models` if you want to check available model IDs under the gateway's active auth mode (`adc` or `oauth`) and current gateway default model (`dots-gateway agy-model`).
 2. Invoke `run_agy` with a clear, self-contained engineering specification:
    - `cwd`: Absolute path to the target project on the remote machine.
+   - `model`: Optional model ID from `list_agy_models` (omit to use the gateway default model).
    - `skip_permissions`: `true` (default; passes `--dangerously-skip-permissions`) or `false` (omits `--dangerously-skip-permissions` while still auto-approving sandboxed commands via session `toolPermission: "proceed-in-sandbox"` and enforcing `permissions.deny`).
    - `prompt`: Include exact requirements, constraints, files of interest, and the test command `agy` must run before finishing.
    - Optional: Pass `add_dirs` for explicit extra directories inside `allowed_workdirs`, or `continue_last: true` / `conversation_id` to iterate on `agy`'s previous run.

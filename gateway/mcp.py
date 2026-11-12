@@ -140,6 +140,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "timeout": {
                     "type": "number",
+                    "minimum": 0.1,
                     "description": "Timeout in seconds (default: 21600 [6h], max: 86400 [24h]).",
                 },
             },
@@ -218,6 +219,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "timeout": {
                     "type": "number",
+                    "minimum": 0.1,
                     "description": "Timeout in seconds (default: 28800 [8h], max: 86400 [24h]).",
                 },
             },
@@ -306,6 +308,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "timeout": {
                     "type": "number",
+                    "minimum": 0.1,
                     "description": "Timeout in seconds (default: 28800 [8h], max: 86400 [24h]).",
                 },
             },
@@ -412,6 +415,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "timeout": {
                     "type": "number",
+                    "minimum": 0.1,
                     "description": "Timeout in seconds (default: 28800 [8h] for agy/codex, 21600 [6h] for exec; max: 86400 [24h]).",
                 },
             },
@@ -671,7 +675,10 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                             "replace_all": {
                                 "type": "boolean",
                                 "default": False,
-                                "description": "Replace all occurrences if target appears multiple times.",
+                                "description": (
+                                    "Replace all occurrences when target appears multiple times "
+                                    "(default: false, which requires a unique match)."
+                                ),
                             },
                         },
                         "required": ["target", "replacement"],

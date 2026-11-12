@@ -279,7 +279,12 @@ DEFAULT_AGY_READONLY_ROOTS: List[str] = [
 
 
 def detect_default_sandbox_state_dir() -> str:
-    """Prefer persistent large data disk `/mnt/data/dots-sandbox` when writable; else `~/.cache/dots-sandbox`."""
+    """Prefer env override, then persistent large data disk `/mnt/data/dots-sandbox` when writable; else `~/.cache/dots-sandbox`."""
+    env_override = (
+        os.environ.get("GATEWAY_SANDBOX_STATE_DIR") or os.environ.get("GATEWAY_SANDBOX_DIR") or ""
+    ).strip()
+    if env_override:
+        return env_override
     data_sb = Path("/mnt/data/dots-sandbox")
     try:
         if data_sb.is_dir() and os.access(data_sb, os.W_OK | os.X_OK):
@@ -372,12 +377,24 @@ class GatewayConfig:
     agy_include_allowed_workdirs: bool = True
     agy_extra_workspace_dirs: List[str] = field(default_factory=list)
     agy_extra_readonly_roots: List[str] = field(default_factory=list)
-    agy_env_file: str = str(Path.home() / ".config" / "dots-gateway" / "agy.env")
+    agy_env_file: str = field(
+        default_factory=lambda: (
+            os.environ.get("GATEWAY_AGY_ENV_FILE")
+            or str(Path.home() / ".config" / "dots-gateway" / "agy.env")
+        ).strip()
+    )
     # Default `agy --model` for gateway sessions when callers omit `model`.
     # Precedence: per-call `model` > hot-reload `agy_model_file` > `agy_default_model` >
     # agy's own `~/.gemini/antigravity-cli/settings.json` selection.
-    agy_default_model: Optional[str] = None
-    agy_model_file: str = str(Path.home() / ".config" / "dots-gateway" / "agy.model")
+    agy_default_model: Optional[str] = field(
+        default_factory=lambda: (os.environ.get("GATEWAY_AGY_DEFAULT_MODEL") or "").strip() or None
+    )
+    agy_model_file: str = field(
+        default_factory=lambda: (
+            os.environ.get("GATEWAY_AGY_MODEL_FILE")
+            or str(Path.home() / ".config" / "dots-gateway" / "agy.model")
+        ).strip()
+    )
     agy_models_cache_seconds: float = 300.0
     codex_binary: str = DEFAULT_CODEX_BIN
     bwrap_binary: str = DEFAULT_BWRAP_BIN
@@ -385,7 +402,12 @@ class GatewayConfig:
     codex_default_sandbox: str = "workspace-write"
     codex_sandbox_network_access: bool = True
     codex_extra_writable_roots: List[str] = field(default_factory=list)
-    codex_env_file: str = str(Path.home() / ".config" / "dots-gateway" / "codex.env")
+    codex_env_file: str = field(
+        default_factory=lambda: (
+            os.environ.get("GATEWAY_CODEX_ENV_FILE")
+            or str(Path.home() / ".config" / "dots-gateway" / "codex.env")
+        ).strip()
+    )
     # Policy-filtered Docker access for sandboxed sessions (exec_command / run_agy / run_codex).
     # The real daemon socket is ALWAYS masked inside the mount-namespace jail; when enabled, a
     # gateway-owned filtering proxy socket is bind-mounted at `/run/docker.sock` instead.
@@ -412,7 +434,16 @@ class GatewayConfig:
     agy_queue_timeout_seconds: float = 28800.0
     # Isolated sandbox storage location & LRU lifecycle retention policy
     sandbox_state_dir: str = field(default_factory=detect_default_sandbox_state_dir)
-    sandbox_cleanup_enabled: bool = True
+    sandbox_cleanup_enabled: bool = field(
+        default_factory=lambda: (
+            os.environ.get("GATEWAY_SANDBOX_CLEANUP_ENABLED")
+            or os.environ.get("GATEWAY_SANDBOX_CLEANUP")
+            or "true"
+        )
+        .strip()
+        .lower()
+        in ("1", "true", "yes")
+    )
     sandbox_cleanup_interval_seconds: float = 3600.0
     sandbox_max_retention_days: float = 30.0
     sandbox_min_retention_days: float = 7.0

@@ -22,5 +22,5 @@ The remote host has OpenAI Codex CLI (`codex`) installed and authorized by the g
 3. Verify changes afterward via `exec_command` (`git diff --stat` and the project's test suite).
 
 ## Parallel Execution & Concurrency
-- `run_codex` and `run_agy` share the gateway's heavy-agent concurrency semaphore (`max_concurrent_agy`) to protect host RAM. Extra calls automatically wait in the gateway queue with SSE keepalive heartbeats.
+- `run_codex` uses its own dedicated concurrency semaphore (`max_concurrent_codex`, default: `6`), independent of `run_agy`'s `max_concurrent_agy` semaphore, so Codex reviews and tasks can run alongside `agy`. Extra calls automatically wait in the gateway queue with SSE keepalive heartbeats.
 - Never run two write-enabled agents on the same working directory (`cwd`) simultaneously; create separate `git worktree` directories when running parallel tasks on one repo.

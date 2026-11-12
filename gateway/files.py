@@ -31,10 +31,32 @@ class FileService:
 
     def stat(self, path_str: str, cwd: Optional[str] = None) -> Dict[str, Any]:
         target = self._resolve_safe_path(path_str, cwd=cwd)
-        if not target.exists() and not target.is_symlink():
+        raw_p = Path(str(path_str)).expanduser()
+        if not raw_p.is_absolute():
+            anchor = Path(cwd or self.policy.config.default_workdir).expanduser().resolve()
+            raw_p = anchor / raw_p
+        lex_p = Path(os.path.abspath(str(raw_p)))
+
+        try:
+            st = target.stat()
+        except OSError:
+            if lex_p.is_symlink():
+                try:
+                    lst = lex_p.lstat()
+                    return {
+                        "exists": False,
+                        "broken_symlink": True,
+                        "path": str(lex_p),
+                        "resolved_path": str(target),
+                        "type": "symlink",
+                        "size": lst.st_size,
+                        "mode": oct(lst.st_mode & 0o777),
+                        "mtime": lst.st_mtime,
+                    }
+                except OSError:
+                    pass
             return {"exists": False, "path": str(target)}
 
-        st = target.stat()
         kind = "dir" if stat_mod.S_ISDIR(st.st_mode) else "file"
         info: Dict[str, Any] = {
             "exists": True,
@@ -244,13 +266,23 @@ class FileService:
         for idx, edit in enumerate(edits):
             old = edit.get("target")
             new = edit.get("replacement", "")
+            replace_all = bool(edit.get("replace_all", False))
             if not old:
                 raise ValueError(f"Edit #{idx} is missing non-empty 'target'")
             if old not in text:
                 raise ValueError(f"Edit #{idx} target snippet not found in {target}")
             count = text.count(old)
-            text = text.replace(old, new)
-            applied += count
+            if count > 1 and not replace_all:
+                raise ValueError(
+                    f"Edit #{idx} target snippet matched {count} times in {target}; "
+                    "provide more surrounding context or set replace_all=true"
+                )
+            if replace_all:
+                text = text.replace(old, new)
+                applied += count
+            else:
+                text = text.replace(old, new, 1)
+                applied += 1
 
         res = self.write(str(target), text, encoding="utf-8", append=False)
         res["replacements_applied"] = applied

@@ -9,20 +9,38 @@ import os
 import shutil
 import tempfile
 import unittest
+import tomllib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import conftest  # noqa: F401
+import gateway
 from dots_client import DotsGatewayClient
-from gateway.config import GATEWAY_ROOT, HOME_DIR, GatewayConfig
+from gateway.config import GATEWAY_ROOT, GatewayConfig
+from gateway.mcp import TOOL_DEFINITIONS
 from gateway.server import GatewayServer
 from gateway.tls import ensure_tls_pki
 
 
 class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
+    _shared_pki_dir: str = ""
+    _shared_pki: Dict[str, str] = {}
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls._shared_pki_dir = tempfile.mkdtemp(prefix="dots_mcp_shared_pki_")
+        cls._shared_pki = ensure_tls_pki(Path(cls._shared_pki_dir), extra_hosts=["127.0.0.1"])
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._shared_pki_dir:
+            shutil.rmtree(cls._shared_pki_dir, ignore_errors=True)
+        super().tearDownClass()
+
     async def asyncSetUp(self) -> None:
         self.tmpdir = tempfile.mkdtemp(prefix="dots_mcp_test_")
-        self.certs_dir = Path(self.tmpdir) / "certs"
-        self.pki = ensure_tls_pki(self.certs_dir, extra_hosts=["127.0.0.1"])
+        self.pki = dict(self._shared_pki)
 
         self.cfg = GatewayConfig(
             host="127.0.0.1",
@@ -34,6 +52,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             tls_certfile=self.pki["server_cert"],
             tls_keyfile=self.pki["server_key"],
             tls_ca_file=self.pki["ca_cert"],
+            docker_proxy_socket=os.path.join(self.tmpdir, "mcp-main-docker-proxy.sock"),
         )
         self.server = GatewayServer(self.cfg)
         host, port = await self.server.start()
@@ -58,6 +77,18 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(codex_manifest["name"], "dots-gateway")
         self.assertEqual(codex_manifest["mcpServers"], "./mcp.json")
+
+        # 2b. Enforce strict version parity across package, manifests, pyproject.toml, and README
+        pyproject_data = tomllib.loads((GATEWAY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        expected_ver = gateway.__version__
+        self.assertEqual(expected_ver, "1.5.15")
+        self.assertEqual(root_manifest["version"], expected_ver)
+        self.assertEqual(codex_manifest["version"], expected_ver)
+        self.assertEqual(pyproject_data["project"]["version"], expected_ver)
+        readme_text = (GATEWAY_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"v{expected_ver}", readme_text)
+        self.assertEqual(len(TOOL_DEFINITIONS), 16)
+        self.assertTrue(callable(getattr(DotsGatewayClient, "list_agy_models", None)))
 
         # 3. Validate mcp.json
         mcp_cfg = json.loads((GATEWAY_ROOT / "mcp.json").read_text(encoding="utf-8"))
@@ -620,6 +651,139 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(st, 200)
         self.assertTrue(json.loads(ref_raw)["access_token"].startswith("dots_at."))
+
+        # 5b. Confidential client (`sec_...`) MUST authenticate on both authorization_code and refresh_token
+        st_sec_reg, _, sec_reg_raw = await asyncio.to_thread(
+            _req,
+            "POST",
+            "/oauth/register",
+            {
+                "client_name": "dots-confidential",
+                "redirect_uris": [redirect_uri],
+                "token_endpoint_auth_method": "client_secret_post",
+            },
+        )
+        self.assertEqual(st_sec_reg, 201)
+        sec_reg = json.loads(sec_reg_raw)
+        sec_cid = sec_reg["client_id"]
+        sec_csec = sec_reg["client_secret"]
+        self.assertTrue(sec_cid.startswith("sec_"))
+
+        async def _issue_code_for(cid: str) -> str:
+            qs = urllib.parse.urlencode(
+                {
+                    "response_type": "code",
+                    "client_id": cid,
+                    "redirect_uri": redirect_uri,
+                    "state": "sec_state",
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                }
+            )
+            st_g, _, doc = await asyncio.to_thread(_req, "GET", f"/oauth/authorize?{qs}")
+            self.assertEqual(st_g, 200)
+            m_c = re.search(r'name="csrf_token"\s+value="([^"]+)"', doc)
+            assert m_c is not None
+            fp = urllib.parse.urlencode(
+                {
+                    "response_type": "code",
+                    "client_id": cid,
+                    "redirect_uri": redirect_uri,
+                    "state": "sec_state",
+                    "scope": "mcp",
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                    "csrf_token": m_c.group(1),
+                    "gateway_token": self.cfg.api_tokens[0],
+                }
+            )
+            st_p, rh, _ = await asyncio.to_thread(
+                _req, "POST", "/oauth/authorize", fp, {"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            self.assertEqual(st_p, 302)
+            return urllib.parse.parse_qs(urllib.parse.urlparse(rh["Location"]).query)["code"][0]
+
+        # Omitting client_id / client_secret on confidential client code exchange MUST return 401
+        sec_code_unauth = await _issue_code_for(sec_cid)
+        st_unauth_code, _, _ = await asyncio.to_thread(
+            _req,
+            "POST",
+            "/oauth/token",
+            urllib.parse.urlencode(
+                {
+                    "grant_type": "authorization_code",
+                    "code": sec_code_unauth,
+                    "redirect_uri": redirect_uri,
+                    "code_verifier": verifier,
+                }
+            ),
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(st_unauth_code, 401)
+
+        # Providing valid client_id + client_secret succeeds, and refresh_token ALSO requires client_secret
+        sec_code_ok = await _issue_code_for(sec_cid)
+        st_ok_sec, _, sec_tok_raw = await asyncio.to_thread(
+            _req,
+            "POST",
+            "/oauth/token",
+            urllib.parse.urlencode(
+                {
+                    "grant_type": "authorization_code",
+                    "code": sec_code_ok,
+                    "redirect_uri": redirect_uri,
+                    "client_id": sec_cid,
+                    "client_secret": sec_csec,
+                    "code_verifier": verifier,
+                }
+            ),
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(st_ok_sec, 200, sec_tok_raw)
+        sec_rt = json.loads(sec_tok_raw)["refresh_token"]
+
+        st_unauth_rt, _, _ = await asyncio.to_thread(
+            _req,
+            "POST",
+            "/oauth/token",
+            urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": sec_rt}),
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(st_unauth_rt, 401)
+
+        st_ok_rt, _, _ = await asyncio.to_thread(
+            _req,
+            "POST",
+            "/oauth/token",
+            urllib.parse.urlencode(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": sec_rt,
+                    "client_id": sec_cid,
+                    "client_secret": sec_csec,
+                }
+            ),
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(st_ok_rt, 200)
+
+        # Public client omitting redirect_uri on authorization_code MUST return 400 (no validation bypass)
+        pub_code_bad = await _issue_code_for(client_id)
+        st_no_redir, _, _ = await asyncio.to_thread(
+            _req,
+            "POST",
+            "/oauth/token",
+            urllib.parse.urlencode(
+                {
+                    "grant_type": "authorization_code",
+                    "code": pub_code_bad,
+                    "client_id": client_id,
+                    "code_verifier": verifier,
+                }
+            ),
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(st_no_redir, 400)
 
         # 6. Secret Capability Path (/mcp/<API_TOKEN>) for UIs selecting "No Authentication"
         st_bad, _, _ = await asyncio.to_thread(

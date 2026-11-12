@@ -24,8 +24,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from dots_client import DotsGatewayClient
-from gateway.tls import compute_cert_sha256
+from dots_client import DotsGatewayClient  # noqa: E402
+from gateway.tls import compute_cert_sha256  # noqa: E402
 
 DEMO_WORKDIR = str(Path.home() / "workspaces" / ".live_demo")
 

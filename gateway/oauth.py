@@ -86,6 +86,14 @@ class OAuthServer:
         self.config = config
         self._fallback_secret = secrets.token_hex(32)
         self._codes: OrderedDict[str, PendingAuthCode] = OrderedDict()
+        self._dummy_pw_hash: Optional[str] = None
+
+    def _get_dummy_pw_hash(self) -> str:
+        if self._dummy_pw_hash is None:
+            from .config import hash_password_pbkdf2
+
+            self._dummy_pw_hash = hash_password_pbkdf2("dots-oauth-dummy-constant-time")
+        return self._dummy_pw_hash
 
     def _signing_key(self) -> bytes:
         base = self.config.hmac_secret or (
@@ -99,9 +107,11 @@ class OAuthServer:
         ).digest()
         return "dcs_" + _b64url_encode(digest)
 
-    def _mint_signed_token(self, token_type: str, subject: str, scope: str, ttl: int) -> str:
+    def _mint_signed_token(
+        self, token_type: str, subject: str, scope: str, ttl: int, client_id: str = ""
+    ) -> str:
         now = int(time.time())
-        payload = {
+        payload: Dict[str, Any] = {
             "typ": token_type,
             "sub": subject,
             "scp": scope or "mcp",
@@ -109,6 +119,8 @@ class OAuthServer:
             "exp": now + ttl,
             "jti": secrets.token_urlsafe(12),
         }
+        if client_id:
+            payload["cid"] = client_id
         body_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         sig = hmac.new(self._signing_key(), body_b64.encode("ascii"), hashlib.sha256).digest()
         prefix = "dots_at" if token_type == "at" else "dots_rt"
@@ -170,7 +182,10 @@ class OAuthServer:
         if ":" in val and self.config.users:
             username, password = val.split(":", 1)
             stored = self.config.users.get(username)
-            if stored and verify_password_pbkdf2(password, stored):
+            if stored is None:
+                verify_password_pbkdf2(password, self._get_dummy_pw_hash())
+                return None
+            if verify_password_pbkdf2(password, stored):
                 return f"oauth-user:{username}"
         return None
 
@@ -422,7 +437,7 @@ class OAuthServer:
             except Exception:
                 return 401, {"error": "invalid_client", "error_description": "Invalid Basic header"}
 
-        client_id = params.get("client_id") or basic_cid
+        client_id = (params.get("client_id") or basic_cid).strip()
         client_secret = params.get("client_secret") or basic_csec
         if client_id.startswith("sec_"):
             expected_sec = self._derive_client_secret(client_id)
@@ -442,12 +457,23 @@ class OAuthServer:
                     "error": "invalid_grant",
                     "error_description": "Authorization code is invalid or expired",
                 }
-            if client_id and client_id != pending.client_id:
+            if pending.client_id.startswith("sec_"):
+                expected_sec = self._derive_client_secret(pending.client_id)
+                if (
+                    client_id != pending.client_id
+                    or not client_secret
+                    or not secrets.compare_digest(client_secret, expected_sec)
+                ):
+                    return 401, {
+                        "error": "invalid_client",
+                        "error_description": "Confidential client authentication required",
+                    }
+            elif pending.client_id and client_id != pending.client_id:
                 return 400, {
                     "error": "invalid_grant",
                     "error_description": "client_id mismatch",
                 }
-            if redirect_uri and redirect_uri != pending.redirect_uri:
+            if pending.redirect_uri and redirect_uri != pending.redirect_uri:
                 return 400, {
                     "error": "invalid_grant",
                     "error_description": "redirect_uri mismatch",
@@ -465,10 +491,18 @@ class OAuthServer:
                 }
 
             at = self._mint_signed_token(
-                "at", pending.principal, pending.scope, ACCESS_TOKEN_TTL_SECONDS
+                "at",
+                pending.principal,
+                pending.scope,
+                ACCESS_TOKEN_TTL_SECONDS,
+                client_id=pending.client_id,
             )
             rt = self._mint_signed_token(
-                "rt", pending.principal, pending.scope, REFRESH_TOKEN_TTL_SECONDS
+                "rt",
+                pending.principal,
+                pending.scope,
+                REFRESH_TOKEN_TTL_SECONDS,
+                client_id=pending.client_id,
             )
             return 200, {
                 "access_token": at,
@@ -486,10 +520,31 @@ class OAuthServer:
                     "error": "invalid_grant",
                     "error_description": "Refresh token is invalid or expired",
                 }
+            bound_cid = str(claims.get("cid") or "")
+            if bound_cid.startswith("sec_"):
+                expected_sec = self._derive_client_secret(bound_cid)
+                if (
+                    client_id != bound_cid
+                    or not client_secret
+                    or not secrets.compare_digest(client_secret, expected_sec)
+                ):
+                    return 401, {
+                        "error": "invalid_client",
+                        "error_description": "Confidential client authentication required",
+                    }
+            elif client_id and bound_cid and client_id != bound_cid:
+                return 400, {
+                    "error": "invalid_grant",
+                    "error_description": "client_id mismatch",
+                }
             sub = str(claims.get("sub") or "oauth-client")
             scp = str(claims.get("scp") or "mcp")
-            at = self._mint_signed_token("at", sub, scp, ACCESS_TOKEN_TTL_SECONDS)
-            rt = self._mint_signed_token("rt", sub, scp, REFRESH_TOKEN_TTL_SECONDS)
+            at = self._mint_signed_token(
+                "at", sub, scp, ACCESS_TOKEN_TTL_SECONDS, client_id=bound_cid
+            )
+            rt = self._mint_signed_token(
+                "rt", sub, scp, REFRESH_TOKEN_TTL_SECONDS, client_id=bound_cid
+            )
             return 200, {
                 "access_token": at,
                 "token_type": "Bearer",

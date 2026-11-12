@@ -108,7 +108,7 @@ async def read_http_request(
         return None
     parts = line_str.split(" ", 2)
     if len(parts) != 3:
-        raise ValueError(f"Malformed HTTP request line")
+        raise ValueError("Malformed HTTP request line")
     method, path, version = parts
 
     headers: Dict[str, str] = {}
@@ -130,8 +130,15 @@ async def read_http_request(
         writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
         await writer.drain()
 
-    transfer_encoding = headers.get("transfer-encoding", "").lower()
-    if "chunked" in transfer_encoding:
+    has_te = "transfer-encoding" in headers
+    has_cl = "content-length" in headers
+    if has_te and has_cl:
+        raise ValueError("Conflicting Transfer-Encoding and Content-Length headers")
+
+    transfer_encoding = headers.get("transfer-encoding", "").strip().lower()
+    if transfer_encoding:
+        if transfer_encoding != "chunked":
+            raise ValueError(f"Unsupported Transfer-Encoding: {transfer_encoding!r}")
         body = await _read_chunked_body(reader, max_body_bytes=max_body_bytes, timeout=60.0)
     else:
         content_length = int(headers.get("content-length", "0") or "0")
@@ -272,8 +279,9 @@ class SSEWriter:
 
     async def send_comment(self, comment: str = "keepalive") -> None:
         """Send an SSE comment frame (`: keepalive\\n\\n`) to prevent NAT idle disconnects."""
+        safe = comment.replace("\r", " ").replace("\n", " ")
         async with self._lock:
-            self.writer.write(f": {comment}\n\n".encode("utf-8"))
+            self.writer.write(f": {safe}\n\n".encode("utf-8"))
             await self.writer.drain()
 
     async def send_event(
@@ -282,9 +290,11 @@ class SSEWriter:
         async with self._lock:
             lines = []
             if event_id is not None:
-                lines.append(f"id: {event_id}\n")
+                safe_id = str(event_id).replace("\r", "").replace("\n", "")
+                lines.append(f"id: {safe_id}\n")
             if event:
-                lines.append(f"event: {event}\n")
+                safe_ev = event.replace("\r", "").replace("\n", "")
+                lines.append(f"event: {safe_ev}\n")
             serialized = (
                 data
                 if isinstance(data, str)
@@ -436,5 +446,6 @@ class WebSocketConnection:
         self.closed = True
         try:
             self.writer.close()
+            await self.writer.wait_closed()
         except Exception:
             pass

@@ -6,11 +6,11 @@ import asyncio
 import json
 import os
 import shutil
-import ssl
 import tempfile
 import unittest
 from pathlib import Path
 
+import conftest  # noqa: F401
 from dots_client import DotsGatewayClient
 from gateway.config import (
     DEFAULT_WORKSPACE_DIR,
@@ -37,6 +37,7 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
             rate_limit_window_seconds=60,
             allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
+            docker_proxy_socket=os.path.join(self.tmpdir, "gw-docker-proxy.sock"),
         )
         self.server = GatewayServer(self.cfg)
         host, port = await self.server.start()
@@ -1219,9 +1220,212 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(p_recent_1d.exists())
             for sub in SANDBOX_SUBDIRS:
                 self.assertTrue((sb_root / sub).is_dir())
+
+            # Phase D: Cooperative cancellation aborts scan/eviction immediately during shutdown
+            p_cancel_40d = _make_entry("tmp/cancel_40d/blob.bin", 40.0, 2 * mib)
+            import threading
+
+            cancelled = threading.Event()
+            cancelled.set()
+            res_cancelled = cleanup_sandbox_state(
+                sb_root,
+                max_retention_days=30.0,
+                min_retention_days=7.0,
+                now=now_ts,
+                disk_usage_fn=lambda _: (50 * gib, 1 * gib),
+                cancel_event=cancelled,
+            )
+            self.assertTrue(res_cancelled.get("cancelled"))
+            self.assertEqual(res_cancelled["deleted_expired_count"], 0)
+            self.assertEqual(res_cancelled["deleted_low_space_count"], 0)
+            self.assertTrue(p_cancel_40d.exists())
         finally:
             shutil.rmtree(sb_root, ignore_errors=True)
             shutil.rmtree(ws_dir, ignore_errors=True)
+
+    async def test_hardening_regressions_timeouts_env_patch_broken_symlinks_and_http_guards(
+        self,
+    ) -> None:
+        from gateway.executor import SessionManager, _extract_initial_agent_id
+
+        client = DotsGatewayClient(base_url=self.base_url, token="test-secret-token-12345")
+
+        # 1. Invalid / zero / negative / non-finite timeouts MUST fail with HTTP 400 (never infinite timeout)
+        for bad_timeout in (0, -1, "NaN", "Infinity"):
+            for path, payload in (
+                ("/v1/exec", {"command": ["echo", "hi"], "cwd": self.tmpdir, "timeout": bad_timeout}),
+                ("/v1/agy", {"prompt": "hi", "cwd": self.tmpdir, "timeout": bad_timeout}),
+                ("/v1/codex", {"prompt": "hi", "cwd": self.tmpdir, "timeout": bad_timeout}),
+                (
+                    "/v1/sessions",
+                    {
+                        "type": "exec",
+                        "command": ["echo", "hi"],
+                        "cwd": self.tmpdir,
+                        "timeout": bad_timeout,
+                    },
+                ),
+            ):
+                with self.assertRaises(RuntimeError) as err_ctx:
+                    await asyncio.to_thread(client._request_json, "POST", path, payload)
+                self.assertIn("400", str(err_ctx.exception))
+
+        # 2. Failed spawn (nonexistent binary with isolate_mount_namespace=False) cleans up session slot
+        missing_bin = os.path.join(self.tmpdir, "does_not_exist_bin")
+        no_ns_cfg = GatewayConfig(
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            allowed_commands=[missing_bin],
+            isolate_mount_namespace=False,
+            max_concurrent_sessions=1,
+            sandbox_cleanup_enabled=False,
+        )
+        mgr = SessionManager(no_ns_cfg, CommandPolicy(no_ns_cfg))
+        with self.assertRaises(FileNotFoundError):
+            await mgr.create_session(command=[missing_bin], cwd=self.tmpdir)
+        self.assertEqual(mgr.active_count(), 0)
+        self.assertEqual(mgr.list_sessions(), [])
+
+        # 3. Caller `env` cannot override blocked security/cloud/dynamic-linker/gateway keys
+        env_res = await asyncio.to_thread(
+            client._request_json,
+            "POST",
+            "/v1/exec",
+            {
+                "command": [
+                    "python3",
+                    "-c",
+                    (
+                        "import json, os; print(json.dumps({"
+                        "'ld': os.environ.get('LD_PRELOAD'),"
+                        "'gce_host': os.environ.get('GCE_METADATA_HOST'),"
+                        "'no_gce': os.environ.get('NO_GCE_CHECK'),"
+                        "'adc': os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'),"
+                        "'docker': os.environ.get('DOCKER_HOST'),"
+                        "'gw_tok': os.environ.get('GATEWAY_TOKEN'),"
+                        "'gw_sb': os.environ.get('GATEWAY_SANDBOX_STATE_DIR'),"
+                        "'safe': os.environ.get('CUSTOM_CALLER_VAR')"
+                        "}))"
+                    ),
+                ],
+                "cwd": self.tmpdir,
+                "env": {
+                    "LD_PRELOAD": "/tmp/evil.so",
+                    "GCE_METADATA_HOST": "evil.internal",
+                    "NO_GCE_CHECK": "",
+                    "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/fake_adc.json",
+                    "DOCKER_HOST": "tcp://evil.example:2375",
+                    "GATEWAY_TOKEN": "leaked",
+                    "CUSTOM_CALLER_VAR": "allowed_val",
+                },
+            },
+        )
+        child_env = json.loads(env_res["stdout"].strip())
+        self.assertIsNone(child_env["ld"])
+        self.assertEqual(child_env["gce_host"], "127.0.0.1:1")
+        self.assertEqual(child_env["no_gce"], "true")
+        self.assertIsNone(child_env["adc"])
+        self.assertNotEqual(child_env["docker"], "tcp://evil.example:2375")
+        self.assertIsNone(child_env["gw_tok"])
+        self.assertIsNone(child_env["gw_sb"])
+        self.assertEqual(child_env["safe"], "allowed_val")
+
+        # 4. `_extract_initial_agent_id` handles both agy `--conversation` and codex `resume`
+        self.assertEqual(
+            _extract_initial_agent_id(
+                ["agy", "chat", "--conversation", "conv-123", "hi"],
+                is_agy=True,
+                is_codex=False,
+            ),
+            "conv-123",
+        )
+        self.assertEqual(
+            _extract_initial_agent_id(
+                ["agy", "chat", "--conversation=conv-456", "hi"],
+                is_agy=True,
+                is_codex=False,
+            ),
+            "conv-456",
+        )
+        self.assertEqual(
+            _extract_initial_agent_id(
+                ["codex", "exec", "resume", "thr-789", "--", "hi"],
+                is_agy=False,
+                is_codex=True,
+            ),
+            "thr-789",
+        )
+
+        # 5. `fs_patch` (`replace_all`) & `fs_stat` on broken symlinks inside workspace
+        patch_file = Path(self.tmpdir) / "multi.txt"
+        patch_file.write_text("alpha\nbeta\nalpha\n", encoding="utf-8")
+        with self.assertRaises(RuntimeError) as patch_err:
+            await asyncio.to_thread(
+                client._request_json,
+                "POST",
+                "/v1/files/patch",
+                {
+                    "path": str(patch_file),
+                    "edits": [{"target": "alpha", "replacement": "omega"}],
+                },
+            )
+        self.assertIn("400", str(patch_err.exception))
+        self.assertIn("matched 2 times", str(patch_err.exception))
+        self.assertEqual(patch_file.read_text(encoding="utf-8"), "alpha\nbeta\nalpha\n")
+
+        ok_patch = await asyncio.to_thread(
+            client._request_json,
+            "POST",
+            "/v1/files/patch",
+            {
+                "path": str(patch_file),
+                "edits": [{"target": "alpha", "replacement": "omega", "replace_all": True}],
+            },
+        )
+        self.assertTrue(ok_patch["ok"])
+        self.assertEqual(ok_patch["replacements_applied"], 2)
+        self.assertEqual(patch_file.read_text(encoding="utf-8"), "omega\nbeta\nomega\n")
+
+        broken_link = Path(self.tmpdir) / "dangling_link"
+        os.symlink("missing_relative_target.txt", broken_link)
+        st_broken = await asyncio.to_thread(
+            client._request_json, "GET", f"/v1/files/stat?path={broken_link}"
+        )
+        self.assertTrue(st_broken["ok"])
+        self.assertFalse(st_broken["exists"])
+        self.assertTrue(st_broken["broken_symlink"])
+        self.assertEqual(st_broken["type"], "symlink")
+
+        # 6. Malformed `after_seq` returns 400 (not 500), and CL+TE smuggling attempt returns 400
+        sess_created = await asyncio.to_thread(
+            client._request_json,
+            "POST",
+            "/v1/sessions",
+            {"type": "exec", "command": ["echo", "seq_check"], "cwd": self.tmpdir},
+        )
+        sid = sess_created["session_id"]
+        with self.assertRaises(RuntimeError) as seq_err:
+            await asyncio.to_thread(
+                client._request_json, "GET", f"/v1/sessions/{sid}?after_seq=not_an_int"
+            )
+        self.assertIn("400", str(seq_err.exception))
+        live_sess = self.server.sessions.get_session(sid)
+        if live_sess is not None:
+            await asyncio.wait_for(live_sess.wait(), timeout=5.0)
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        writer.write(
+            b"POST /health HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Length: 4\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            b"0\r\n\r\n"
+        )
+        await writer.drain()
+        smuggle_status = await reader.readline()
+        writer.close()
+        await writer.wait_closed()
+        self.assertIn(b"400", smuggle_status)
 
 
 if __name__ == "__main__":

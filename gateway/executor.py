@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import json
+import math
 import os
 import pty
 import shlex
 import signal
 import struct
 import termios
+import threading
 import time
 import uuid
 from collections import deque
@@ -96,11 +98,11 @@ def _extract_initial_agent_id(
     """Extract resumed conversation/session ID from `agy` or `codex` CLI arguments when present."""
     if is_agy:
         for i, tok in enumerate(argv):
-            if tok == "--resume" and i + 1 < len(argv):
+            if tok in ("--conversation", "--resume") and i + 1 < len(argv):
                 cand = argv[i + 1].strip()
                 if cand and not cand.startswith("-"):
                     return cand
-            elif tok.startswith("--resume="):
+            elif tok.startswith(("--conversation=", "--resume=")):
                 cand = tok.split("=", 1)[1].strip()
                 if cand:
                     return cand
@@ -210,11 +212,35 @@ _STRIPPED_ENV_KEYS = {
     "CODEX_ACCESS_TOKEN",
     "AGY_ADC_AUTH",
     "GOOGLE_CLOUD_QUOTA_PROJECT",
+    # Never let host cloud credentials or VM metadata overrides leak into sandboxed sessions
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CLOUDSDK_CONFIG",
+    "GCE_METADATA_HOST",
+    "GCE_METADATA_ROOT",
+    "GCE_METADATA_IP",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
     # Never let host Docker endpoints leak into sandboxed sessions (daemon access goes via proxy)
     "DOCKER_HOST",
     "DOCKER_CONTEXT",
     "DOCKER_TLS_VERIFY",
     "DOCKER_CERT_PATH",
+}
+_BLOCKED_CALLER_ENV_KEYS = _STRIPPED_ENV_KEYS | {
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "BASH_ENV",
+    "ENV",
+    "PROMPT_COMMAND",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "IFS",
+    "CDPATH",
+    "NO_GCE_CHECK",
+    "AWS_EC2_METADATA_DISABLED",
+    "CONTAINER_HOST",
 }
 
 
@@ -541,6 +567,14 @@ class ExecutionSession:
                     start_new_session=True,
                     limit=STREAM_LINE_LIMIT,
                 )
+        except BaseException:
+            if self._pty_master_fd is not None:
+                try:
+                    os.close(self._pty_master_fd)
+                except OSError:
+                    pass
+                self._pty_master_fd = None
+            raise
         finally:
             if slave_fd is not None:
                 try:
@@ -1314,7 +1348,9 @@ class SessionManager:
             "last_cleanup": self._last_sandbox_cleanup,
         }
 
-    async def run_sandbox_cleanup(self) -> Dict[str, Any]:
+    async def run_sandbox_cleanup(
+        self, cancel_event: Optional[threading.Event] = None
+    ) -> Dict[str, Any]:
         """Run non-blocking sandbox LRU lifecycle sweep in a worker thread."""
         async with self._sandbox_cleanup_lock:
             summary = await asyncio.to_thread(
@@ -1324,15 +1360,35 @@ class SessionManager:
                 self.config.sandbox_min_retention_days,
                 self.config.sandbox_low_space_free_gb,
                 self.config.sandbox_low_space_free_percent,
+                None,
+                None,
+                cancel_event,
             )
             self._last_sandbox_cleanup = summary
             return summary
 
-    def _prepare_env(self, extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    def _resolve_timeout(self, timeout: Optional[float], default: float) -> float:
+        """Validate a caller-supplied timeout (`> 0` and finite) and clamp to `max_timeout_seconds`."""
+        if timeout is None:
+            val = float(default)
+        else:
+            try:
+                val = float(timeout)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid timeout value: {timeout!r}") from exc
+            if not math.isfinite(val) or val <= 0:
+                raise ValueError("timeout must be a positive finite number (or omit for default)")
+        return min(val, float(self.config.max_timeout_seconds))
+
+    def _prepare_env(
+        self,
+        extra_env: Optional[Dict[str, str]] = None,
+        trusted_env: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
         env = {
             k: v
             for k, v in os.environ.items()
-            if k not in _STRIPPED_ENV_KEYS
+            if k not in _STRIPPED_ENV_KEYS and not k.startswith("GATEWAY_")
         }
         local_bin = str(os.path.expanduser("~/.local/bin"))
         current_path = env.get("PATH", "/usr/local/bin:/usr/bin:/bin")
@@ -1352,6 +1408,24 @@ class SessionManager:
                 env["TMPDIR"] = str(sb_tmp_p)
             except OSError:
                 pass
+        # Prevent cloud SDKs (google-auth, boto3, etc.) from probing host VM instance metadata
+        # (169.254.169.254 / fd20:ce::254) when application credentials are intentionally absent.
+        env["NO_GCE_CHECK"] = "true"
+        env["GCE_METADATA_HOST"] = "127.0.0.1:1"
+        env["GCE_METADATA_ROOT"] = "127.0.0.1:1"
+        env["AWS_EC2_METADATA_DISABLED"] = "true"
+        if trusted_env:
+            for k, v in trusted_env.items():
+                ks = str(k)
+                if ks in ("DOCKER_HOST", "DOCKER_CONTEXT") or ks.startswith("GATEWAY_"):
+                    continue
+                env[ks] = str(v)
+        if extra_env:
+            for k, v in extra_env.items():
+                ks = str(k)
+                if ks in _BLOCKED_CALLER_ENV_KEYS or ks.startswith("GATEWAY_"):
+                    continue
+                env[ks] = str(v)
         docker_sock = self._active_docker_proxy_socket()
         if docker_sock:
             env["DOCKER_HOST"] = (
@@ -1359,11 +1433,6 @@ class SessionManager:
                 if self.config.isolate_mount_namespace
                 else f"unix://{docker_sock}"
             )
-        if extra_env:
-            for k, v in extra_env.items():
-                if str(k) in ("DOCKER_HOST", "DOCKER_CONTEXT"):
-                    continue
-                env[str(k)] = str(v)
         # Ensure loopback traffic (e.g. Flutter `flutter_tester` WebSocket on `127.0.0.1:<port>`)
         # bypasses outbound sandbox HTTP proxies (`agy --sandbox`'s `HTTP_PROXY`/`connectd`)
         for np_key in ("NO_PROXY", "no_proxy"):
@@ -1535,7 +1604,7 @@ class SessionManager:
                     if os.path.exists(self.config.agy_binary)
                     else "agy"
                 )
-                env = self._prepare_env(self._load_agy_env())
+                env = self._prepare_env(trusted_env=self._load_agy_env())
                 try:
                     proc = await asyncio.create_subprocess_exec(
                         agy_bin,
@@ -1548,10 +1617,10 @@ class SessionManager:
                     )
                     try:
                         out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=60.0)
-                    except asyncio.TimeoutError:
+                    except asyncio.TimeoutError as exc:
                         proc.kill()
                         await proc.wait()
-                        raise RuntimeError("`agy models` timed out after 60s")
+                        raise RuntimeError("`agy models` timed out after 60s") from exc
                 except FileNotFoundError as exc:
                     raise RuntimeError(f"agy binary not found: {agy_bin}") from exc
 
@@ -1687,6 +1756,7 @@ class SessionManager:
         is_agy: bool = False,
         is_codex: bool = False,
         readonly_subpaths: Optional[Sequence[str]] = None,
+        trusted_env: Optional[Dict[str, str]] = None,
     ) -> ExecutionSession:
         """Validate command against security policy and start an ExecutionSession."""
         if self.active_count() >= self.config.max_concurrent_sessions:
@@ -1701,11 +1771,10 @@ class SessionManager:
             raise PermissionError(decision.reason)
 
         assert decision.normalized_argv is not None
-        effective_timeout = (
-            self.config.default_timeout_seconds if timeout is None else float(timeout)
+        effective_timeout = self._resolve_timeout(
+            timeout, self.config.default_timeout_seconds
         )
-        if effective_timeout > self.config.max_timeout_seconds:
-            effective_timeout = self.config.max_timeout_seconds
+        prepared_env = self._prepare_env(extra_env=env, trusted_env=trusted_env)
 
         # Auto-enable shell execution when a string command uses pipes/chaining/builtins
         use_shell = decision.requires_shell if shell is None else bool(shell)
@@ -1731,6 +1800,11 @@ class SessionManager:
                 if shell_cmd is not None
                 else list(decision.normalized_argv)
             )
+            adc_active = bool(
+                is_agy
+                and str(prepared_env.get("AGY_ADC_AUTH", "")).strip().lower()
+                in ("1", "true", "yes", "on")
+            )
             spawn_argv = build_mount_ns_argv(
                 target_argv=target_exec,
                 cwd=decision.resolved_cwd,
@@ -1742,6 +1816,7 @@ class SessionManager:
                 sandbox_state_dir=self.config.sandbox_state_dir,
                 docker_mask_paths=self.config.docker_mask_paths,
                 docker_proxy_socket=self._active_docker_proxy_socket(),
+                mount_gcloud_adc=adc_active,
             )
 
         self._cleanup_old_sessions()
@@ -1750,7 +1825,7 @@ class SessionManager:
             session_id=session_id,
             argv=decision.normalized_argv,
             cwd=decision.resolved_cwd,
-            env=self._prepare_env(env),
+            env=prepared_env,
             shell_cmd=shell_cmd,
             use_pty=use_pty,
             stream_json=stream_json,
@@ -1771,7 +1846,11 @@ class SessionManager:
             ),
         )
         self._sessions[session_id] = session
-        await session.start(initial_stdin=initial_stdin, close_stdin=close_stdin)
+        try:
+            await session.start(initial_stdin=initial_stdin, close_stdin=close_stdin)
+        except BaseException:
+            self._sessions.pop(session_id, None)
+            raise
         return session
 
     async def create_agy_session(
@@ -1818,7 +1897,8 @@ class SessionManager:
         _, ro_hook_dirs = self.policy.resolve_codex_git_metadata_dirs(
             cwd=cwd, add_dirs=add_dirs
         )
-        merged_env = self._load_agy_env()
+        trusted_agy_env = self._load_agy_env()
+        caller_env: Dict[str, str] = {}
         if env:
             for k, v in env.items():
                 ks = str(k)
@@ -1827,21 +1907,19 @@ class SessionManager:
                     ks == "AGY_ADC_AUTH"
                     and vs.strip().lower() in ("0", "false", "no", "off")
                 ):
-                    merged_env.pop(ks, None)
+                    trusted_agy_env.pop(ks, None)
                     if ks == "AGY_ADC_AUTH":
-                        merged_env.pop("GOOGLE_CLOUD_QUOTA_PROJECT", None)
+                        trusted_agy_env.pop("GOOGLE_CLOUD_QUOTA_PROJECT", None)
                 else:
-                    merged_env[ks] = vs
+                    caller_env[ks] = vs
         is_stream_json = output_format == "stream-json" or "--output-format=stream-json" in argv
-        eff_timeout = (
-            self.config.agent_default_timeout_seconds
-            if timeout is None
-            else float(timeout)
+        eff_timeout = self._resolve_timeout(
+            timeout, self.config.agent_default_timeout_seconds
         )
         return await self.create_session(
             command=argv,
             cwd=cwd,
-            env=merged_env,
+            env=caller_env,
             shell=False,
             use_pty=use_pty,
             stream_json=is_stream_json,
@@ -1852,6 +1930,7 @@ class SessionManager:
             queue_timeout=self.config.agy_queue_timeout_seconds,
             is_agy=True,
             readonly_subpaths=ro_hook_dirs,
+            trusted_env=trusted_agy_env,
         )
 
     async def create_codex_session(
@@ -1898,20 +1977,16 @@ class SessionManager:
         _, ro_hook_dirs = self.policy.resolve_codex_git_metadata_dirs(
             cwd=cwd, add_dirs=add_dirs
         )
-        merged_env = self._load_codex_env()
-        if env:
-            for k, v in env.items():
-                merged_env[str(k)] = str(v)
+        trusted_codex_env = self._load_codex_env()
+        caller_env = {str(k): str(v) for k, v in env.items()} if env else {}
         is_stream_json = json_events or "--json" in argv
-        eff_timeout = (
-            self.config.agent_default_timeout_seconds
-            if timeout is None
-            else float(timeout)
+        eff_timeout = self._resolve_timeout(
+            timeout, self.config.agent_default_timeout_seconds
         )
         return await self.create_session(
             command=argv,
             cwd=cwd,
-            env=merged_env,
+            env=caller_env,
             shell=False,
             use_pty=use_pty,
             stream_json=is_stream_json,
@@ -1922,6 +1997,7 @@ class SessionManager:
             queue_timeout=self.config.agy_queue_timeout_seconds,
             is_codex=True,
             readonly_subpaths=ro_hook_dirs,
+            trusted_env=trusted_codex_env,
         )
 
     def get_session(

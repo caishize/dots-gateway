@@ -247,7 +247,10 @@ class DotsGatewayClient:
                 raw = resp.read().decode("utf-8")
                 return json.loads(raw)
         except urllib.error.HTTPError as exc:
-            err_body = exc.read().decode("utf-8", errors="replace")
+            try:
+                err_body = exc.read().decode("utf-8", errors="replace")
+            finally:
+                exc.close()
             try:
                 err_json = json.loads(err_body)
             except Exception:
@@ -385,7 +388,10 @@ class DotsGatewayClient:
                     return None, resp_sid
                 return json.loads(raw_bytes.decode("utf-8")), resp_sid
         except urllib.error.HTTPError as exc:
-            err_body = exc.read().decode("utf-8", errors="replace")
+            try:
+                err_body = exc.read().decode("utf-8", errors="replace")
+            finally:
+                exc.close()
             raise RuntimeError(f"Gateway MCP HTTP {exc.code}: {err_body}") from exc
 
     # ------------------------------------------------------------------
@@ -488,6 +494,11 @@ class DotsGatewayClient:
         if timeout is not None:
             payload["timeout"] = timeout
         return self._request_json("POST", "/v1/agy", payload, timeout=(timeout or 28800.0) + 30.0)
+
+    def list_agy_models(self, refresh: bool = False) -> Dict[str, Any]:
+        """List available Antigravity (`agy`) models and current gateway default model (`GET /v1/agy/models`)."""
+        suffix = "?refresh=1" if refresh else ""
+        return self._request_json("GET", f"/v1/agy/models{suffix}", timeout=75.0)
 
     def stream_agy(
         self,
@@ -972,6 +983,22 @@ def main() -> int:
     p_agy.add_argument("--output-format", default="text", help="Output format (text|json|stream-json)")
     p_agy.add_argument("--no-stream", action="store_true", help="Wait instead of streaming")
 
+    p_agy_models = sub.add_parser("agy-models", help="List available agy models and default selection")
+    p_agy_models.add_argument("--refresh", action="store_true", help="Bypass server cache")
+
+    p_codex = sub.add_parser("codex", help="Run OpenAI Codex (`codex exec`) on the gateway")
+    p_codex.add_argument("prompt", nargs="?", default=None, help="Task prompt for codex")
+    p_codex.add_argument("-m", "--model", default=None, help="Model override")
+    p_codex.add_argument("-e", "--effort", default=None, help="Effort level (low|medium|high|xhigh)")
+    p_codex.add_argument(
+        "-s", "--sandbox-mode", default="workspace-write", help="Sandbox mode (read-only|workspace-write)"
+    )
+    p_codex.add_argument("--session", default=None, help="Resume Codex session ID")
+    p_codex.add_argument("-c", "--continue-last", action="store_true", help="Resume last Codex session")
+    p_codex.add_argument("--review", action="store_true", help="Run `codex exec review`")
+    p_codex.add_argument("--json", action="store_true", help="Emit JSONL events")
+    p_codex.add_argument("--no-stream", action="store_true", help="Wait instead of streaming")
+
     p_ls = sub.add_parser("ls", help="List remote workspace directory")
     p_ls.add_argument("path", nargs="?", default=".", help="Remote directory path")
     p_ls.add_argument("-r", "--recursive", action="store_true", help="Recursive listing")
@@ -1072,6 +1099,49 @@ def main() -> int:
             conversation_id=args.conversation,
             continue_last=args.continue_last,
             output_format=args.output_format,
+        ):
+            etype = ev.get("type")
+            if etype == "stdout":
+                sys.stdout.write(str(ev.get("data", "")))
+                sys.stdout.flush()
+            elif etype == "stderr":
+                sys.stderr.write(str(ev.get("data", "")))
+                sys.stderr.flush()
+            elif etype == "exit":
+                rc = int((ev.get("data") or {}).get("returncode") or 0)
+        return rc
+
+    if args.cmd == "agy-models":
+        print(json.dumps(client.list_agy_models(refresh=args.refresh), indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "codex":
+        if args.no_stream:
+            res = client.run_codex(
+                prompt=args.prompt,
+                cwd=args.cwd,
+                sandbox_mode=args.sandbox_mode,
+                json_events=args.json,
+                model=args.model,
+                effort=args.effort,
+                session_id=args.session,
+                continue_last=args.continue_last,
+                review=args.review,
+            )
+            sys.stdout.write(res.get("stdout", ""))
+            sys.stderr.write(res.get("stderr", ""))
+            return int(res.get("returncode") or 0)
+        rc = 0
+        for ev in client.stream_codex(
+            prompt=args.prompt,
+            cwd=args.cwd,
+            sandbox_mode=args.sandbox_mode,
+            json_events=args.json,
+            model=args.model,
+            effort=args.effort,
+            session_id=args.session,
+            continue_last=args.continue_last,
+            review=args.review,
         ):
             etype = ev.get("type")
             if etype == "stdout":
