@@ -201,6 +201,10 @@ class DockerRequestPolicy:
         for cand in (lex, real):
             if self.policy.is_protected_path(cand):
                 raise _deny(f"{what} source '{src}' is inside a protected path")
+            if self.policy.is_agy_plugin_path(cand):
+                raise _deny(
+                    f"{what} source '{src}' is inside an AGY-only plugin resource path"
+                )
             inside = self.policy.is_within_allowed_workdirs(cand) or any(
                 cand == r or cand.startswith(r.rstrip("/") + "/") for r in extra
             )

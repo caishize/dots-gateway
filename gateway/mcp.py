@@ -20,12 +20,31 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 from . import __version__
-from .config import GatewayConfig
+from .config import GatewayConfig, redact_diagnostic_text
 from .executor import ExecutionSession, SessionManager
 from .files import FileService
 from .policy import CommandPolicy, redact_for_audit_log
 
 logger = logging.getLogger("dots_gateway")
+
+_FORBIDDEN_TASK_PLUGIN_KEYS = (
+    "plugin_dirs",
+    "agy_plugin_dirs",
+    "plugins",
+    "plugin_root",
+    "agy_plugins_enabled",
+)
+
+
+def _reject_task_plugin_overrides(payload: Any) -> None:
+    if isinstance(payload, dict):
+        for key in _FORBIDDEN_TASK_PLUGIN_KEYS:
+            if key in payload:
+                raise PermissionError(
+                    f"Task-level '{key}' declaration is forbidden by security policy; "
+                    "register trusted AGY plugins via operator configuration only"
+                )
+
 
 SUPPORTED_PROTOCOL_VERSIONS: Tuple[str, ...] = (
     "2025-06-18",
@@ -1086,6 +1105,9 @@ class MCPHandler:
             return _jsonrpc_error(req_id, -32602, "Tool 'arguments' must be an object")
 
         try:
+            if tool_name in ("exec_command", "run_agy", "run_codex", "session_start"):
+                _reject_task_plugin_overrides(args)
+
             if tool_name == "gateway_status":
                 data = {
                     "ok": True,
@@ -1120,6 +1142,7 @@ class MCPHandler:
                     "agy_readonly_roots": self.policy.get_agy_readonly_roots(),
                     "agy_writable_roots": self.policy.get_agy_writable_roots(),
                     "agy_auth": self.sessions.get_agy_auth_info(),
+                    "agy_plugins": self.policy.get_agy_plugins_info(),
                     "docker": self.sessions.get_docker_info(),
                     "codex_binary": self.config.codex_binary,
                     "codex_default_skip_permissions": self.config.codex_default_skip_permissions,
@@ -1173,7 +1196,9 @@ class MCPHandler:
                         refresh=bool(args.get("refresh", False))
                     )
                 except RuntimeError as exc:
-                    return _jsonrpc_result(req_id, _tool_error(str(exc)))
+                    return _jsonrpc_result(
+                        req_id, _tool_error(redact_diagnostic_text(str(exc), self.config))
+                    )
                 return _jsonrpc_result(req_id, _tool_success(data))
 
             if tool_name == "run_agy":
@@ -1184,6 +1209,7 @@ class MCPHandler:
                 session = await self.sessions.create_agy_session(
                     prompt=prompt,
                     cwd=args.get("cwd"),
+                    env=args.get("env"),
                     args=extra_args,
                     skip_permissions=args.get("skip_permissions"),
                     print_mode=True,
@@ -1228,6 +1254,7 @@ class MCPHandler:
                 session = await self.sessions.create_codex_session(
                     prompt=prompt,
                     cwd=args.get("cwd"),
+                    env=args.get("env"),
                     args=extra_args,
                     skip_permissions=args.get("skip_permissions"),
                     sandbox_mode=args.get("sandbox_mode"),
@@ -1462,6 +1489,7 @@ class MCPHandler:
                 return _jsonrpc_result(req_id, _tool_success(res))
 
         except PermissionError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
             preview = redact_for_audit_log(
                 args.get("command")
                 if "command" in args
@@ -1471,12 +1499,14 @@ class MCPHandler:
                 "MCP policy rejection: tool=%s cwd=%r reason=%s preview=%s",
                 tool_name,
                 args.get("cwd"),
-                exc,
+                safe_err,
                 preview,
             )
-            return _jsonrpc_result(req_id, _tool_error(str(exc)))
+            return _jsonrpc_result(req_id, _tool_error(safe_err))
         except (FileNotFoundError, ValueError, RuntimeError, OSError) as exc:
-            return _jsonrpc_result(req_id, _tool_error(str(exc)))
+            return _jsonrpc_result(
+                req_id, _tool_error(redact_diagnostic_text(str(exc), self.config))
+            )
 
         return _jsonrpc_error(req_id, -32602, f"Unhandled tool: {tool_name}")
 
@@ -1503,6 +1533,7 @@ class MCPHandler:
                     "max_timeout_seconds": self.config.max_timeout_seconds,
                     "agy_queue_timeout_seconds": self.config.agy_queue_timeout_seconds,
                     "agy_auth": self.sessions.get_agy_auth_info(),
+                    "agy_plugins": self.policy.get_agy_plugins_info(),
                     "docker": self.sessions.get_docker_info(),
                     "codex_auth_configured": self.sessions.has_codex_auth(),
                     "session_persistence_enabled": bool(self.config.session_state_dir),
@@ -1540,6 +1571,7 @@ class MCPHandler:
                     "agy_include_allowed_workdirs": self.config.agy_include_allowed_workdirs,
                     "agy_readonly_roots": self.policy.get_agy_readonly_roots(),
                     "agy_writable_roots": self.policy.get_agy_writable_roots(),
+                    "agy_plugins": self.policy.get_agy_plugins_info(),
                     "codex_default_sandbox": self.config.codex_default_sandbox,
                     "codex_sandbox_network_access": self.config.codex_sandbox_network_access,
                     "codex_writable_roots": self.policy.get_codex_writable_roots(),
@@ -1558,7 +1590,11 @@ class MCPHandler:
             try:
                 res = await asyncio.to_thread(self.files.read, file_path, None, "utf-8", 0, None)
             except Exception as exc:
-                return _jsonrpc_error(req_id, -32002, f"Failed to read resource {uri}: {exc}")
+                return _jsonrpc_error(
+                    req_id,
+                    -32002,
+                    f"Failed to read resource {uri}: {redact_diagnostic_text(str(exc), self.config)}",
+                )
             return _jsonrpc_result(
                 req_id,
                 {

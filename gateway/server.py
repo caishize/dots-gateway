@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .auth import Authenticator, extract_mcp_path_token
-from .config import GatewayConfig
+from .config import GatewayConfig, redact_diagnostic_text
 from .docker_proxy import DockerProxy
 from .executor import ExecutionSession, SessionManager
 from .files import FileService
@@ -30,6 +30,7 @@ from .protocol import (
     send_html_response,
     send_json_response,
 )
+from .sandbox import SandboxStorageError
 from .tls import build_server_ssl_context
 
 logger = logging.getLogger("dots_gateway")
@@ -37,6 +38,23 @@ logger = logging.getLogger("dots_gateway")
 _SESSION_ID_RE = re.compile(
     r"^/v1/sessions/([A-Za-z0-9_-]+)(?:/(events|input|signal|resize))?$"
 )
+_FORBIDDEN_TASK_PLUGIN_KEYS = (
+    "plugin_dirs",
+    "agy_plugin_dirs",
+    "plugins",
+    "plugin_root",
+    "agy_plugins_enabled",
+)
+
+
+def _reject_task_plugin_overrides(payload: Any) -> None:
+    if isinstance(payload, dict):
+        for key in _FORBIDDEN_TASK_PLUGIN_KEYS:
+            if key in payload:
+                raise PermissionError(
+                    f"Task-level '{key}' declaration is forbidden by security policy; "
+                    "register trusted AGY plugins via operator configuration only"
+                )
 
 
 class GatewayServer:
@@ -553,6 +571,7 @@ class GatewayServer:
                     "agy_readonly_roots": self.policy.get_agy_readonly_roots(),
                     "agy_writable_roots": self.policy.get_agy_writable_roots(),
                     "agy_auth": self.sessions.get_agy_auth_info(),
+                    "agy_plugins": self.policy.get_agy_plugins_info(),
                     "docker": self.sessions.get_docker_info(),
                     "codex_binary": self.config.codex_binary,
                     "codex_default_skip_permissions": self.config.codex_default_skip_permissions,
@@ -630,7 +649,14 @@ class GatewayServer:
                 try:
                     body = self._parse_json_body(req)
                 except Exception as exc:
-                    await send_json_response(writer, 400, {"ok": False, "error": f"Invalid JSON: {exc}"})
+                    await send_json_response(
+                        writer,
+                        400,
+                        {
+                            "ok": False,
+                            "error": f"Invalid JSON: {redact_diagnostic_text(str(exc), self.config)}",
+                        },
+                    )
                     return
                 close_after = bool(body.get("close_stdin", False))
                 try:
@@ -646,7 +672,11 @@ class GatewayServer:
                         )
                         return
                 except Exception as exc:
-                    await send_json_response(writer, 400, {"ok": False, "error": str(exc)})
+                    await send_json_response(
+                        writer,
+                        400,
+                        {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+                    )
                     return
                 await send_json_response(
                     writer, 200, {"ok": True, "session_id": session_id, "status": session.status}
@@ -657,7 +687,14 @@ class GatewayServer:
                 try:
                     body = self._parse_json_body(req)
                 except Exception as exc:
-                    await send_json_response(writer, 400, {"ok": False, "error": f"Invalid JSON: {exc}"})
+                    await send_json_response(
+                        writer,
+                        400,
+                        {
+                            "ok": False,
+                            "error": f"Invalid JSON: {redact_diagnostic_text(str(exc), self.config)}",
+                        },
+                    )
                     return
                 sig_name = str(body.get("signal", "SIGTERM"))
                 await session.send_signal(sig_name)
@@ -673,7 +710,11 @@ class GatewayServer:
                     body = self._parse_json_body(req)
                     session.resize_pty(int(body.get("rows", 24)), int(body.get("cols", 80)))
                 except Exception as exc:
-                    await send_json_response(writer, 400, {"ok": False, "error": str(exc)})
+                    await send_json_response(
+                        writer,
+                        400,
+                        {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+                    )
                     return
                 await send_json_response(writer, 200, {"ok": True, "session_id": session_id})
                 return
@@ -722,7 +763,10 @@ class GatewayServer:
                 {
                     "jsonrpc": "2.0",
                     "id": None,
-                    "error": {"code": -32700, "message": f"Parse error: {exc}"},
+                    "error": {
+                        "code": -32700,
+                        "message": f"Parse error: {redact_diagnostic_text(str(exc), self.config)}",
+                    },
                 },
             )
             return
@@ -848,16 +892,25 @@ class GatewayServer:
                 writer, 404, {"ok": False, "error": f"Unknown file endpoint: {req.method} {path}"}
             )
         except PermissionError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
             logger.warning(
                 "HTTP file policy rejection: path=%s reason=%s",
                 path,
-                exc,
+                safe_err,
             )
-            await send_json_response(writer, 403, {"ok": False, "error": str(exc)})
+            await send_json_response(writer, 403, {"ok": False, "error": safe_err})
         except FileNotFoundError as exc:
-            await send_json_response(writer, 404, {"ok": False, "error": str(exc)})
+            await send_json_response(
+                writer,
+                404,
+                {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+            )
         except Exception as exc:
-            await send_json_response(writer, 400, {"ok": False, "error": str(exc)})
+            await send_json_response(
+                writer,
+                400,
+                {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+            )
 
     async def _stream_session_sse(
         self, session: ExecutionSession, writer: asyncio.StreamWriter, after_seq: int = 0
@@ -878,7 +931,22 @@ class GatewayServer:
         try:
             body = self._parse_json_body(req)
         except Exception as exc:
-            await send_json_response(writer, 400, {"ok": False, "error": f"Invalid JSON: {exc}"})
+            await send_json_response(
+                writer,
+                400,
+                {
+                    "ok": False,
+                    "error": f"Invalid JSON: {redact_diagnostic_text(str(exc), self.config)}",
+                },
+            )
+            return
+
+        try:
+            _reject_task_plugin_overrides(body)
+        except PermissionError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
+            logger.warning("HTTP exec plugin override rejection: route=%s reason=%s", req.path, safe_err)
+            await send_json_response(writer, 403, {"ok": False, "error": safe_err})
             return
 
         command = body.get("command")
@@ -908,17 +976,27 @@ class GatewayServer:
                 close_stdin=close_stdin,
             )
         except PermissionError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
             logger.warning(
                 "HTTP exec policy rejection: route=%s cwd=%r reason=%s preview=%s",
                 req.path,
                 body.get("cwd"),
-                exc,
+                safe_err,
                 redact_for_audit_log(command),
             )
-            await send_json_response(writer, 403, {"ok": False, "error": str(exc)})
+            await send_json_response(writer, 403, {"ok": False, "error": safe_err})
+            return
+        except SandboxStorageError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
+            logger.error("HTTP exec sandbox storage failure: route=%s reason=%s", req.path, safe_err)
+            await send_json_response(writer, 503, {"ok": False, "error": safe_err})
             return
         except Exception as exc:
-            await send_json_response(writer, 400, {"ok": False, "error": str(exc)})
+            await send_json_response(
+                writer,
+                400,
+                {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+            )
             return
 
         if stream:
@@ -938,7 +1016,22 @@ class GatewayServer:
         try:
             body = self._parse_json_body(req)
         except Exception as exc:
-            await send_json_response(writer, 400, {"ok": False, "error": f"Invalid JSON: {exc}"})
+            await send_json_response(
+                writer,
+                400,
+                {
+                    "ok": False,
+                    "error": f"Invalid JSON: {redact_diagnostic_text(str(exc), self.config)}",
+                },
+            )
+            return
+
+        try:
+            _reject_task_plugin_overrides(body)
+        except PermissionError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
+            logger.warning("HTTP agy plugin override rejection: route=%s reason=%s", req.path, safe_err)
+            await send_json_response(writer, 403, {"ok": False, "error": safe_err})
             return
 
         prompt = body.get("prompt")
@@ -987,17 +1080,27 @@ class GatewayServer:
             if interactive and prompt is not None:
                 await session.send_agy_turn(str(prompt), close_after=False)
         except PermissionError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
             logger.warning(
                 "HTTP agy policy rejection: route=%s cwd=%r reason=%s preview=%s",
                 req.path,
                 body.get("cwd"),
-                exc,
+                safe_err,
                 redact_for_audit_log(args or body.get("add_dirs")),
             )
-            await send_json_response(writer, 403, {"ok": False, "error": str(exc)})
+            await send_json_response(writer, 403, {"ok": False, "error": safe_err})
+            return
+        except SandboxStorageError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
+            logger.error("HTTP agy sandbox storage failure: route=%s reason=%s", req.path, safe_err)
+            await send_json_response(writer, 503, {"ok": False, "error": safe_err})
             return
         except Exception as exc:
-            await send_json_response(writer, 400, {"ok": False, "error": str(exc)})
+            await send_json_response(
+                writer,
+                400,
+                {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+            )
             return
 
         if stream:
@@ -1024,7 +1127,22 @@ class GatewayServer:
         try:
             body = self._parse_json_body(req)
         except Exception as exc:
-            await send_json_response(writer, 400, {"ok": False, "error": f"Invalid JSON: {exc}"})
+            await send_json_response(
+                writer,
+                400,
+                {
+                    "ok": False,
+                    "error": f"Invalid JSON: {redact_diagnostic_text(str(exc), self.config)}",
+                },
+            )
+            return
+
+        try:
+            _reject_task_plugin_overrides(body)
+        except PermissionError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
+            logger.warning("HTTP codex plugin override rejection: route=%s reason=%s", req.path, safe_err)
+            await send_json_response(writer, 403, {"ok": False, "error": safe_err})
             return
 
         prompt = body.get("prompt")
@@ -1063,17 +1181,27 @@ class GatewayServer:
                 close_stdin=bool(body.get("close_stdin", True)),
             )
         except PermissionError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
             logger.warning(
                 "HTTP codex policy rejection: route=%s cwd=%r reason=%s preview=%s",
                 req.path,
                 body.get("cwd"),
-                exc,
+                safe_err,
                 redact_for_audit_log(args or body.get("add_dirs") or body.get("sandbox_mode")),
             )
-            await send_json_response(writer, 403, {"ok": False, "error": str(exc)})
+            await send_json_response(writer, 403, {"ok": False, "error": safe_err})
+            return
+        except SandboxStorageError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
+            logger.error("HTTP codex sandbox storage failure: route=%s reason=%s", req.path, safe_err)
+            await send_json_response(writer, 503, {"ok": False, "error": safe_err})
             return
         except Exception as exc:
-            await send_json_response(writer, 400, {"ok": False, "error": str(exc)})
+            await send_json_response(
+                writer,
+                400,
+                {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+            )
             return
 
         if stream:
@@ -1094,11 +1222,19 @@ class GatewayServer:
         try:
             body = self._parse_json_body(req)
         except Exception as exc:
-            await send_json_response(writer, 400, {"ok": False, "error": f"Invalid JSON: {exc}"})
+            await send_json_response(
+                writer,
+                400,
+                {
+                    "ok": False,
+                    "error": f"Invalid JSON: {redact_diagnostic_text(str(exc), self.config)}",
+                },
+            )
             return
 
         session_type = body.get("type", "exec")
         try:
+            _reject_task_plugin_overrides(body)
             if session_type == "agy":
                 input_format = body.get("input_format", "stream-json")
                 output_format = body.get("output_format", "stream-json")
@@ -1174,18 +1310,33 @@ class GatewayServer:
                     close_stdin=bool(body.get("close_stdin", False)),
                 )
         except PermissionError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
             logger.warning(
                 "HTTP session policy rejection: route=%s type=%s cwd=%r reason=%s preview=%s",
                 req.path,
                 session_type,
                 body.get("cwd"),
-                exc,
+                safe_err,
                 redact_for_audit_log(body.get("command") or body.get("args") or body.get("add_dirs")),
             )
-            await send_json_response(writer, 403, {"ok": False, "error": str(exc)})
+            await send_json_response(writer, 403, {"ok": False, "error": safe_err})
+            return
+        except SandboxStorageError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
+            logger.error(
+                "HTTP session sandbox storage failure: route=%s type=%s reason=%s",
+                req.path,
+                session_type,
+                safe_err,
+            )
+            await send_json_response(writer, 503, {"ok": False, "error": safe_err})
             return
         except Exception as exc:
-            await send_json_response(writer, 400, {"ok": False, "error": str(exc)})
+            await send_json_response(
+                writer,
+                400,
+                {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+            )
             return
 
         await send_json_response(
@@ -1252,6 +1403,17 @@ class GatewayServer:
                     continue
 
                 if action == "exec":
+                    try:
+                        _reject_task_plugin_overrides(msg)
+                    except Exception as exc:
+                        await ws.send_json(
+                            {
+                                "type": "error",
+                                "id": req_id,
+                                "error": redact_diagnostic_text(str(exc), self.config),
+                            }
+                        )
+                        continue
                     command = msg.get("command")
                     if not command:
                         await ws.send_json(
@@ -1277,7 +1439,11 @@ class GatewayServer:
                         )
                     except Exception as exc:
                         await ws.send_json(
-                            {"type": "error", "id": req_id, "error": str(exc)}
+                            {
+                                "type": "error",
+                                "id": req_id,
+                                "error": redact_diagnostic_text(str(exc), self.config),
+                            }
                         )
                         continue
 
@@ -1306,6 +1472,7 @@ class GatewayServer:
                         output_format = "stream-json"
                     close_stdin = bool(msg.get("close_stdin", not interactive))
                     try:
+                        _reject_task_plugin_overrides(msg)
                         session = await self.sessions.create_agy_session(
                             prompt=prompt if not interactive else None,
                             cwd=msg.get("cwd"),
@@ -1330,7 +1497,11 @@ class GatewayServer:
                             await session.send_agy_turn(str(prompt), close_after=False)
                     except Exception as exc:
                         await ws.send_json(
-                            {"type": "error", "id": req_id, "error": str(exc)}
+                            {
+                                "type": "error",
+                                "id": req_id,
+                                "error": redact_diagnostic_text(str(exc), self.config),
+                            }
                         )
                         continue
 
@@ -1351,6 +1522,7 @@ class GatewayServer:
 
                 if action == "codex":
                     try:
+                        _reject_task_plugin_overrides(msg)
                         session = await self.sessions.create_codex_session(
                             prompt=msg.get("prompt"),
                             cwd=msg.get("cwd"),
@@ -1373,7 +1545,11 @@ class GatewayServer:
                         )
                     except Exception as exc:
                         await ws.send_json(
-                            {"type": "error", "id": req_id, "error": str(exc)}
+                            {
+                                "type": "error",
+                                "id": req_id,
+                                "error": redact_diagnostic_text(str(exc), self.config),
+                            }
                         )
                         continue
 
@@ -1423,7 +1599,11 @@ class GatewayServer:
                         )
                     except Exception as exc:
                         await ws.send_json(
-                            {"type": "error", "id": req_id, "error": str(exc)}
+                            {
+                                "type": "error",
+                                "id": req_id,
+                                "error": redact_diagnostic_text(str(exc), self.config),
+                            }
                         )
                     continue
 
@@ -1465,7 +1645,13 @@ class GatewayServer:
                             {"type": "session.resize.ack", "id": req_id, "session_id": session_id}
                         )
                     except Exception as exc:
-                        await ws.send_json({"type": "error", "id": req_id, "error": str(exc)})
+                        await ws.send_json(
+                            {
+                                "type": "error",
+                                "id": req_id,
+                                "error": redact_diagnostic_text(str(exc), self.config),
+                            }
+                        )
                     continue
 
                 if action == "session.subscribe":

@@ -91,20 +91,30 @@ class FileService:
         entries: List[Dict[str, Any]] = []
         truncated = False
 
+        def _is_hidden_entry(p: Path) -> bool:
+            lex = os.path.abspath(str(p))
+            if self.policy.is_protected_path(lex) or self.policy.is_agy_plugin_path(lex):
+                return True
+            try:
+                res = str(p.resolve())
+            except OSError:
+                return True
+            return self.policy.is_protected_path(res) or self.policy.is_agy_plugin_path(res)
+
         if recursive:
             for root, dirs, files in os.walk(target):
                 dirs.sort()
                 files.sort()
-                # Skip protected directories
+                # Skip protected and AGY-only plugin directories
                 dirs[:] = [
                     d
                     for d in dirs
-                    if not self.policy.is_protected_path(str((Path(root) / d).resolve()))
+                    if not _is_hidden_entry(Path(root) / d)
                 ]
                 for name in dirs + files:
                     full = Path(root) / name
                     rel = str(full.relative_to(target))
-                    if self.policy.is_protected_path(str(full.resolve())):
+                    if _is_hidden_entry(full):
                         continue
                     try:
                         st = full.lstat()
@@ -125,11 +135,7 @@ class FileService:
                     break
         else:
             for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name)):
-                try:
-                    resolved_child = str(child.resolve())
-                except OSError:
-                    continue
-                if self.policy.is_protected_path(resolved_child):
+                if _is_hidden_entry(child):
                     continue
                 try:
                     st = child.lstat()

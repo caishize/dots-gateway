@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
+import stat
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 GATEWAY_ROOT: Path = Path(__file__).resolve().parent.parent
 HOME_DIR: str = str(Path.home())
@@ -396,6 +398,17 @@ class GatewayConfig:
         ).strip()
     )
     agy_models_cache_seconds: float = 300.0
+    # Operator-confirmed read-only Antigravity (`agy`) plugin resource registration (default OFF).
+    # Precedence: hot-reload `agy_plugins_file` (written by `dots-gateway agy-plugins`, 0600) >
+    # `agy_plugins_enabled` + `agy_plugin_dirs` in `config.json`.
+    agy_plugins_enabled: bool = False
+    agy_plugin_dirs: List[str] = field(default_factory=list)
+    agy_plugins_file: str = field(
+        default_factory=lambda: (
+            os.environ.get("GATEWAY_AGY_PLUGINS_FILE")
+            or str(Path.home() / ".config" / "dots-gateway" / "agy-plugins.json")
+        ).strip()
+    )
     codex_binary: str = DEFAULT_CODEX_BIN
     bwrap_binary: str = DEFAULT_BWRAP_BIN
     codex_default_skip_permissions: bool = True
@@ -449,6 +462,7 @@ class GatewayConfig:
     sandbox_min_retention_days: float = 7.0
     sandbox_low_space_free_gb: float = 8.0
     sandbox_low_space_free_percent: float = 15.0
+    sandbox_lock_timeout_seconds: float = 5.0
     # Execution, connection, session persistence & memory limits
     session_state_dir: Optional[str] = None
     max_persisted_sessions: int = 200
@@ -550,6 +564,21 @@ class GatewayConfig:
             cfg.agy_default_model = os.environ["GATEWAY_AGY_DEFAULT_MODEL"].strip() or None
         if os.environ.get("GATEWAY_AGY_MODEL_FILE"):
             cfg.agy_model_file = os.environ["GATEWAY_AGY_MODEL_FILE"].strip()
+        if os.environ.get("GATEWAY_AGY_PLUGINS_ENABLED"):
+            cfg.agy_plugins_enabled = os.environ["GATEWAY_AGY_PLUGINS_ENABLED"].strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        if os.environ.get("GATEWAY_AGY_PLUGIN_DIRS"):
+            cfg.agy_plugin_dirs = [
+                x.strip()
+                for x in os.environ["GATEWAY_AGY_PLUGIN_DIRS"].split(",")
+                if x.strip()
+            ]
+        if os.environ.get("GATEWAY_AGY_PLUGINS_FILE"):
+            cfg.agy_plugins_file = os.environ["GATEWAY_AGY_PLUGINS_FILE"].strip()
         if os.environ.get("GATEWAY_DOCKER_ENABLED"):
             cfg.docker_enabled = os.environ["GATEWAY_DOCKER_ENABLED"].strip().lower() in (
                 "1",
@@ -632,6 +661,10 @@ class GatewayConfig:
                     ),
                 ),
             )
+        if os.environ.get("GATEWAY_SANDBOX_LOCK_TIMEOUT"):
+            cfg.sandbox_lock_timeout_seconds = max(
+                0.1, float(os.environ["GATEWAY_SANDBOX_LOCK_TIMEOUT"])
+            )
         if os.environ.get("GATEWAY_MAX_TIMEOUT"):
             cfg.max_timeout_seconds = max(60.0, float(os.environ["GATEWAY_MAX_TIMEOUT"]))
         if os.environ.get("GATEWAY_DEFAULT_TIMEOUT"):
@@ -654,6 +687,14 @@ class GatewayConfig:
             max(1.0, float(cfg.agent_default_timeout_seconds or 28800.0)),
         )
         cfg.agy_queue_timeout_seconds = max(1.0, float(cfg.agy_queue_timeout_seconds or 28800.0))
+        cfg.sandbox_lock_timeout_seconds = max(
+            0.1,
+            float(
+                5.0
+                if cfg.sandbox_lock_timeout_seconds is None
+                else cfg.sandbox_lock_timeout_seconds
+            ),
+        )
         cfg.max_concurrent_codex = max(1, int(cfg.max_concurrent_codex or 6))
         if not cfg.sandbox_state_dir:
             cfg.sandbox_state_dir = detect_default_sandbox_state_dir()
@@ -807,3 +848,204 @@ def docker_access_state(cfg: "GatewayConfig") -> Dict[str, object]:
 def docker_access_enabled(cfg: "GatewayConfig") -> bool:
     """Shorthand for `docker_access_state(cfg)["enabled"]`."""
     return bool(docker_access_state(cfg)["enabled"])
+
+
+_DIAGNOSTIC_SECRET_PATTERNS = (
+    re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}"),
+    re.compile(r"://[^/\s:@]+:[^/\s@]+@"),
+    re.compile(
+        r"(?i)\b(token|secret|password|passwd|api[_-]?key|runtime[_-]?key|hmac[_-]?secret|client[_-]?secret)"
+        r"(\s*[:=]\s*['\"]?)([^'\"\s,;]+)"
+    ),
+    re.compile(r"\bdots_gw_(?:tok|token|secret|key)[A-Za-z0-9_-]{6,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{16,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bya29\.[A-Za-z0-9._-]{16,}\b"),
+    re.compile(r"pbkdf2_sha256\$[^\s'\"]+"),
+)
+
+
+def redact_diagnostic_text(
+    text: str,
+    cfg: Optional["GatewayConfig"] = None,
+    extra_secrets: Sequence[str] = (),
+) -> str:
+    """Scrub credentials, tokens, and secret literals from diagnostic and error messages."""
+    out = str(text or "")
+    if not out:
+        return out
+
+    literals: List[str] = []
+    if cfg is not None:
+        for tok in getattr(cfg, "api_tokens", None) or ():
+            if isinstance(tok, str) and len(tok) >= 6:
+                literals.append(tok)
+        hmac_val = getattr(cfg, "hmac_secret", None)
+        if isinstance(hmac_val, str) and len(hmac_val) >= 6:
+            literals.append(hmac_val)
+        users_map = getattr(cfg, "users", None)
+        if isinstance(users_map, dict):
+            for u_secret in users_map.values():
+                if isinstance(u_secret, str) and len(u_secret) >= 6:
+                    literals.append(u_secret)
+    for item in extra_secrets:
+        if isinstance(item, str) and len(item) >= 6:
+            literals.append(item)
+
+    for lit in sorted(set(literals), key=len, reverse=True):
+        out = out.replace(lit, "[REDACTED]")
+
+    out = _DIAGNOSTIC_SECRET_PATTERNS[0].sub(r"\1 [REDACTED]", out)
+    out = _DIAGNOSTIC_SECRET_PATTERNS[1].sub("://[REDACTED]@", out)
+    out = _DIAGNOSTIC_SECRET_PATTERNS[2].sub(r"\1\2[REDACTED]", out)
+    for rx in _DIAGNOSTIC_SECRET_PATTERNS[3:]:
+        out = rx.sub("[REDACTED]", out)
+    return out
+
+
+def agy_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
+    """Return hot-reloaded AGY plugin registration config state.
+
+    Precedence: `agy_plugins_file` (JSON `{"enabled": bool, "plugin_dirs": [...]}` managed by
+    `dots-gateway agy-plugins`, mode 0600) > `cfg.agy_plugins_enabled` + `cfg.agy_plugin_dirs`.
+    Defaults to disabled (`enabled=False`) when neither is configured. Any corrupted, symlinked,
+    or world-writable `agy_plugins_file` returns `enabled=True` with `config_error` so AGY
+    sessions fail closed rather than silently bypassing operator policy.
+    """
+    raw_pf = str(getattr(cfg, "agy_plugins_file", "") or "").strip()
+    if raw_pf:
+        pf_path = os.path.expanduser(raw_pf)
+        try:
+            lst = os.lstat(pf_path)
+        except FileNotFoundError:
+            lst = None
+        except OSError as exc:
+            return {
+                "enabled": True,
+                "configured": True,
+                "source": redact_diagnostic_text(pf_path, cfg),
+                "raw_dirs": [],
+                "config_error": redact_diagnostic_text(
+                    f"Cannot inspect agy_plugins_file '{pf_path}': {exc}", cfg
+                ),
+            }
+        if lst is not None:
+            if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
+                return {
+                    "enabled": True,
+                    "configured": True,
+                    "source": redact_diagnostic_text(pf_path, cfg),
+                    "raw_dirs": [],
+                    "config_error": redact_diagnostic_text(
+                        f"agy_plugins_file '{pf_path}' must be a regular file, not a symlink or special file",
+                        cfg,
+                    ),
+                }
+            if lst.st_mode & 0o002:
+                return {
+                    "enabled": True,
+                    "configured": True,
+                    "source": redact_diagnostic_text(pf_path, cfg),
+                    "raw_dirs": [],
+                    "config_error": redact_diagnostic_text(
+                        f"agy_plugins_file '{pf_path}' must not be world-writable",
+                        cfg,
+                    ),
+                }
+            if hasattr(os, "getuid") and lst.st_uid not in (os.getuid(), 0):
+                return {
+                    "enabled": True,
+                    "configured": True,
+                    "source": redact_diagnostic_text(pf_path, cfg),
+                    "raw_dirs": [],
+                    "config_error": redact_diagnostic_text(
+                        f"agy_plugins_file '{pf_path}' is owned by untrusted uid {lst.st_uid}",
+                        cfg,
+                    ),
+                }
+            try:
+                raw_json = Path(pf_path).read_text(encoding="utf-8")
+                parsed = json.loads(raw_json)
+            except Exception as exc:
+                return {
+                    "enabled": True,
+                    "configured": True,
+                    "source": redact_diagnostic_text(pf_path, cfg),
+                    "raw_dirs": [],
+                    "config_error": redact_diagnostic_text(
+                        f"Invalid JSON in agy_plugins_file '{pf_path}': {exc}",
+                        cfg,
+                    ),
+                }
+            if not isinstance(parsed, dict):
+                return {
+                    "enabled": True,
+                    "configured": True,
+                    "source": redact_diagnostic_text(pf_path, cfg),
+                    "raw_dirs": [],
+                    "config_error": redact_diagnostic_text(
+                        f"agy_plugins_file '{pf_path}' must contain a JSON object",
+                        cfg,
+                    ),
+                }
+            raw_enabled = parsed.get("enabled", False)
+            if not isinstance(raw_enabled, bool):
+                return {
+                    "enabled": True,
+                    "configured": True,
+                    "source": redact_diagnostic_text(pf_path, cfg),
+                    "raw_dirs": [],
+                    "config_error": redact_diagnostic_text(
+                        f"agy_plugins_file '{pf_path}' field 'enabled' must be a boolean",
+                        cfg,
+                    ),
+                }
+            raw_list = parsed.get("plugin_dirs", [])
+            if not isinstance(raw_list, list) or any(not isinstance(x, str) for x in raw_list):
+                return {
+                    "enabled": True,
+                    "configured": True,
+                    "source": redact_diagnostic_text(pf_path, cfg),
+                    "raw_dirs": [],
+                    "config_error": redact_diagnostic_text(
+                        f"agy_plugins_file '{pf_path}' field 'plugin_dirs' must be a list of strings",
+                        cfg,
+                    ),
+                }
+            clean_dirs = [x.strip() for x in raw_list if x.strip()]
+            return {
+                "enabled": raw_enabled,
+                "configured": bool(raw_enabled or clean_dirs),
+                "source": redact_diagnostic_text(pf_path, cfg),
+                "raw_dirs": clean_dirs,
+                "config_error": None,
+            }
+
+    cfg_enabled = getattr(cfg, "agy_plugins_enabled", False)
+    cfg_dirs = getattr(cfg, "agy_plugin_dirs", [])
+    if not isinstance(cfg_enabled, bool):
+        return {
+            "enabled": True,
+            "configured": True,
+            "source": "config.agy_plugins",
+            "raw_dirs": [],
+            "config_error": "config field 'agy_plugins_enabled' must be a boolean",
+        }
+    if not isinstance(cfg_dirs, (list, tuple)) or any(not isinstance(x, str) for x in cfg_dirs):
+        return {
+            "enabled": True,
+            "configured": True,
+            "source": "config.agy_plugins",
+            "raw_dirs": [],
+            "config_error": "config field 'agy_plugin_dirs' must be a list of strings",
+        }
+    clean_cfg_dirs = [x.strip() for x in cfg_dirs if x.strip()]
+    return {
+        "enabled": cfg_enabled,
+        "configured": bool(cfg_enabled or clean_cfg_dirs),
+        "source": "config.agy_plugins",
+        "raw_dirs": clean_cfg_dirs,
+        "config_error": None,
+    }

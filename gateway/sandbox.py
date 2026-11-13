@@ -11,16 +11,22 @@ persistent isolated sandbox caches (`~/.cache/dots-sandbox`).
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
+import fcntl
 from functools import lru_cache
 import os
+import re
 import shlex
 import shutil
 import stat
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from .config import redact_diagnostic_text
 
 SANDBOX_SUBDIRS: Tuple[str, ...] = (
     "tmp",
@@ -42,6 +48,217 @@ SANDBOX_MANAGED_SUBDIRS: Tuple[str, ...] = (
     "dart_tool",
     "dart_server",
 )
+_SAFE_PLUGIN_MOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+class SandboxStorageError(RuntimeError):
+    """Raised when sandbox runtime directories are unwritable, corrupt, or hit disk faults."""
+
+
+class SandboxLockTimeoutError(SandboxStorageError):
+    """Raised when acquiring the sandbox runtime state lock exceeds the configured timeout."""
+
+
+def _paths_overlap_strict(path_a: str, path_b: str) -> bool:
+    a = path_a.rstrip("/") or "/"
+    b = path_b.rstrip("/") or "/"
+    if a == "/" or b == "/":
+        return True
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+
+def prepare_sandbox_runtime_state(
+    sandbox_state_dir: str,
+    lock_timeout_seconds: float = 5.0,
+    subdirs: Sequence[str] = SANDBOX_SUBDIRS,
+    forbidden_roots: Sequence[str] = (),
+) -> Path:
+    """Create, lock, and actively probe `sandbox_state_dir` before spawning a session.
+
+    Fails closed (`SandboxLockTimeoutError` / `SandboxStorageError`) on lock contention
+    timeouts, read-only filesystems (`EROFS`), out-of-space (`ENOSPC`/`EDQUOT`), permission
+    denials (`EACCES`), I/O faults (`EIO`), symlink swaps, or overlap with `HOME` root /
+    plugin directories, never silently falling back to `HOME` or plugin paths.
+    """
+    raw = str(sandbox_state_dir or "").strip()
+    if not raw:
+        raise SandboxStorageError(
+            "sandbox_state_dir is empty; refusing to fall back to HOME or plugin directories"
+        )
+    expanded = os.path.expanduser(raw)
+    if not expanded.startswith("/"):
+        raise SandboxStorageError(
+            f"sandbox_state_dir must be an absolute path (got '{redact_diagnostic_text(raw)}')"
+        )
+    lex_abs = os.path.abspath(expanded)
+    home_lex = os.path.abspath(str(Path.home()))
+    try:
+        home_res = str(Path.home().resolve())
+    except OSError:
+        home_res = home_lex
+
+    if lex_abs in ("/", "/home", home_lex, home_res):
+        raise SandboxStorageError(
+            f"sandbox_state_dir '{redact_diagnostic_text(lex_abs)}' cannot equal system or HOME root"
+        )
+
+    norm_forbidden: List[str] = []
+    for raw_forb in forbidden_roots:
+        if not raw_forb:
+            continue
+        try:
+            f_exp = os.path.expanduser(str(raw_forb))
+            norm_forbidden.append(os.path.abspath(f_exp))
+            if os.path.exists(f_exp):
+                norm_forbidden.append(os.path.realpath(f_exp))
+        except OSError:
+            continue
+
+    for forb in norm_forbidden:
+        if _paths_overlap_strict(lex_abs, forb):
+            raise SandboxStorageError(
+                f"sandbox_state_dir '{redact_diagnostic_text(lex_abs)}' overlaps protected/plugin directory "
+                f"'{redact_diagnostic_text(forb)}'"
+            )
+
+    if os.path.islink(lex_abs):
+        raise SandboxStorageError(
+            f"sandbox_state_dir '{redact_diagnostic_text(lex_abs)}' must not be a symlink"
+        )
+
+    newly_created_root = not os.path.lexists(lex_abs)
+    try:
+        Path(lex_abs).mkdir(mode=0o700, parents=True, exist_ok=True)
+        if newly_created_root:
+            os.chmod(lex_abs, 0o700)
+        st_root = os.lstat(lex_abs)
+    except OSError as exc:
+        err_code = errno.errorcode.get(exc.errno or 0, "OS_ERROR")
+        raise SandboxStorageError(
+            f"Failed to prepare sandbox_state_dir '{redact_diagnostic_text(lex_abs)}' ({err_code}): "
+            f"{redact_diagnostic_text(str(exc))}"
+        ) from exc
+
+    if stat.S_ISLNK(st_root.st_mode) or not stat.S_ISDIR(st_root.st_mode):
+        raise SandboxStorageError(
+            f"sandbox_state_dir '{redact_diagnostic_text(lex_abs)}' is not a real directory"
+        )
+    if st_root.st_mode & 0o002:
+        raise SandboxStorageError(
+            f"sandbox_state_dir '{redact_diagnostic_text(lex_abs)}' must not be world-writable"
+        )
+
+    real_root = os.path.realpath(lex_abs)
+    if real_root in ("/", "/home", home_lex, home_res):
+        raise SandboxStorageError(
+            f"sandbox_state_dir '{redact_diagnostic_text(real_root)}' resolves to system or HOME root"
+        )
+    for forb in norm_forbidden:
+        if _paths_overlap_strict(real_root, forb):
+            raise SandboxStorageError(
+                f"sandbox_state_dir '{redact_diagnostic_text(real_root)}' resolves inside protected/plugin "
+                f"directory '{redact_diagnostic_text(forb)}'"
+            )
+
+    sandbox_state = Path(real_root)
+    lock_path = sandbox_state / ".sandbox-init.lock"
+    open_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_fd = os.open(str(lock_path), open_flags, 0o600)
+    except OSError as exc:
+        err_code = errno.errorcode.get(exc.errno or 0, "OS_ERROR")
+        raise SandboxStorageError(
+            f"Cannot open sandbox lock file '{redact_diagnostic_text(str(lock_path))}' ({err_code}): "
+            f"{redact_diagnostic_text(str(exc))}"
+        ) from exc
+
+    timeout_s = max(0.05, float(lock_timeout_seconds))
+    deadline = time.monotonic() + timeout_s
+    locked = False
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise SandboxLockTimeoutError(
+                        f"Timed out after {timeout_s:.2f}s waiting for sandbox state lock "
+                        f"'{redact_diagnostic_text(str(lock_path))}'"
+                    ) from exc
+                time.sleep(min(0.025, max(0.005, deadline - time.monotonic())))
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EACCES):
+                    if time.monotonic() >= deadline:
+                        raise SandboxLockTimeoutError(
+                            f"Timed out after {timeout_s:.2f}s waiting for sandbox state lock "
+                            f"'{redact_diagnostic_text(str(lock_path))}'"
+                        ) from exc
+                    time.sleep(min(0.025, max(0.005, deadline - time.monotonic())))
+                    continue
+                err_code = errno.errorcode.get(exc.errno or 0, "OS_ERROR")
+                raise SandboxStorageError(
+                    f"Failed acquiring sandbox state lock '{redact_diagnostic_text(str(lock_path))}' "
+                    f"({err_code}): {redact_diagnostic_text(str(exc))}"
+                ) from exc
+
+        try:
+            for sub in subdirs:
+                sub_p = sandbox_state / sub
+                if os.path.islink(sub_p):
+                    raise SandboxStorageError(
+                        f"Sandbox subdirectory '{redact_diagnostic_text(str(sub_p))}' must not be a symlink"
+                    )
+                sub_new = not os.path.lexists(sub_p)
+                sub_p.mkdir(mode=0o700, parents=True, exist_ok=True)
+                if sub_new:
+                    os.chmod(sub_p, 0o1777 if sub == "tmp" else 0o700)
+                sub_st = os.lstat(sub_p)
+                if stat.S_ISLNK(sub_st.st_mode) or not stat.S_ISDIR(sub_st.st_mode):
+                    raise SandboxStorageError(
+                        f"Sandbox subdirectory '{redact_diagnostic_text(str(sub_p))}' is not a directory"
+                    )
+            tmp_dir = sandbox_state / "tmp"
+
+            probe_file = tmp_dir / f".gw_write_probe_{os.getpid()}_{uuid.uuid4().hex[:12]}"
+            probe_fd = os.open(
+                str(probe_file),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                written = os.write(probe_fd, b"ok\n")
+                if written != 3:
+                    raise OSError(errno.ENOSPC, "Short write during sandbox disk health probe")
+            finally:
+                try:
+                    os.close(probe_fd)
+                finally:
+                    try:
+                        os.unlink(probe_file)
+                    except OSError:
+                        pass
+        except SandboxStorageError:
+            raise
+        except OSError as exc:
+            err_code = errno.errorcode.get(exc.errno or 0, "OS_ERROR")
+            raise SandboxStorageError(
+                f"Sandbox runtime directory '{redact_diagnostic_text(str(sandbox_state))}' is not writable "
+                f"or encountered a disk fault ({err_code}): {redact_diagnostic_text(str(exc))}"
+            ) from exc
+    finally:
+        if locked:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+    return sandbox_state
 
 
 def _find_sys_bin(name: str) -> Optional[str]:
@@ -146,6 +363,124 @@ def _docker_socket_mask_lines(
     return lines
 
 
+def _validate_plugin_mounts_for_vfs(
+    agy_plugin_mounts: Optional[Sequence[Tuple[str, str]]],
+) -> List[Tuple[str, str]]:
+    if not agy_plugin_mounts:
+        raise SandboxStorageError(
+            "AGY plugins are enabled, but no validated plugin mounts were provided to VFS sandbox"
+        )
+    validated: List[Tuple[str, str]] = []
+    seen_names: set[str] = set()
+    for raw_name, raw_src in agy_plugin_mounts:
+        name = str(raw_name or "").strip()
+        src = str(raw_src or "").strip()
+        if not _SAFE_PLUGIN_MOUNT_NAME_RE.match(name):
+            raise SandboxStorageError(
+                f"Invalid AGY plugin mount name '{redact_diagnostic_text(name)}'"
+            )
+        if name in seen_names:
+            raise SandboxStorageError(
+                f"Duplicate AGY plugin mount name '{redact_diagnostic_text(name)}'"
+            )
+        if not src.startswith("/") or os.path.islink(src):
+            raise SandboxStorageError(
+                f"AGY plugin source '{redact_diagnostic_text(src)}' must be a non-symlink absolute directory"
+            )
+        real_src = os.path.realpath(src)
+        if real_src != os.path.abspath(src) or not os.path.isdir(real_src):
+            raise SandboxStorageError(
+                f"AGY plugin source '{redact_diagnostic_text(src)}' does not exist or contains symlink components"
+            )
+        seen_names.add(name)
+        validated.append((name, real_src))
+    return validated
+
+
+def _ensure_safe_gemini_plugin_mountpoint(home_dir: str, home_covered: bool) -> None:
+    """Verify `$HOME`, `~/.gemini`, `~/.gemini/config`, and `plugins` do not traverse unsafe symlinks."""
+    home_lex = os.path.abspath(str(Path.home()))
+    if os.path.islink(home_lex) or home_lex != home_dir:
+        raise SandboxStorageError(
+            f"AGY plugins require a non-symlink HOME directory (got '{redact_diagnostic_text(home_lex)}' -> '{redact_diagnostic_text(home_dir)}')"
+        )
+    gem_lex = os.path.join(home_dir, ".gemini")
+    if home_covered and os.path.islink(gem_lex):
+        raise SandboxStorageError(
+            "AGY plugins forbid symlinked '~/.gemini' when $HOME is covered by allowed_workdirs"
+        )
+    if not os.path.exists(gem_lex):
+        if os.path.islink(gem_lex):
+            raise SandboxStorageError("Dangling symlink at '~/.gemini' is forbidden")
+        Path(gem_lex).mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(gem_lex, 0o700)
+        except OSError:
+            pass
+    gem_real = Path(os.path.realpath(gem_lex))
+    if not gem_real.is_dir():
+        raise SandboxStorageError("'~/.gemini' must be a directory")
+    for sub_parts, label in (
+        (("config",), "~/.gemini/config"),
+        (("config", "plugins"), "~/.gemini/config/plugins"),
+    ):
+        cur = gem_real.joinpath(*sub_parts)
+        if os.path.islink(str(cur)):
+            raise SandboxStorageError(
+                f"Symlink at '{label}' is forbidden when AGY plugins are enabled"
+            )
+        if not cur.exists():
+            cur.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(cur, 0o700)
+            except OSError:
+                pass
+        elif not cur.is_dir():
+            raise SandboxStorageError(f"'{label}' must be a directory")
+
+
+def _agy_registered_plugin_mount_lines(
+    stage_dir: str,
+    home_dir: str,
+    q_mount: str,
+    plugin_mounts: Sequence[Tuple[str, str]],
+) -> List[str]:
+    """Build fail-closed shell lines mounting registered AGY plugins read-only in VFS."""
+    gem_vfs = os.path.join(home_dir, ".gemini")
+    gem_cfg_vfs = os.path.join(gem_vfs, "config")
+    plugins_vfs_root = os.path.join(gem_cfg_vfs, "plugins")
+    q_gem_vfs = shlex.quote(f"{stage_dir}{gem_vfs}")
+    q_gem_cfg_vfs = shlex.quote(f"{stage_dir}{gem_cfg_vfs}")
+    q_plg_root = shlex.quote(f"{stage_dir}{plugins_vfs_root}")
+    out: List[str] = [
+        f"[ ! -L {q_gem_vfs} ] && [ ! -L {q_gem_cfg_vfs} ] && [ ! -L {q_plg_root} ]",
+        f"mkdir -p {q_plg_root}",
+        f"[ ! -L {q_gem_vfs} ] && [ ! -L {q_gem_cfg_vfs} ] && [ ! -L {q_plg_root} ]",
+        f"{q_mount} -t tmpfs -o size=4m,mode=0755,nosuid,nodev tmpfs {q_plg_root}",
+    ]
+    for plg_name, plg_src in plugin_mounts:
+        q_src = shlex.quote(plg_src)
+        q_dst_canon = shlex.quote(f"{stage_dir}{plg_src}")
+        q_dst_disc = shlex.quote(f"{stage_dir}{os.path.join(plugins_vfs_root, plg_name)}")
+        out.extend(
+            [
+                f"[ ! -L {q_src} ] && [ -d {q_src} ]",
+                f"[ ! -L {q_dst_canon} ]",
+                f"[ -d {q_dst_canon} ] || mkdir -p {q_dst_canon}",
+                f"[ ! -L {q_dst_canon} ] && [ -d {q_dst_canon} ]",
+                f"{q_mount} --bind {q_src} {q_dst_canon}",
+                f"{q_mount} -o remount,bind,ro,nosuid,nodev {q_dst_canon} 2>/dev/null || {q_mount} -o remount,bind,ro {q_dst_canon} 2>/dev/null || {q_mount} -o bind,remount,ro {q_dst_canon}",
+                f"mkdir -p {q_dst_disc}",
+                f"{q_mount} --bind {q_src} {q_dst_disc}",
+                f"{q_mount} -o remount,bind,ro,nosuid,nodev {q_dst_disc} 2>/dev/null || {q_mount} -o remount,bind,ro {q_dst_disc} 2>/dev/null || {q_mount} -o bind,remount,ro {q_dst_disc}",
+            ]
+        )
+    out.append(
+        f"{q_mount} -o remount,ro,nosuid,nodev {q_plg_root} 2>/dev/null || {q_mount} -o remount,ro {q_plg_root} 2>/dev/null || {q_mount} -o bind,remount,ro {q_plg_root}"
+    )
+    return out
+
+
 def build_mount_ns_argv(
     target_argv: Sequence[str],
     cwd: str,
@@ -158,6 +493,11 @@ def build_mount_ns_argv(
     docker_mask_paths: Optional[Sequence[str]] = None,
     docker_proxy_socket: Optional[str] = None,
     mount_gcloud_adc: bool = True,
+    agy_plugins_enabled: bool = False,
+    agy_plugin_mounts: Optional[Sequence[Tuple[str, str]]] = None,
+    masked_plugin_paths: Optional[Sequence[str]] = None,
+    sandbox_lock_timeout_seconds: float = 5.0,
+    prevalidated_sandbox_state: Optional[Path] = None,
 ) -> List[str]:
     """Wrap `target_argv` in an unprivileged user+mount namespace `pivot_root` jail.
 
@@ -171,6 +511,11 @@ def build_mount_ns_argv(
             "Linux mount-namespace isolation is enabled (isolate_mount_namespace=True), "
             "but unprivileged user/mount namespaces are unavailable on this host."
         )
+
+    validated_plugin_mounts: List[Tuple[str, str]] = []
+    if is_agy and agy_plugins_enabled:
+        validated_plugin_mounts = _validate_plugin_mounts_for_vfs(agy_plugin_mounts)
+    active_plugin_srcs = {src for _, src in validated_plugin_mounts}
 
     unshare_bin = _find_sys_bin("unshare") or "/usr/bin/unshare"
     pivot_bin = _find_sys_bin("pivot_root") or "/usr/sbin/pivot_root"
@@ -191,23 +536,34 @@ def build_mount_ns_argv(
     home_dir = str(Path.home().resolve())
     home_covered = _is_covered_by_roots(home_dir, allowed_roots)
 
-    sandbox_state = (
-        Path(sandbox_state_dir).expanduser().resolve()
+    raw_sb_target = (
+        str(sandbox_state_dir).strip()
         if sandbox_state_dir
-        else (Path(home_dir) / ".cache" / "dots-sandbox")
+        else str(Path(home_dir) / ".cache" / "dots-sandbox")
     )
+    forbidden_sb_roots = [
+        *list(protected_paths or ()),
+        os.path.join(home_dir, ".gemini"),
+        os.path.join(home_dir, ".config"),
+        *(src for _, src in validated_plugin_mounts),
+        *list(masked_plugin_paths or ()),
+    ]
     gh_cfg_dir = Path(home_dir) / ".config" / "gh"
     if not home_covered:
-        for sub in SANDBOX_SUBDIRS:
-            (sandbox_state / sub).mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(sandbox_state, 0o700)
-            os.chmod(sandbox_state / "tmp", 0o1777)
-        except OSError:
-            pass
+        if prevalidated_sandbox_state is not None:
+            sandbox_state = prevalidated_sandbox_state
+        else:
+            sandbox_state = prepare_sandbox_runtime_state(
+                raw_sb_target,
+                lock_timeout_seconds=sandbox_lock_timeout_seconds,
+                subdirs=SANDBOX_SUBDIRS,
+                forbidden_roots=forbidden_sb_roots,
+            )
         gh_cfg_dir.mkdir(parents=True, exist_ok=True)
         if is_agy:
             (Path(home_dir) / ".config" / "antigravity").mkdir(parents=True, exist_ok=True)
+            if agy_plugins_enabled:
+                _ensure_safe_gemini_plugin_mountpoint(home_dir, home_covered=False)
         if is_codex:
             codex_dir_p = Path(home_dir) / ".codex"
             codex_dir_p.mkdir(parents=True, exist_ok=True)
@@ -215,8 +571,33 @@ def build_mount_ns_argv(
                 os.chmod(codex_dir_p, 0o700)
             except OSError:
                 pass
+    else:
+        sandbox_state = Path(os.path.realpath(os.path.expanduser(raw_sb_target)))
+        if is_agy and agy_plugins_enabled:
+            _ensure_safe_gemini_plugin_mountpoint(home_dir, home_covered=True)
 
-    stage_dir = _select_stage_mountpoint([*allowed_roots, str(sandbox_state), home_dir])
+    stage_sources: List[str] = [
+        *allowed_roots,
+        str(sandbox_state),
+        home_dir,
+        *(src for _, src in validated_plugin_mounts),
+    ]
+    for dot_rel in (
+        os.path.join(".local", "bin"),
+        os.path.join(".config", "gh"),
+        ".gemini",
+        os.path.join(".config", "antigravity"),
+        os.path.join(".config", "gcloud"),
+        ".codex",
+    ):
+        dot_cand = os.path.join(home_dir, dot_rel)
+        if os.path.exists(dot_cand):
+            try:
+                stage_sources.append(os.path.realpath(dot_cand))
+            except OSError:
+                pass
+
+    stage_dir = _select_stage_mountpoint(stage_sources)
     q_stage = shlex.quote(stage_dir)
     q_mount = shlex.quote(mount_bin)
     q_umount = shlex.quote(umount_bin)
@@ -248,7 +629,11 @@ def build_mount_ns_argv(
             f'    {q_mount} --rbind "/$d" "{stage_dir}/$d"',
             "  fi",
             "done",
-            # Protect /opt SDK installations as read-only while keeping Flutter's bin/cache writable
+            # Lock /opt and any submounts under /opt read-only by default while keeping Flutter's bin/cache writable
+            f'if [ -d "/opt" ] && [ -d "{stage_dir}/opt" ]; then',
+            f'  {q_mount} -o remount,bind,ro "{stage_dir}/opt" 2>/dev/null || {q_mount} -o bind,remount,ro "{stage_dir}/opt"',
+            f'  while read -r _src _mp _rest; do case "$_mp" in {stage_dir}/opt/*) [ -d "$_mp" ] && ({q_mount} -o remount,bind,ro "$_mp" 2>/dev/null || {q_mount} -o bind,remount,ro "$_mp" || true) ;; esac; done < /proc/self/mounts',
+            "fi",
             "for ro_opt in /opt/codex /opt/devtools /opt/uv-python /opt/uv-tools /opt/flutter; do",
             f'  if [ -d "$ro_opt" ] && [ -d "{stage_dir}$ro_opt" ]; then',
             f'    {q_mount} --bind "$ro_opt" "{stage_dir}$ro_opt"',
@@ -259,7 +644,7 @@ def build_mount_ns_argv(
             f'  {q_mount} --rbind "/opt/flutter/bin/cache" "{stage_dir}/opt/flutter/bin/cache"',
             "fi",
             # Mask host per-user runtime sockets (/run/user/$UID/systemd, /run/user/$UID/gnupg)
-            # while preserving /run/systemd/resolve DNS and a clean private XDG_RUNTIME_DIR
+            # while preserving /run/systemd/resolve DNS and a private XDG_RUNTIME_DIR
             f'if [ -d "{stage_dir}/run/user" ]; then',
             f'  {q_mount} -t tmpfs -o size=8m,mode=0755 tmpfs {shlex.quote(f"{stage_dir}/run/user")}',
             f'  mkdir -p "{stage_dir}/run/user/$(id -u)" && chmod 0700 "{stage_dir}/run/user/$(id -u)"',
@@ -271,6 +656,32 @@ def build_mount_ns_argv(
             f"chmod 1777 {shlex.quote(f'{stage_dir}/tmp')}",
         ]
     )
+
+    # Mask configured AGY plugin directories under system trees (/opt, /usr, /var, /etc) whenever
+    # they are NOT actively mounted for an AGY session (`exec_command`, `run_codex`, disabled/staged plugins).
+    if masked_plugin_paths:
+        seen_masked: set[str] = set()
+        for raw_mp in masked_plugin_paths:
+            try:
+                mp_exp = os.path.expanduser(str(raw_mp).strip())
+                cands = [os.path.abspath(mp_exp)]
+                if os.path.exists(mp_exp):
+                    cands.append(os.path.realpath(mp_exp))
+            except OSError:
+                continue
+            for mp_cand in cands:
+                if (
+                    mp_cand in seen_masked
+                    or mp_cand in active_plugin_srcs
+                    or mp_cand in ("/", "/opt", "/usr", "/var", "/etc")
+                    or not mp_cand.startswith(("/opt/", "/usr/", "/var/", "/etc/"))
+                ):
+                    continue
+                seen_masked.add(mp_cand)
+                q_dst_mp = shlex.quote(f"{stage_dir}{mp_cand}")
+                lines.append(
+                    f"if [ -d {q_dst_mp} ]; then {q_mount} -t tmpfs -o size=4k,mode=0555,ro tmpfs {q_dst_mp}; fi"
+                )
 
     # Back /tmp by persistent isolated disk dir when allowed_roots are outside /tmp
     # (prevents 64m tmpfs ENOSPC on large pip/npm/cargo builds while hiding host /tmp)
@@ -336,7 +747,7 @@ def build_mount_ns_argv(
         # Read-only ~/.local/bin so user-installed developer CLIs & agy can execute safely
         local_bin = os.path.join(home_dir, ".local", "bin")
         if os.path.isdir(local_bin):
-            q_lb = shlex.quote(local_bin)
+            q_lb = shlex.quote(os.path.realpath(local_bin))
             q_dst_lb = shlex.quote(f"{stage_dir}{local_bin}")
             lines.extend(
                 [
@@ -349,7 +760,7 @@ def build_mount_ns_argv(
         # Read-only ~/.gitconfig so `git` credential helper & author settings work inside workspaces
         gitconfig = os.path.join(home_dir, ".gitconfig")
         if os.path.isfile(gitconfig):
-            q_gc = shlex.quote(gitconfig)
+            q_gc = shlex.quote(os.path.realpath(gitconfig))
             q_dst_gc = shlex.quote(f"{stage_dir}{gitconfig}")
             lines.extend(
                 [
@@ -361,7 +772,7 @@ def build_mount_ns_argv(
 
         # Persistent ~/.config/gh so `gh` CLI and `gh auth git-credential` work & persist across commands
         # while ~/.config/dots-gateway, ~/.config/tunnel-client, and ~/.config/systemd remain invisible
-        q_gh = shlex.quote(str(gh_cfg_dir))
+        q_gh = shlex.quote(os.path.realpath(str(gh_cfg_dir)))
         q_dst_gh = shlex.quote(f"{stage_dir}{gh_cfg_dir}")
         lines.extend(
             [
@@ -371,11 +782,13 @@ def build_mount_ns_argv(
         )
 
         if is_agy:
-            # Antigravity CLI requires ~/.gemini (for OAuth & trajectory store) and ~/.config/antigravity,
-            # while ~/.gemini/config/plugins is remounted READ-ONLY so oh-my-agents hooks cannot be tampered with.
+            # Antigravity CLI requires ~/.gemini (for OAuth & trajectory store) and ~/.config/antigravity.
+            # When explicit plugin registration (`agy_plugins_enabled`) is OFF, preserve legacy read-only
+            # remount of `~/.gemini/config/plugins`. When ON, mount an isolated read-only tmpfs view
+            # populated strictly with operator-registered `agy_plugin_mounts` plus canonical read-only mounts.
             gemini_dir = os.path.join(home_dir, ".gemini")
             if os.path.isdir(gemini_dir):
-                q_gem = shlex.quote(gemini_dir)
+                q_gem = shlex.quote(os.path.realpath(gemini_dir))
                 q_dst_gem = shlex.quote(f"{stage_dir}{gemini_dir}")
                 lines.extend(
                     [
@@ -383,20 +796,28 @@ def build_mount_ns_argv(
                         f"{q_mount} --rbind {q_gem} {q_dst_gem}",
                     ]
                 )
-                plugins_dir = os.path.join(gemini_dir, "config", "plugins")
-                if os.path.isdir(plugins_dir):
-                    q_plg = shlex.quote(plugins_dir)
-                    q_dst_plg = shlex.quote(f"{stage_dir}{plugins_dir}")
-                    lines.extend(
-                        [
-                            f"{q_mount} --bind {q_plg} {q_dst_plg}",
-                            f"{q_mount} -o remount,bind,ro {q_dst_plg} 2>/dev/null || {q_mount} -o bind,remount,ro {q_dst_plg}",
-                        ]
+                if not agy_plugins_enabled:
+                    plugins_dir = os.path.join(gemini_dir, "config", "plugins")
+                    if os.path.isdir(plugins_dir):
+                        q_plg = shlex.quote(os.path.realpath(plugins_dir))
+                        q_dst_plg = shlex.quote(f"{stage_dir}{plugins_dir}")
+                        lines.extend(
+                            [
+                                f"{q_mount} --bind {q_plg} {q_dst_plg}",
+                                f"{q_mount} -o remount,bind,ro {q_dst_plg} 2>/dev/null || {q_mount} -o bind,remount,ro {q_dst_plg}",
+                            ]
+                        )
+
+            if agy_plugins_enabled:
+                lines.extend(
+                    _agy_registered_plugin_mount_lines(
+                        stage_dir, home_dir, q_mount, validated_plugin_mounts
                     )
+                )
 
             agy_cfg_dir = os.path.join(home_dir, ".config", "antigravity")
             if os.path.isdir(agy_cfg_dir):
-                q_ac = shlex.quote(agy_cfg_dir)
+                q_ac = shlex.quote(os.path.realpath(agy_cfg_dir))
                 q_dst_ac = shlex.quote(f"{stage_dir}{agy_cfg_dir}")
                 lines.extend(
                     [
@@ -408,7 +829,7 @@ def build_mount_ns_argv(
             # Read-only ~/.config/gcloud only when `AGY_ADC_AUTH=true` needs application_default_credentials.json
             gcloud_cfg_dir = os.path.join(home_dir, ".config", "gcloud")
             if mount_gcloud_adc and os.path.isdir(gcloud_cfg_dir):
-                q_gc_dir = shlex.quote(gcloud_cfg_dir)
+                q_gc_dir = shlex.quote(os.path.realpath(gcloud_cfg_dir))
                 q_dst_gc_dir = shlex.quote(f"{stage_dir}{gcloud_cfg_dir}")
                 lines.extend(
                     [
@@ -423,7 +844,7 @@ def build_mount_ns_argv(
             # codex-linux-sandbox helper) while ~/gateway, ~/.gemini, ~/.ssh, and ~/.config/* stay hidden.
             codex_dir = os.path.join(home_dir, ".codex")
             if os.path.isdir(codex_dir):
-                q_cx = shlex.quote(codex_dir)
+                q_cx = shlex.quote(os.path.realpath(codex_dir))
                 q_dst_cx = shlex.quote(f"{stage_dir}{codex_dir}")
                 lines.extend(
                     [
@@ -457,6 +878,27 @@ def build_mount_ns_argv(
                 lines.append(
                     f'[ -f {q_dp} ] && {q_mount} --bind /dev/null {q_dp} || true'
                 )
+        for raw_mp in masked_plugin_paths or ():
+            try:
+                mp_res = str(Path(raw_mp).expanduser().resolve())
+            except Exception:
+                continue
+            if (
+                mp_res in active_plugin_srcs
+                or mp_res in ("/", home_dir)
+                or not os.path.isdir(mp_res)
+            ):
+                continue
+            q_mp_dst = shlex.quote(f"{stage_dir}{mp_res}")
+            lines.append(
+                f'[ -d {q_mp_dst} ] && {q_mount} -t tmpfs -o size=4k,mode=0555,ro tmpfs {q_mp_dst} || true'
+            )
+        if is_agy and agy_plugins_enabled:
+            lines.extend(
+                _agy_registered_plugin_mount_lines(
+                    stage_dir, home_dir, q_mount, validated_plugin_mounts
+                )
+            )
 
     q_cwd = shlex.quote(resolved_cwd)
     lines.extend(

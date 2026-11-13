@@ -20,12 +20,13 @@ USER_UNIT_FILE="${USER_UNIT_DIR}/${SERVICE_NAME}"
 TUNNEL_UNIT_FILE="${USER_UNIT_DIR}/${TUNNEL_SERVICE_NAME}"
 SOURCE_UNIT_FILE="${GATEWAY_DIR}/deploy/${SERVICE_NAME}"
 SOURCE_TUNNEL_UNIT_FILE="${GATEWAY_DIR}/deploy/${TUNNEL_SERVICE_NAME}"
-CONFIG_FILE="${GATEWAY_DIR}/config.json"
-CLIENT_CONFIG_DIR="${HOME}/.config/dots-gateway"
+CONFIG_FILE="${GATEWAY_CONFIG_FILE:-${GATEWAY_DIR}/config.json}"
+CLIENT_CONFIG_DIR="${GATEWAY_CLIENT_CONFIG_DIR:-${HOME}/.config/dots-gateway}"
 TUNNEL_ENV_FILE="${CLIENT_CONFIG_DIR}/tunnel.env"
 CODEX_ENV_FILE="${CLIENT_CONFIG_DIR}/codex.env"
 AGY_ENV_FILE="${CLIENT_CONFIG_DIR}/agy.env"
 AGY_MODEL_FILE="${CLIENT_CONFIG_DIR}/agy.model"
+AGY_PLUGINS_FILE="${GATEWAY_AGY_PLUGINS_FILE:-${CLIENT_CONFIG_DIR}/agy-plugins.json}"
 DOCKER_MODE_FILE="${CLIENT_CONFIG_DIR}/docker.mode"
 DOCKER_PROXY_SOCKET="${CLIENT_CONFIG_DIR}/docker-proxy.sock"
 TUNNEL_HEALTH_URL="http://127.0.0.1:18766"
@@ -109,6 +110,18 @@ if not d.get("agy_env_file"):
 if not d.get("agy_model_file"):
     d["agy_model_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "agy.model")
     changed = True
+if "agy_plugins_enabled" not in d:
+    d["agy_plugins_enabled"] = False
+    changed = True
+if "agy_plugin_dirs" not in d:
+    d["agy_plugin_dirs"] = []
+    changed = True
+if not d.get("agy_plugins_file"):
+    d["agy_plugins_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "agy-plugins.json")
+    changed = True
+if d.get("sandbox_lock_timeout_seconds") is None:
+    d["sandbox_lock_timeout_seconds"] = 5.0
+    changed = True
 if d.get("max_concurrent_codex") is None or int(d.get("max_concurrent_codex") or 0) <= 2:
     d["max_concurrent_codex"] = 6
     changed = True
@@ -161,7 +174,7 @@ if changed:
 # run_codex and interactive/app-server sessions) can write Flutter SDK bin/cache & caches
 try:
     from gateway.config import GatewayConfig
-    from gateway.policy import CommandPolicy
+    from gateway.policy import CommandPolicy, _paths_overlap_any_direction
 
     gw_cfg = GatewayConfig.load(cfg_p)
     pol = CommandPolicy(gw_cfg)
@@ -209,6 +222,10 @@ try:
             existing_allow = [str(x) for x in (perms_dict.get("allow") or [])]
             agy_rw_roots = pol.get_agy_writable_roots()
             agy_rw_set = set(agy_rw_roots)
+            plugin_guards = [
+                str(pathlib.Path.home() / ".gemini" / "config" / "plugins"),
+                *pol.get_configured_agy_plugin_paths(),
+            ]
             merged_allow = []
             merged_seen = set()
 
@@ -217,13 +234,32 @@ try:
                     merged_seen.add(rule)
                     merged_allow.append(rule)
 
+            # Only sync static SDK read-only roots here; registered AGY plugin
+            # read_file(...) rules are injected dynamically per session via --settings
+            # so 'dots-gateway agy-plugins off' rolls back cleanly without restart.
             for ro_root in pol.get_agy_readonly_roots():
-                if ro_root not in agy_rw_set and ")" not in ro_root:
+                if (
+                    ro_root not in agy_rw_set
+                    and ")" not in ro_root
+                    and not pol.is_agy_plugin_path(ro_root)
+                ):
                     _add_allow(f"read_file({ro_root})")
             for existing_rule in existing_allow:
+                m_w = re.match(r"^write_file\((.*)\)$", existing_rule.strip())
+                if m_w:
+                    cand_w = os.path.abspath(os.path.expanduser(m_w.group(1).strip()))
+                    if any(_paths_overlap_any_direction(cand_w, g) for g in plugin_guards):
+                        continue
+                m_r = re.match(r"^read_file\((.*)\)$", existing_rule.strip())
+                if m_r:
+                    cand_r = os.path.abspath(os.path.expanduser(m_r.group(1).strip()))
+                    if pol.is_agy_plugin_path(cand_r) or any(
+                        _paths_overlap_any_direction(cand_r, g) for g in plugin_guards
+                    ):
+                        continue
                 _add_allow(existing_rule)
             for rw_root in agy_rw_roots:
-                if ")" not in rw_root:
+                if ")" not in rw_root and not pol.is_agy_plugin_path(rw_root):
                     _add_allow(f"write_file({rw_root})")
 
             if merged_allow != existing_allow:
@@ -473,6 +509,7 @@ PY
     codex_auth_state="auth=pending (run 'dots-gateway codex-setup')"
   fi
   echo "  Local Agents     : agy (${agy_auth_summary}, model=$(current_agy_model_label)) + ${codex_ver} (${codex_auth_state})"
+  echo "  AGY Plugins      : $(agy_plugins_summary)"
   echo "  Docker Access    : $(docker_access_summary)"
 
   if is_tunnel_configured; then
@@ -1330,6 +1367,451 @@ cmd_docker() {
   esac
 }
 
+agy_plugins_summary() {
+  python3 - "${CONFIG_FILE}" "${GATEWAY_DIR}" "${AGY_PLUGINS_FILE}" <<'PY' 2>/dev/null || echo "off (default)"
+import os, pathlib, sys
+cfg_p = pathlib.Path(sys.argv[1])
+gw_dir = sys.argv[2]
+pf_override = sys.argv[3]
+if gw_dir not in sys.path:
+    sys.path.insert(0, gw_dir)
+if pf_override:
+    os.environ.setdefault("GATEWAY_AGY_PLUGINS_FILE", pf_override)
+from gateway.config import GatewayConfig
+from gateway.policy import CommandPolicy
+
+cfg = GatewayConfig.load(cfg_p) if cfg_p.is_file() else GatewayConfig(agy_plugins_file=pf_override)
+info = CommandPolicy(cfg).get_agy_plugins_info()
+status = info.get("status")
+plugins = info.get("plugins") or []
+cfg_dirs = info.get("configured_dirs") or []
+if status == "active":
+    names = ", ".join(f"{p['name']}(ro)" for p in plugins)
+    print(f"on [{names}] (source={info.get('source')})")
+elif status == "error":
+    print(f"ERROR ({info.get('error')})")
+else:
+    if cfg_dirs:
+        print(f"off ({len(cfg_dirs)} registered dir(s) staged; run 'dots-gateway agy-plugins on')")
+    else:
+        print("off (default; isolated)")
+PY
+}
+
+cmd_agy_plugins() {
+  mkdir -p "${CLIENT_CONFIG_DIR}"
+  chmod 700 "${CLIENT_CONFIG_DIR}" 2>/dev/null || true
+
+  python3 - "${CONFIG_FILE}" "${GATEWAY_DIR}" "${AGY_PLUGINS_FILE}" "${PROG_NAME}" "$@" <<'PY'
+import dataclasses
+import errno
+import fcntl
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+
+cfg_path = pathlib.Path(sys.argv[1])
+gw_dir = sys.argv[2]
+plugins_file_arg = sys.argv[3]
+prog_name = sys.argv[4]
+cli_args = sys.argv[5:]
+
+if gw_dir not in sys.path:
+    sys.path.insert(0, gw_dir)
+if plugins_file_arg:
+    os.environ["GATEWAY_AGY_PLUGINS_FILE"] = plugins_file_arg
+
+from gateway.config import GatewayConfig, agy_plugins_config_state, redact_diagnostic_text
+from gateway.policy import CommandPolicy
+from gateway.sandbox import (
+    SandboxStorageError,
+    build_mount_ns_argv,
+    can_use_mount_namespace,
+    prepare_sandbox_runtime_state,
+)
+
+cfg = (
+    GatewayConfig.load(cfg_path)
+    if cfg_path.is_file()
+    else GatewayConfig(agy_plugins_file=plugins_file_arg)
+)
+if plugins_file_arg:
+    cfg.agy_plugins_file = plugins_file_arg
+
+plugins_file = pathlib.Path(os.path.abspath(os.path.expanduser(cfg.agy_plugins_file)))
+lock_timeout = max(0.05, float(cfg.sandbox_lock_timeout_seconds or 5.0))
+
+
+def _err(msg: str, code: int = 1) -> "None":
+    safe = redact_diagnostic_text(str(msg), cfg)
+    print(f"ERROR: {safe}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def _acquire_file_lock(lock_path: pathlib.Path) -> int:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(lock_path.parent, 0o700)
+    except OSError:
+        pass
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(lock_path), flags, 0o600)
+    except OSError as exc:
+        _err(f"Cannot open plugin registry lock '{lock_path}': {exc}")
+    deadline = time.monotonic() + lock_timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                os.close(fd)
+                _err(f"flock failed on '{lock_path}': {exc}")
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                _err(
+                    f"Timed out after {lock_timeout:.2f}s waiting for plugin registry lock '{lock_path}'"
+                )
+            time.sleep(0.05)
+
+
+def _write_plugins_state_atomic(enabled: bool, dirs: list[str]) -> None:
+    plugins_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(plugins_file.parent, 0o700)
+    except OSError:
+        pass
+    if plugins_file.is_symlink():
+        _err(f"Refusing to write symlinked agy_plugins_file '{plugins_file}'")
+    payload = {
+        "schema_version": 1,
+        "enabled": bool(enabled),
+        "plugin_dirs": list(dirs),
+    }
+    tmp_p = plugins_file.parent / f".{plugins_file.name}.tmp.{os.getpid()}"
+    try:
+        if tmp_p.exists() or tmp_p.is_symlink():
+            tmp_p.unlink()
+        tmp_p.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.chmod(tmp_p, 0o600)
+        os.replace(tmp_p, plugins_file)
+    except OSError as exc:
+        try:
+            tmp_p.unlink(missing_ok=True)
+        except OSError:
+            pass
+        _err(f"Failed to write '{plugins_file}': {exc}")
+
+
+def _validate_candidate_dirs(cand_dirs: list[str]) -> list:
+    probe_cfg = dataclasses.replace(
+        cfg,
+        agy_plugins_enabled=True,
+        agy_plugin_dirs=list(cand_dirs),
+        agy_plugins_file=str(plugins_file.parent / f".nonexistent-probe-{os.getpid()}.json"),
+    )
+    pol = CommandPolicy(probe_cfg)
+    return pol.validate_agy_plugins(require_mount_ns_check=False)
+
+
+def _print_status() -> None:
+    pol = CommandPolicy(cfg)
+    info = pol.get_agy_plugins_info()
+    print("============================================================================")
+    print("  Antigravity CLI (agy) Trusted Read-Only Plugins (Hot-Reload / 免重启管理)")
+    print("============================================================================")
+    print(f"  Status           : {info.get('status')} (enabled={info.get('enabled')})")
+    print(f"  Config Source    : {info.get('source')}")
+    print(f"  Hot-Reload File  : {info.get('plugins_file')}")
+    cfg_dirs = info.get("configured_dirs") or []
+    if cfg_dirs:
+        print(f"  Registered Dirs  : {len(cfg_dirs)}")
+        for idx, d in enumerate(cfg_dirs, 1):
+            print(f"    {idx}) {d}")
+    else:
+        print("  Registered Dirs  : <none> (默认关闭，与原行为完全一致)")
+    active_plgs = info.get("plugins") or []
+    if active_plgs:
+        print("  Active Mappings  :")
+        for p in active_plgs:
+            print(
+                f"    - {p['name']} [{p['mode']}, {p['manifest']}]: "
+                f"{p['source_dir']} -> {p['vfs_discovery_dir']}"
+            )
+    if info.get("error"):
+        print(f"  Policy Error     : {info.get('error')}")
+    print("----------------------------------------------------------------------------")
+    print("  运维命令 (仅限宿主管理员操作，任务不可动态覆盖；即时生效，无需重启网关):")
+    print(f"    {prog_name} agy-plugins add <PLUGIN_DIR> [--enable]  # 校验并登记可信插件目录")
+    print(f"    {prog_name} agy-plugins on                           # 开启已登记插件只读挂载与读取授权")
+    print(f"    {prog_name} agy-plugins off                          # 一键关闭插件能力并回滚至隔离态")
+    print(f"    {prog_name} agy-plugins remove <PLUGIN_DIR>          # 移除单个插件目录")
+    print(f"    {prog_name} agy-plugins clear                        # 清空登记并恢复默认关闭态")
+    print(f"    {prog_name} agy-plugins doctor                       # 执行目录边界、沙箱挂载与只读自检")
+    print("============================================================================")
+
+
+subcmd = cli_args[0].strip().lower() if cli_args else "status"
+rest = cli_args[1:]
+
+if subcmd in ("status", "show", "info", "list", "ls"):
+    _print_status()
+    raise SystemExit(0)
+
+if subcmd in ("add", "register"):
+    enable_now = False
+    raw_targets: list[str] = []
+    for tok in rest:
+        if tok in ("--enable", "-e", "--on"):
+            enable_now = True
+        else:
+            raw_targets.append(tok)
+    if len(raw_targets) != 1 or not raw_targets[0].strip():
+        _err(f"Usage: {prog_name} agy-plugins add <PLUGIN_DIR> [--enable]")
+    cand = os.path.abspath(os.path.expanduser(raw_targets[0].strip()))
+
+    lock_fd = _acquire_file_lock(plugins_file.parent / f".{plugins_file.name}.lock")
+    try:
+        state = agy_plugins_config_state(cfg)
+        if state.get("config_error"):
+            _err(f"Existing agy-plugins registry is corrupted: {state['config_error']}")
+        cur_dirs = [os.path.abspath(os.path.expanduser(x)) for x in (state.get("raw_dirs") or [])]
+        new_dirs = list(cur_dirs)
+        if cand not in new_dirs:
+            new_dirs.append(cand)
+        try:
+            validated = _validate_candidate_dirs(new_dirs)
+        except Exception as exc:
+            _err(str(exc))
+        new_enabled = True if enable_now else bool(state.get("enabled"))
+        _write_plugins_state_atomic(new_enabled, new_dirs)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+    names = ", ".join(p.name for p in validated)
+    print(f"✅ 已通过安全边界校验并登记 AGY 插件目录: {cand} (plugins: {names})")
+    if not new_enabled:
+        print(f"💡 当前处于默认关闭态，确认无误后执行 '{prog_name} agy-plugins on' 即可免重启启用。")
+    else:
+        print("✅ 插件只读挂载与会话读取规则已即时生效 (无需重启网关)。")
+    raise SystemExit(0)
+
+if subcmd in ("on", "enable"):
+    lock_fd = _acquire_file_lock(plugins_file.parent / f".{plugins_file.name}.lock")
+    try:
+        state = agy_plugins_config_state(cfg)
+        if state.get("config_error"):
+            _err(state["config_error"])
+        cur_dirs = [os.path.abspath(os.path.expanduser(x)) for x in (state.get("raw_dirs") or [])]
+        if not cur_dirs:
+            _err(
+                f"尚未登记任何插件目录；请先执行 '{prog_name} agy-plugins add <PLUGIN_DIR>' 再启用。"
+            )
+        try:
+            validated = _validate_candidate_dirs(cur_dirs)
+        except Exception as exc:
+            _err(str(exc))
+        _write_plugins_state_atomic(True, cur_dirs)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+    names = ", ".join(f"{p.name} -> {p.vfs_discovery_dir}" for p in validated)
+    print(f"✅ AGY 已登记插件已启用 [{names}] — 新 run_agy 会话即时生效，无需重启！")
+    raise SystemExit(0)
+
+if subcmd in ("off", "disable"):
+    lock_fd = _acquire_file_lock(plugins_file.parent / f".{plugins_file.name}.lock")
+    try:
+        state = agy_plugins_config_state(cfg)
+        cur_dirs = (
+            [os.path.abspath(os.path.expanduser(x)) for x in (state.get("raw_dirs") or [])]
+            if not state.get("config_error")
+            else []
+        )
+        _write_plugins_state_atomic(False, cur_dirs)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    print("✅ AGY 插件挂载已关闭并回滚至隔离状态 — 新会话即时生效，无需重启！")
+    raise SystemExit(0)
+
+if subcmd in ("remove", "rm", "del", "unregister"):
+    if len(rest) != 1 or not rest[0].strip():
+        _err(f"Usage: {prog_name} agy-plugins remove <PLUGIN_DIR>")
+    target = os.path.abspath(os.path.expanduser(rest[0].strip()))
+    lock_fd = _acquire_file_lock(plugins_file.parent / f".{plugins_file.name}.lock")
+    try:
+        state = agy_plugins_config_state(cfg)
+        if state.get("config_error"):
+            _err(state["config_error"])
+        cur_dirs = [os.path.abspath(os.path.expanduser(x)) for x in (state.get("raw_dirs") or [])]
+        new_dirs = [d for d in cur_dirs if d != target]
+        if len(new_dirs) == len(cur_dirs):
+            _err(f"Plugin directory '{target}' is not registered")
+        new_enabled = bool(state.get("enabled")) and bool(new_dirs)
+        if new_enabled:
+            try:
+                _validate_candidate_dirs(new_dirs)
+            except Exception as exc:
+                _err(str(exc))
+        _write_plugins_state_atomic(new_enabled, new_dirs)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    print(f"✅ 已移除插件目录: {target} (enabled={new_enabled})")
+    raise SystemExit(0)
+
+if subcmd in ("clear", "reset"):
+    lock_fd = _acquire_file_lock(plugins_file.parent / f".{plugins_file.name}.lock")
+    try:
+        if cfg.agy_plugins_enabled or cfg.agy_plugin_dirs:
+            _write_plugins_state_atomic(False, [])
+        else:
+            try:
+                if plugins_file.is_symlink() or plugins_file.exists():
+                    plugins_file.unlink()
+            except OSError as exc:
+                _err(f"Failed to remove '{plugins_file}': {exc}")
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    print("✅ 已清空已登记 AGY 插件并恢复默认关闭态 — 即时生效，无需重启！")
+    raise SystemExit(0)
+
+if subcmd in ("doctor", "check", "verify"):
+    require_mns = "--require-mount-ns" in rest
+    state = agy_plugins_config_state(cfg)
+    if state.get("config_error"):
+        _err(f"[1/4] 配置状态检查失败: {state['config_error']}")
+    enabled = bool(state.get("enabled"))
+    raw_dirs = [os.path.abspath(os.path.expanduser(x)) for x in (state.get("raw_dirs") or [])]
+    print(f"[1/4] 配置状态检查通过: enabled={enabled}, source={state.get('source')}, dirs={len(raw_dirs)}")
+
+    try:
+        sb_root = prepare_sandbox_runtime_state(
+            cfg.sandbox_state_dir,
+            lock_timeout_seconds=lock_timeout,
+            forbidden_roots=raw_dirs,
+        )
+    except Exception as exc:
+        _err(f"[2/4] 沙箱运行态与锁健康检查失败: {exc}")
+    print(f"[2/4] 沙箱运行态与锁健康检查通过: {sb_root} (tmp 写入探针正常)")
+
+    validated = []
+    if raw_dirs:
+        try:
+            validated = _validate_candidate_dirs(raw_dirs)
+        except Exception as exc:
+            _err(f"[3/4] 插件三类目录隔离与符号链接检查失败: {exc}")
+        probe_active_cfg = dataclasses.replace(
+            cfg,
+            agy_plugins_enabled=True,
+            agy_plugin_dirs=list(raw_dirs),
+            agy_plugins_file=str(plugins_file.parent / f".nonexistent-doc-{os.getpid()}.json"),
+        )
+        probe_pol = CommandPolicy(probe_active_cfg)
+        try:
+            settings_obj = probe_pol.build_agy_sandbox_settings()
+        except Exception as exc:
+            _err(f"[3/4] AGY --settings 权限规则生成失败: {exc}")
+        allow_rules = set((settings_obj.get("permissions") or {}).get("allow") or [])
+        from gateway.policy import _paths_overlap_any_direction
+
+        for plg in validated:
+            for req_p in (plg.source_dir, plg.vfs_discovery_dir):
+                if f"read_file({req_p})" not in allow_rules:
+                    _err(f"[3/4] 缺少只读授权规则 read_file({req_p})")
+            for rule in allow_rules:
+                if rule.startswith("write_file(") and rule.endswith(")"):
+                    wr_p = os.path.abspath(os.path.expanduser(rule[len("write_file(") : -1].strip()))
+                    if _paths_overlap_any_direction(
+                        wr_p, plg.source_dir
+                    ) or _paths_overlap_any_direction(wr_p, plg.vfs_discovery_dir):
+                        _err(f"[3/4] 检测到危险可写规则泄漏: {rule}")
+        print(
+            "[3/4] 三类目录边界、符号链接防逃逸与 AGY --settings 只读规则检查通过: "
+            + ", ".join(f"{p.name}({p.source_dir})" for p in validated)
+        )
+    else:
+        if enabled:
+            _err("[3/4] agy_plugins_enabled=true 但未配置任何插件目录")
+        print("[3/4] 当前未登记插件目录 (默认关闭态兼容校验通过)")
+
+    mns_ok = can_use_mount_namespace()
+    if not mns_ok:
+        if require_mns:
+            _err("[4/4] 当前内核/容器环境不支持 unshare --user --mount")
+        print("[4/4] 内核挂载命名空间探针跳过 (当前环境 unshare 受容器 seccomp 限制)")
+        raise SystemExit(0)
+
+    if validated:
+        mount_pairs = [(p.name, p.source_dir) for p in validated]
+        probe_script = (
+            "set -eu\n"
+            "for d in \"$@\"; do\n"
+            "  [ -d \"$d\" ] || { echo \"missing:$d\" >&2; exit 21; }\n"
+            "  if ( : > \"$d/.dots_ro_probe\" ) 2>/dev/null; then\n"
+            "    rm -f \"$d/.dots_ro_probe\" 2>/dev/null || true\n"
+            "    echo \"writable:$d\" >&2; exit 22;\n"
+            "  fi\n"
+            "done\n"
+            "if [ -e \"$HOME/.config/dots-gateway/config.json\" ] || [ -e \"$HOME/.config/dots-gateway/tunnel.env\" ]; then\n"
+            "  echo 'secret_exposed' >&2; exit 23;\n"
+            "fi\n"
+        )
+        check_targets = []
+        for p in validated:
+            check_targets.extend([p.source_dir, p.vfs_discovery_dir])
+        probe_cwd = pathlib.Path(cfg.default_workdir).expanduser()
+        probe_cwd.mkdir(parents=True, exist_ok=True)
+        ns_argv = build_mount_ns_argv(
+            ["/bin/sh", "-c", probe_script, "sh", *check_targets],
+            cwd=str(probe_cwd),
+            allowed_workdirs=cfg.allowed_workdirs,
+            protected_paths=cfg.protected_paths,
+            is_agy=True,
+            sandbox_state_dir=cfg.sandbox_state_dir,
+            agy_plugins_enabled=True,
+            agy_plugin_mounts=mount_pairs,
+            masked_plugin_paths=probe_pol.get_configured_agy_plugin_paths(),
+            sandbox_lock_timeout_seconds=lock_timeout,
+        )
+        proc = subprocess.run(ns_argv, capture_output=True, text=True, timeout=15)
+        if proc.returncode != 0:
+            _err(
+                f"[4/4] 真实沙箱 VFS 只读挂载与凭据屏蔽探针失败 (rc={proc.returncode}): "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        print("[4/4] 真实沙箱 VFS 只读挂载、目录可见性与凭据屏蔽探针通过")
+    else:
+        print("[4/4] 内核 unshare --user --mount 可用")
+    raise SystemExit(0)
+
+_err(
+    f"未知的 agy-plugins 子命令 '{subcmd}' (可选: status | add | on | off | remove | clear | doctor)"
+)
+PY
+}
+
 cmd_config() {
   (cd "${GATEWAY_DIR}" && python3 main.py --print-plugin-config)
 }
@@ -1361,6 +1843,7 @@ Dots Gateway & Secure MCP Tunnel 运维管理命令行 (${PROG_NAME})
   tunnel-setup [ID]  交互式配置并启动 OpenAI 官方 Secure MCP Tunnel (tunnel-client 后台常驻)
   agy-auth [mode]    免重启切换 Antigravity CLI 认证方式: adc [PROJECT_ID] | oauth | toggle | status
   agy-model [cmd]    免重启切换网关 agy 默认模型: list | set <MODEL_ID> | reset | status
+  agy-plugins [cmd]  免重启管理已登记只读 AGY 插件: status | add <DIR> | on | off | remove | clear | doctor
   docker [cmd]       免重启开关沙箱 Docker 访问 (策略过滤代理): on | off | toggle | status | test
   codex-setup        交互式配置本机 OpenAI Codex CLI 的 API Key (0600 隔离存储，即时生效)
   start              启动网关服务 (及已配置的 Tunnel 服务) 并执行健康检查
@@ -1374,6 +1857,7 @@ Dots Gateway & Secure MCP Tunnel 运维管理命令行 (${PROG_NAME})
 
 常用示例:
   ${PROG_NAME} tunnel-setup    # 绑定 OpenAI tunnel_... 与 Runtime Key 并启动官方隧道
+  ${PROG_NAME} agy-plugins status # 查看 AGY 只读插件登记、边界校验及挂载状态
   ${PROG_NAME} status          # 查看网关与 OpenAI 隧道实时连接状态
   ${PROG_NAME} restart         # 一键重启网关与隧道服务
   ${PROG_NAME} logs -f         # 实时滚动查看网关与隧道日志
@@ -1405,6 +1889,9 @@ case "${ACTION}" in
     ;;
   agy-model|agy-models|model)
     cmd_agy_model "$@"
+    ;;
+  agy-plugins|agy-plugin|plugins)
+    cmd_agy_plugins "$@"
     ;;
   docker|docker-access)
     cmd_docker "$@"

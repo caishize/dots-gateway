@@ -24,4 +24,7 @@ os.environ.setdefault("GATEWAY_SANDBOX_STATE_DIR", os.path.join(_TEST_ISOLATION_
 os.environ.setdefault("GATEWAY_SANDBOX_CLEANUP_ENABLED", "0")
 os.environ.setdefault("GATEWAY_AGY_ENV_FILE", os.path.join(_TEST_ISOLATION_DIR, "agy.env"))
 os.environ.setdefault("GATEWAY_AGY_MODEL_FILE", os.path.join(_TEST_ISOLATION_DIR, "agy.model"))
+os.environ.setdefault(
+    "GATEWAY_AGY_PLUGINS_FILE", os.path.join(_TEST_ISOLATION_DIR, "agy-plugins.json")
+)
 os.environ.setdefault("GATEWAY_CODEX_ENV_FILE", os.path.join(_TEST_ISOLATION_DIR, "codex.env"))

@@ -32,12 +32,20 @@ from typing import (
     Union,
 )
 
-from .config import GatewayConfig, docker_access_enabled, docker_access_state
+from .config import (
+    GATEWAY_ROOT,
+    GatewayConfig,
+    agy_plugins_config_state,
+    docker_access_enabled,
+    docker_access_state,
+    redact_diagnostic_text,
+)
 from .policy import CommandPolicy
 from .sandbox import (
     build_mount_ns_argv,
     cleanup_sandbox_state,
     get_sandbox_disk_status,
+    prepare_sandbox_runtime_state,
 )
 
 STREAM_LINE_LIMIT = 16 * 1024 * 1024  # 16 MiB asyncio StreamReader buffer limit
@@ -226,11 +234,26 @@ _STRIPPED_ENV_KEYS = {
     "DOCKER_CONTEXT",
     "DOCKER_TLS_VERIFY",
     "DOCKER_CERT_PATH",
+    # Never let unverified plugin/project roots leak from host or caller environments
+    "AGY_PLUGIN_ROOT",
+    "AGY_PLUGIN_DIRS",
+    "AGY_REGISTERED_PLUGINS",
+    "CLAUDE_PLUGIN_ROOT",
+    "CLAUDE_PROJECT_DIR",
+    "AGY_PROJECT_DIR",
+    "HARNESS_PROJECT_DIR",
+    "OH_MY_AGENTS_ROOT",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
 }
 _BLOCKED_CALLER_ENV_KEYS = _STRIPPED_ENV_KEYS | {
+    "PATH",
     "LD_PRELOAD",
     "LD_AUDIT",
     "LD_LIBRARY_PATH",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "GLIBC_TUNABLES",
     "BASH_ENV",
     "ENV",
     "PROMPT_COMMAND",
@@ -241,6 +264,28 @@ _BLOCKED_CALLER_ENV_KEYS = _STRIPPED_ENV_KEYS | {
     "NO_GCE_CHECK",
     "AWS_EC2_METADATA_DISABLED",
     "CONTAINER_HOST",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "PYTHONHOME",
+    "PYTHONPYCACHEPREFIX",
+    "PYTHONDONTWRITEBYTECODE",
+    "PYTHONINSPECT",
+    "PYTHONUSERBASE",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_REPL_EXTERNAL_MODULE",
+    "GIT_SSH_COMMAND",
+    "GIT_EXEC_PATH",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_TEMPLATE_DIR",
 }
 
 
@@ -307,6 +352,8 @@ class ExecutionSession:
         is_codex: bool = False,
         spawn_argv: Optional[List[str]] = None,
         on_persist: Optional[Callable[["ExecutionSession", bool], None]] = None,
+        pre_spawn_check: Optional[Callable[[], None]] = None,
+        error_redactor: Optional[Callable[[str], str]] = None,
     ) -> None:
         self.session_id = session_id
         self.argv = argv
@@ -322,6 +369,8 @@ class ExecutionSession:
         self.is_agy = is_agy
         self.is_codex = is_codex
         self._on_persist = on_persist
+        self._pre_spawn_check = pre_spawn_check
+        self._error_redactor = error_redactor
 
         self.status: str = "starting"
         self.pid: Optional[int] = None
@@ -490,6 +539,8 @@ class ExecutionSession:
             return
 
         try:
+            if self._pre_spawn_check is not None:
+                await asyncio.to_thread(self._pre_spawn_check)
             self.started_at = time.time()
             await self._spawn_process(initial_stdin=None, close_stdin=False)
             should_close = close_stdin
@@ -505,7 +556,9 @@ class ExecutionSession:
             self.ended_at = time.time()
             self.returncode = -1
             self.status = "failed"
-            self._emit("error", str(exc))
+            err_msg = self._error_redactor(str(exc)) if self._error_redactor else str(exc)
+            self._append_stderr(err_msg + "\n")
+            self._emit("error", err_msg)
             self._emit("exit", {"returncode": -1, "status": "failed", "duration_seconds": 0.0})
             self._notify_persist(force=True)
             self._done_event.set()
@@ -1380,17 +1433,30 @@ class SessionManager:
                 raise ValueError("timeout must be a positive finite number (or omit for default)")
         return min(val, float(self.config.max_timeout_seconds))
 
+    def _sandbox_forbidden_roots(self) -> List[str]:
+        home_dir = str(Path.home().resolve())
+        return [
+            str(GATEWAY_ROOT),
+            *list(self.config.protected_paths or ()),
+            os.path.join(home_dir, ".gemini"),
+            os.path.join(home_dir, ".config"),
+            *self.policy.get_configured_agy_plugin_paths(),
+        ]
+
     def _prepare_env(
         self,
         extra_env: Optional[Dict[str, str]] = None,
         trusted_env: Optional[Dict[str, str]] = None,
+        check_sandbox_storage: bool = False,
+        prevalidated_sandbox_state: Optional[Path] = None,
     ) -> Dict[str, str]:
         env = {
             k: v
             for k, v in os.environ.items()
             if k not in _STRIPPED_ENV_KEYS and not k.startswith("GATEWAY_")
         }
-        local_bin = str(os.path.expanduser("~/.local/bin"))
+        home_dir = str(Path.home().resolve())
+        local_bin = os.path.join(home_dir, ".local", "bin")
         current_path = env.get("PATH", "/usr/local/bin:/usr/bin:/bin")
         parts = [p for p in current_path.split(os.pathsep) if p]
         for required_dir in ("/usr/local/bin", local_bin):
@@ -1400,30 +1466,50 @@ class SessionManager:
         if env.get("TERM") in (None, "", "dumb"):
             env["TERM"] = "xterm-256color"
         if self.config.isolate_mount_namespace:
+            if check_sandbox_storage and prevalidated_sandbox_state is None:
+                home_covered = any(
+                    home_dir == r or home_dir.startswith(r.rstrip("/") + "/")
+                    for r in self.policy._allowed_roots
+                )
+                if not home_covered:
+                    prepare_sandbox_runtime_state(
+                        self.config.sandbox_state_dir,
+                        lock_timeout_seconds=self.config.sandbox_lock_timeout_seconds,
+                        forbidden_roots=self._sandbox_forbidden_roots(),
+                    )
             env["TMPDIR"] = "/tmp"
+        elif check_sandbox_storage:
+            sb_state = prevalidated_sandbox_state or prepare_sandbox_runtime_state(
+                self.config.sandbox_state_dir,
+                lock_timeout_seconds=self.config.sandbox_lock_timeout_seconds,
+                forbidden_roots=self._sandbox_forbidden_roots(),
+            )
+            env["TMPDIR"] = str(sb_state / "tmp")
         elif self.config.sandbox_state_dir:
-            try:
-                sb_tmp_p = Path(self.config.sandbox_state_dir).expanduser().resolve() / "tmp"
-                sb_tmp_p.mkdir(parents=True, exist_ok=True)
+            sb_tmp_p = Path(self.config.sandbox_state_dir).expanduser() / "tmp"
+            if sb_tmp_p.is_dir():
                 env["TMPDIR"] = str(sb_tmp_p)
-            except OSError:
-                pass
         # Prevent cloud SDKs (google-auth, boto3, etc.) from probing host VM instance metadata
         # (169.254.169.254 / fd20:ce::254) when application credentials are intentionally absent.
         env["NO_GCE_CHECK"] = "true"
         env["GCE_METADATA_HOST"] = "127.0.0.1:1"
         env["GCE_METADATA_ROOT"] = "127.0.0.1:1"
         env["AWS_EC2_METADATA_DISABLED"] = "true"
+        # Apply untrusted caller extra_env BEFORE operator trusted_env so operator settings always win
+        if extra_env:
+            for k, v in extra_env.items():
+                ks = str(k)
+                if (
+                    ks in _BLOCKED_CALLER_ENV_KEYS
+                    or ks.startswith("GATEWAY_")
+                    or ks.startswith("LD_")
+                ):
+                    continue
+                env[ks] = str(v)
         if trusted_env:
             for k, v in trusted_env.items():
                 ks = str(k)
                 if ks in ("DOCKER_HOST", "DOCKER_CONTEXT") or ks.startswith("GATEWAY_"):
-                    continue
-                env[ks] = str(v)
-        if extra_env:
-            for k, v in extra_env.items():
-                ks = str(k)
-                if ks in _BLOCKED_CALLER_ENV_KEYS or ks.startswith("GATEWAY_"):
                     continue
                 env[ks] = str(v)
         docker_sock = self._active_docker_proxy_socket()
@@ -1757,6 +1843,9 @@ class SessionManager:
         is_codex: bool = False,
         readonly_subpaths: Optional[Sequence[str]] = None,
         trusted_env: Optional[Dict[str, str]] = None,
+        agy_plugins_enabled: bool = False,
+        agy_plugin_mounts: Optional[Sequence[Tuple[str, str]]] = None,
+        pre_spawn_check: Optional[Callable[[], None]] = None,
     ) -> ExecutionSession:
         """Validate command against security policy and start an ExecutionSession."""
         if self.active_count() >= self.config.max_concurrent_sessions:
@@ -1765,7 +1854,10 @@ class SessionManager:
             )
 
         decision = self.policy.validate_command(
-            command, cwd=cwd, _trusted_agy_argv=is_agy
+            command,
+            cwd=cwd,
+            _trusted_agy_argv=is_agy,
+            _trusted_codex_argv=is_codex,
         )
         if not decision.allowed:
             raise PermissionError(decision.reason)
@@ -1774,7 +1866,25 @@ class SessionManager:
         effective_timeout = self._resolve_timeout(
             timeout, self.config.default_timeout_seconds
         )
-        prepared_env = self._prepare_env(extra_env=env, trusted_env=trusted_env)
+        home_dir = os.path.realpath(str(Path.home()))
+        home_covered = any(
+            home_dir == r or home_dir.startswith(r.rstrip("/") + "/")
+            for r in self.policy._allowed_roots
+        )
+        prevalidated_sb: Optional[Path] = None
+        if not self.config.isolate_mount_namespace or not home_covered:
+            prevalidated_sb = await asyncio.to_thread(
+                prepare_sandbox_runtime_state,
+                self.config.sandbox_state_dir,
+                lock_timeout_seconds=self.config.sandbox_lock_timeout_seconds,
+                forbidden_roots=self._sandbox_forbidden_roots(),
+            )
+        prepared_env = self._prepare_env(
+            extra_env=env,
+            trusted_env=trusted_env,
+            check_sandbox_storage=True,
+            prevalidated_sandbox_state=prevalidated_sb,
+        )
 
         # Auto-enable shell execution when a string command uses pipes/chaining/builtins
         use_shell = decision.requires_shell if shell is None else bool(shell)
@@ -1817,6 +1927,11 @@ class SessionManager:
                 docker_mask_paths=self.config.docker_mask_paths,
                 docker_proxy_socket=self._active_docker_proxy_socket(),
                 mount_gcloud_adc=adc_active,
+                agy_plugins_enabled=agy_plugins_enabled,
+                agy_plugin_mounts=agy_plugin_mounts,
+                masked_plugin_paths=self.policy.get_configured_agy_plugin_paths(),
+                sandbox_lock_timeout_seconds=self.config.sandbox_lock_timeout_seconds,
+                prevalidated_sandbox_state=prevalidated_sb,
             )
 
         self._cleanup_old_sessions()
@@ -1844,6 +1959,8 @@ class SessionManager:
             on_persist=(
                 self._on_live_session_persist if self._state_dir is not None else None
             ),
+            pre_spawn_check=pre_spawn_check,
+            error_redactor=lambda s: redact_diagnostic_text(s, self.config),
         )
         self._sessions[session_id] = session
         try:
@@ -1894,24 +2011,74 @@ class SessionManager:
             add_dirs=add_dirs,
             cwd=cwd,
         )
+        plugins_state = agy_plugins_config_state(self.config)
+        validated_plugins = []
+        if plugins_state.get("config_error") or plugins_state.get("enabled"):
+            validated_plugins = self.policy.validate_agy_plugins(
+                cwd=cwd, add_dirs=add_dirs, require_mount_ns_check=True
+            )
         _, ro_hook_dirs = self.policy.resolve_codex_git_metadata_dirs(
             cwd=cwd, add_dirs=add_dirs
         )
         trusted_agy_env = self._load_agy_env()
+        for strip_plg_key in (
+            "AGY_PLUGIN_ROOT",
+            "AGY_PLUGIN_DIRS",
+            "AGY_REGISTERED_PLUGINS",
+            "CLAUDE_PLUGIN_ROOT",
+            "CLAUDE_PROJECT_DIR",
+            "AGY_PROJECT_DIR",
+            "HARNESS_PROJECT_DIR",
+            "OH_MY_AGENTS_ROOT",
+        ):
+            trusted_agy_env.pop(strip_plg_key, None)
+
         caller_env: Dict[str, str] = {}
         if env:
             for k, v in env.items():
                 ks = str(k)
                 vs = "" if v is None else str(v)
-                if not vs or (
-                    ks == "AGY_ADC_AUTH"
-                    and vs.strip().lower() in ("0", "false", "no", "off")
+                if ks == "AGY_ADC_AUTH" and (
+                    not vs or vs.strip().lower() in ("0", "false", "no", "off")
                 ):
-                    trusted_agy_env.pop(ks, None)
-                    if ks == "AGY_ADC_AUTH":
-                        trusted_agy_env.pop("GOOGLE_CLOUD_QUOTA_PROJECT", None)
-                else:
+                    trusted_agy_env.pop("AGY_ADC_AUTH", None)
+                    trusted_agy_env.pop("GOOGLE_CLOUD_QUOTA_PROJECT", None)
+                elif vs:
                     caller_env[ks] = vs
+
+        if validated_plugins:
+            trusted_agy_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            oma_plg = next(
+                (p for p in validated_plugins if p.name == "oh-my-agents"), None
+            )
+            primary_plg = oma_plg or (
+                validated_plugins[0] if len(validated_plugins) == 1 else None
+            )
+            if primary_plg is not None:
+                trusted_agy_env["AGY_PLUGIN_ROOT"] = primary_plg.source_dir
+            trusted_agy_env["AGY_REGISTERED_PLUGINS"] = os.pathsep.join(
+                p.source_dir for p in validated_plugins
+            )
+
+        expected_plugin_mounts = [(p.name, p.source_dir) for p in validated_plugins]
+
+        def _revalidate_agy_plugins_before_spawn() -> None:
+            latest_state = agy_plugins_config_state(self.config)
+            current_plugins = []
+            if latest_state.get("config_error") or latest_state.get("enabled"):
+                current_plugins = self.policy.validate_agy_plugins(
+                    cwd=cwd, add_dirs=add_dirs, require_mount_ns_check=True
+                )
+            current_mounts = [(p.name, p.source_dir) for p in current_plugins]
+            if current_mounts != expected_plugin_mounts:
+                raise PermissionError(
+                    redact_diagnostic_text(
+                        "AGY plugin registration changed while session was queued; "
+                        "aborting queued session fail-closed.",
+                        self.config,
+                    )
+                )
+
         is_stream_json = output_format == "stream-json" or "--output-format=stream-json" in argv
         eff_timeout = self._resolve_timeout(
             timeout, self.config.agent_default_timeout_seconds
@@ -1931,6 +2098,9 @@ class SessionManager:
             is_agy=True,
             readonly_subpaths=ro_hook_dirs,
             trusted_env=trusted_agy_env,
+            agy_plugins_enabled=bool(validated_plugins),
+            agy_plugin_mounts=expected_plugin_mounts,
+            pre_spawn_check=_revalidate_agy_plugins_before_spawn,
         )
 
     async def create_codex_session(
