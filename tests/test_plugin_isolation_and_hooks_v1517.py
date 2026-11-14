@@ -2080,6 +2080,205 @@ class TestPluginIsolationAndHooksV1517(unittest.IsolatedAsyncioTestCase):
         finally:
             cleanup_prepared_plugin_runtime(prep_agy)
 
+    async def test_gh_config_local_bin_and_gitconfig_not_shadowed_by_protected_umbrellas(
+        self,
+    ) -> None:
+        """Regression test: `~/.config` and `~/.local` in `protected_paths` must never shadow
+        writable `~/.config/gh` / `~/.config/flutter`, writable `~/.local/share`, or read-only
+        `~/.local/bin` & `~/.gitconfig` in `exec_command`, `plain_codex`, `plain_agy`, or isolated
+        plugin homes (`home_covered=False` and `home_covered=True`).
+        """
+        fake_home = self.test_root / "fake-home-gh-umbrella"
+        (fake_home / ".config" / "gh").mkdir(parents=True, exist_ok=True)
+        (fake_home / ".config" / "gh" / "hosts.yml").write_text(
+            "github.com:\n    user: demo\n", encoding="utf-8"
+        )
+        (fake_home / ".config" / "dots-gateway").mkdir(parents=True, exist_ok=True)
+        (fake_home / ".config" / "dots-gateway" / "tunnel.env").write_text(
+            "SECRET=1\n", encoding="utf-8"
+        )
+        (fake_home / ".config" / "tunnel-client").mkdir(parents=True, exist_ok=True)
+        (fake_home / ".config" / "antigravity").mkdir(parents=True, exist_ok=True)
+        (fake_home / ".config" / "antigravity" / "state.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
+        (fake_home / ".config" / "rclone").mkdir(parents=True, exist_ok=True)
+        (fake_home / ".config" / "rclone" / "rclone.conf").write_text(
+            "token=1\n", encoding="utf-8"
+        )
+        (fake_home / ".local" / "bin").mkdir(parents=True, exist_ok=True)
+        user_cli = fake_home / ".local" / "bin" / "my-tool"
+        user_cli.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+        os.chmod(user_cli, 0o755)
+        (fake_home / ".gitconfig").write_text(
+            "[credential \"https://github.com\"]\n\thelper = !/usr/bin/gh auth git-credential\n",
+            encoding="utf-8",
+        )
+        ext_ws = self.test_root / "ext-ws-gh"
+        ext_ws.mkdir(parents=True, exist_ok=True)
+        sb_dir = self.test_root / "sb-gh"
+
+        default_like_prots = [
+            str(fake_home / ".config"),
+            str(fake_home / ".gemini"),
+            str(fake_home / ".codex"),
+            str(fake_home / ".ssh"),
+            str(fake_home / ".local"),
+        ]
+
+        with (
+            patch("gateway.sandbox.Path.home", return_value=fake_home),
+            patch("gateway.policy.Path.home", return_value=fake_home),
+            patch("gateway.hook_jail.Path.home", return_value=fake_home),
+            patch("gateway.sandbox.can_use_mount_namespace", return_value=True),
+        ):
+            # 1. Policy check: build_agy_sandbox_settings grants read_file on .gitconfig & .local/bin
+            plain_pol = CommandPolicy(
+                GatewayConfig(
+                    allowed_workdirs=[str(ext_ws)],
+                    default_workdir=str(ext_ws),
+                    protected_paths=default_like_prots,
+                    sandbox_state_dir=str(sb_dir),
+                )
+            )
+            plain_settings = plain_pol.build_agy_sandbox_settings(cwd=str(ext_ws))
+            self.assertIn(
+                f"read_file({fake_home.resolve() / '.gitconfig'})",
+                plain_settings["permissions"]["allow"],
+            )
+            self.assertIn(
+                f"read_file({fake_home.resolve() / '.local' / 'bin'})",
+                plain_settings["permissions"]["allow"],
+            )
+
+            iso_pol = CommandPolicy(
+                GatewayConfig(
+                    allowed_workdirs=[str(ext_ws)],
+                    default_workdir=str(ext_ws),
+                    protected_paths=default_like_prots,
+                    sandbox_state_dir=str(sb_dir),
+                    agy_plugins_enabled=True,
+                    agy_plugin_dirs=[str(self.oma_gemini_dir)],
+                    agy_plugins_file=str(self.test_root / "no_agy_plg_gh.json"),
+                )
+            )
+            iso_settings = iso_pol.build_agy_sandbox_settings(cwd=str(ext_ws))
+            self.assertIn(
+                "read_file(/mnt/dots-agent-home/agy/.gitconfig)",
+                iso_settings["permissions"]["allow"],
+            )
+
+            # 2. VFS script checks for exec_command & plain_codex (home_covered=False)
+            for label, kw in (
+                ("exec", {"is_agy": False, "is_codex": False}),
+                ("plain_codex", {"is_agy": False, "is_codex": True}),
+            ):
+                mns_argv = build_mount_ns_argv(
+                    target_argv=["/bin/true"],
+                    cwd=str(ext_ws),
+                    allowed_workdirs=[str(ext_ws)],
+                    protected_paths=default_like_prots,
+                    sandbox_state_dir=str(sb_dir),
+                    **kw,
+                )
+                script = mns_argv[mns_argv.index("-c") + 1]
+                self.assertIn(".config/gh", script, label)
+                self.assertNotIn(
+                    f"tmpfs /media{fake_home.resolve()}/.config;",
+                    script,
+                    f"{label} must not shadow ~/.config with ro tmpfs",
+                )
+                self.assertNotIn(
+                    f"tmpfs /media{fake_home.resolve()}/.local;",
+                    script,
+                    f"{label} must not shadow ~/.local with ro tmpfs",
+                )
+
+            # Explicit `~/.config/gh` in protected_paths MUST still be masked
+            explicit_gh_argv = build_mount_ns_argv(
+                target_argv=["/bin/true"],
+                cwd=str(ext_ws),
+                allowed_workdirs=[str(ext_ws)],
+                protected_paths=[*default_like_prots, str(fake_home / ".config" / "gh")],
+                sandbox_state_dir=str(sb_dir),
+            )
+            explicit_gh_script = explicit_gh_argv[explicit_gh_argv.index("-c") + 1]
+            self.assertIn(
+                f"if [ -d /media{fake_home.resolve()}/.config/gh ]; then",
+                explicit_gh_script,
+            )
+
+        if not can_use_mount_namespace():
+            return
+
+        probe_code = (
+            "import json, os\n"
+            f"h = {str(fake_home.resolve())!r}\n"
+            "gh_dir = os.path.join(h, '.config', 'gh')\n"
+            "hosts_txt = open(os.path.join(gh_dir, 'hosts.yml')).read()\n"
+            "p = os.path.join(gh_dir, '_rw_test')\n"
+            "open(p, 'w').write('writable_ok')\n"
+            "rw_val = open(p).read()\n"
+            "os.unlink(p)\n"
+            "fl_p = os.path.join(h, '.config', 'flutter', '_fl_rw')\n"
+            "open(fl_p, 'w').write('fl_ok')\n"
+            "os.unlink(fl_p)\n"
+            "ls_p = os.path.join(h, '.local', 'share', '_ls_rw')\n"
+            "open(ls_p, 'w').write('ls_ok')\n"
+            "os.unlink(ls_p)\n"
+            "lb_ro = False\n"
+            "try:\n"
+            "    open(os.path.join(h, '.local', 'bin', '_evil'), 'w').write('x')\n"
+            "except OSError:\n"
+            "    lb_ro = True\n"
+            "gc_ro = False\n"
+            "try:\n"
+            "    open(os.path.join(h, '.gitconfig'), 'a').write('#x')\n"
+            "except OSError:\n"
+            "    gc_ro = True\n"
+            "gw_sec = os.path.exists(os.path.join(h, '.config', 'dots-gateway', 'tunnel.env'))\n"
+            "agy_sec = os.path.exists(os.path.join(h, '.config', 'antigravity', 'state.json'))\n"
+            "rclone_sec = os.path.exists(os.path.join(h, '.config', 'rclone', 'rclone.conf'))\n"
+            "print(json.dumps({\n"
+            "    'hosts_ok': 'user: demo' in hosts_txt,\n"
+            "    'rw_ok': rw_val == 'writable_ok',\n"
+            "    'cli_exists': os.path.isfile(os.path.join(h, '.local', 'bin', 'my-tool')),\n"
+            "    'lb_ro': lb_ro,\n"
+            "    'gc_ro': gc_ro,\n"
+            "    'gw_sec': gw_sec,\n"
+            "    'agy_sec': agy_sec,\n"
+            "    'rclone_sec': rclone_sec,\n"
+            "}))\n"
+        )
+
+        with patch("gateway.sandbox.Path.home", return_value=fake_home):
+            for allowed_roots in ([str(ext_ws)], [str(fake_home), str(ext_ws)]):
+                for kw in (
+                    {"is_agy": False, "is_codex": False},
+                    {"is_agy": False, "is_codex": True},
+                ):
+                    ns_argv = build_mount_ns_argv(
+                        [sys.executable, "-c", probe_code],
+                        cwd=str(ext_ws),
+                        allowed_workdirs=allowed_roots,
+                        protected_paths=default_like_prots,
+                        sandbox_state_dir=str(sb_dir),
+                        **kw,
+                    )
+                    proc = subprocess.run(
+                        ns_argv, capture_output=True, text=True, timeout=15
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+                    out = json.loads(proc.stdout.strip())
+                    self.assertTrue(out["hosts_ok"], out)
+                    self.assertTrue(out["rw_ok"], out)
+                    self.assertTrue(out["cli_exists"], out)
+                    self.assertTrue(out["lb_ro"], out)
+                    self.assertTrue(out["gc_ro"], out)
+                    self.assertFalse(out["gw_sec"], out)
+                    self.assertFalse(out["agy_sec"], out)
+                    self.assertFalse(out["rclone_sec"], out)
+
 
 if __name__ == "__main__":
     unittest.main()

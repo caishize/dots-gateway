@@ -850,12 +850,29 @@ def _mask_protected_and_workspace_hook_lines(
                 pass
         return variants
 
+    home_covered = _is_covered_by_roots(home_dir, allowed_roots)
+    dot_local_variants = _home_dot_variants(".local")
+    dot_config_variants = _home_dot_variants(".config")
+
+    explicit_prot_set: set[str] = set()
+    for raw_prot in protected_paths:
+        try:
+            explicit_prot_set.add(str(Path(raw_prot).expanduser().resolve()))
+        except Exception:
+            continue
+
     skip_dot_umbrellas: set[str] = set()
-    if is_agy or is_codex:
-        skip_dot_umbrellas.update(_home_dot_variants(".local"))
+    if not home_covered:
+        skip_dot_umbrellas.update(dot_local_variants)
+        if not use_isolated_agy_home and not use_isolated_codex_home:
+            skip_dot_umbrellas.update(dot_config_variants)
+    else:
+        if not use_isolated_agy_home and not use_isolated_codex_home:
+            skip_dot_umbrellas.update(dot_local_variants)
+        if is_agy and not use_isolated_agy_home:
+            skip_dot_umbrellas.update(dot_config_variants)
     if is_agy and not use_isolated_agy_home:
         skip_dot_umbrellas.update(_home_dot_variants(".gemini"))
-        skip_dot_umbrellas.update(_home_dot_variants(".config"))
     if is_codex and not use_isolated_codex_home:
         skip_dot_umbrellas.update(_home_dot_variants(".codex"))
 
@@ -871,7 +888,7 @@ def _mask_protected_and_workspace_hook_lines(
         resolved_prots.append(prot_cand)
 
     # Always mask sensitive ~/.config subtrees even when the ~/.config umbrella was skipped
-    # (e.g. plain AGY with allowed_workdirs covering HOME).
+    # (e.g. plain AGY with allowed_workdirs covering HOME, or skeleton ~/.config in exec/codex).
     mandatory_config_subs = [
         os.path.join(home_dir, ".config", "dots-gateway"),
         os.path.join(home_dir, ".config", "tunnel-client"),
@@ -879,6 +896,8 @@ def _mask_protected_and_workspace_hook_lines(
     ]
     if not (is_agy and mount_gcloud_adc and not use_isolated_agy_home):
         mandatory_config_subs.append(os.path.join(home_dir, ".config", "gcloud"))
+    if not (is_agy and not use_isolated_agy_home):
+        mandatory_config_subs.append(os.path.join(home_dir, ".config", "antigravity"))
     for cfg_sub_lex in mandatory_config_subs:
         if os.path.islink(cfg_sub_lex) and _is_covered_by_roots(cfg_sub_lex, allowed_roots):
             raise SandboxStorageError(
@@ -948,11 +967,139 @@ def _mask_protected_and_workspace_hook_lines(
         q_dp = shlex.quote(f"{stage_dir}{prot}")
         if os.path.isdir(prot):
             masked_prot_dirs.append(prot)
-            if (
+            has_preserved_bin = (
                 preserve_lex is not None
                 and preserve_real is not None
                 and preserve_lex.startswith(prot.rstrip("/") + "/")
+            )
+            if (
+                home_covered
+                and prot in dot_config_variants
+                and not use_isolated_agy_home
+                and not use_isolated_codex_home
             ):
+                cfg_lex = os.path.join(home_dir, ".config")
+                gh_lex = os.path.join(cfg_lex, "gh")
+                fl_lex = os.path.join(cfg_lex, "flutter")
+                for chk_p in (cfg_lex, gh_lex, fl_lex):
+                    if os.path.islink(chk_p):
+                        raise SandboxStorageError(
+                            f"Symlinked protected configuration path '{redact_diagnostic_text(chk_p)}' "
+                            "is forbidden when covered by allowed_workdirs"
+                        )
+                out.extend(
+                    [
+                        f"mkdir -p {q_dp}",
+                        f"{q_mount} -t tmpfs -o size=16k,mode=0755,nosuid,nodev tmpfs {q_dp}",
+                    ]
+                )
+                if has_preserved_bin and preserve_lex is not None and preserve_real is not None:
+                    preserved_in_masked_prot = True
+                    q_real_bin = shlex.quote(preserve_real)
+                    q_dst_bin = shlex.quote(f"{stage_dir}{preserve_lex}")
+                    q_dst_parent = shlex.quote(f"{stage_dir}{os.path.dirname(preserve_lex)}")
+                    out.extend(
+                        [
+                            f"[ ! -L {q_real_bin} ] && [ -f {q_real_bin} ] && [ -x {q_real_bin} ]",
+                            f"mkdir -p {q_dst_parent}",
+                            f": > {q_dst_bin}",
+                            f"{q_mount} --bind {q_real_bin} {q_dst_bin}",
+                            _remount_ro_cmd(q_mount, q_dst_bin),
+                        ]
+                    )
+                gh_real = os.path.realpath(gh_lex) if os.path.isdir(gh_lex) else ""
+                if (
+                    gh_real
+                    and os.path.abspath(gh_lex) not in explicit_prot_set
+                    and gh_real not in explicit_prot_set
+                ):
+                    q_gh_hc = shlex.quote(gh_real)
+                    q_dst_gh_hc = shlex.quote(f"{stage_dir}{os.path.join(prot, 'gh')}")
+                    out.extend(
+                        [
+                            f"mkdir -p {q_dst_gh_hc}",
+                            f"{q_mount} --rbind {q_gh_hc} {q_dst_gh_hc}",
+                        ]
+                    )
+                fl_src = ""
+                if os.path.isdir(fl_lex):
+                    fl_src = os.path.realpath(fl_lex)
+                elif sandbox_state is not None and (sandbox_state / "flutter_cfg").is_dir():
+                    fl_src = str(sandbox_state / "flutter_cfg")
+                if (
+                    fl_src
+                    and os.path.abspath(fl_lex) not in explicit_prot_set
+                    and os.path.realpath(fl_lex) not in explicit_prot_set
+                ):
+                    q_fl_hc = shlex.quote(fl_src)
+                    q_dst_fl_hc = shlex.quote(f"{stage_dir}{os.path.join(prot, 'flutter')}")
+                    out.extend(
+                        [
+                            f"mkdir -p {q_dst_fl_hc}",
+                            f"{q_mount} --rbind {q_fl_hc} {q_dst_fl_hc}",
+                        ]
+                    )
+                out.append(
+                    f"{q_mount} -o remount,ro,nosuid,nodev {q_dp} 2>/dev/null || {q_mount} -o remount,ro {q_dp}"
+                )
+            elif (
+                home_covered
+                and prot in dot_local_variants
+                and (use_isolated_agy_home or use_isolated_codex_home)
+            ):
+                loc_lex = os.path.join(home_dir, ".local")
+                lb_lex = os.path.join(loc_lex, "bin")
+                for chk_p in (loc_lex, lb_lex):
+                    if os.path.islink(chk_p):
+                        raise SandboxStorageError(
+                            f"Symlinked protected runtime path '{redact_diagnostic_text(chk_p)}' "
+                            "is forbidden when covered by allowed_workdirs"
+                        )
+                out.extend(
+                    [
+                        f"mkdir -p {q_dp}",
+                        f"{q_mount} -t tmpfs -o size=16k,mode=0755,nosuid,nodev tmpfs {q_dp}",
+                    ]
+                )
+                lb_mounted = False
+                lb_real = os.path.realpath(lb_lex) if os.path.isdir(lb_lex) else ""
+                if (
+                    lb_real
+                    and os.path.abspath(lb_lex) not in explicit_prot_set
+                    and lb_real not in explicit_prot_set
+                ):
+                    lb_mounted = True
+                    q_lb_hc = shlex.quote(lb_real)
+                    q_dst_lb_hc = shlex.quote(f"{stage_dir}{os.path.join(prot, 'bin')}")
+                    out.extend(
+                        [
+                            f"mkdir -p {q_dst_lb_hc}",
+                            f"{q_mount} --bind {q_lb_hc} {q_dst_lb_hc}",
+                            _remount_ro_cmd(q_mount, q_dst_lb_hc),
+                        ]
+                    )
+                if has_preserved_bin and preserve_lex is not None and preserve_real is not None:
+                    preserved_in_masked_prot = True
+                    if not (
+                        lb_mounted
+                        and preserve_lex.startswith(os.path.join(prot, "bin").rstrip("/") + "/")
+                    ):
+                        q_real_bin = shlex.quote(preserve_real)
+                        q_dst_bin = shlex.quote(f"{stage_dir}{preserve_lex}")
+                        q_dst_parent = shlex.quote(f"{stage_dir}{os.path.dirname(preserve_lex)}")
+                        out.extend(
+                            [
+                                f"[ ! -L {q_real_bin} ] && [ -f {q_real_bin} ] && [ -x {q_real_bin} ]",
+                                f"mkdir -p {q_dst_parent}",
+                                f": > {q_dst_bin}",
+                                f"{q_mount} --bind {q_real_bin} {q_dst_bin}",
+                                _remount_ro_cmd(q_mount, q_dst_bin),
+                            ]
+                        )
+                out.append(
+                    f"{q_mount} -o remount,ro,nosuid,nodev {q_dp} 2>/dev/null || {q_mount} -o remount,ro {q_dp}"
+                )
+            elif has_preserved_bin and preserve_lex is not None and preserve_real is not None:
                 preserved_in_masked_prot = True
                 q_real_bin = shlex.quote(preserve_real)
                 q_dst_bin = shlex.quote(f"{stage_dir}{preserve_lex}")
@@ -1222,9 +1369,24 @@ def build_mount_ns_argv(
                 subdirs=SANDBOX_SUBDIRS,
                 forbidden_roots=non_home_forbidden_sb_roots,
             )
-            gh_cfg_dir.mkdir(parents=True, exist_ok=True)
         else:
             sandbox_state = Path(os.path.realpath(os.path.expanduser(raw_sb_target)))
+        if not os.path.islink(os.path.join(home_dir, ".config")):
+            if not os.path.islink(str(gh_cfg_dir)):
+                gh_cfg_dir.mkdir(parents=True, exist_ok=True)
+            fl_cfg_dir = Path(home_dir) / ".config" / "flutter"
+            if not (is_agy and agy_plugins_enabled) and not (
+                is_codex and codex_plugins_enabled
+            ) and not os.path.islink(str(fl_cfg_dir)):
+                fl_cfg_dir.mkdir(parents=True, exist_ok=True)
+        if not (is_agy and agy_plugins_enabled) and not (
+            is_codex and codex_plugins_enabled
+        ):
+            hc_local_share_dir = Path(home_dir) / ".local" / "share"
+            if not os.path.islink(os.path.join(home_dir, ".local")) and not os.path.islink(
+                str(hc_local_share_dir)
+            ):
+                hc_local_share_dir.mkdir(parents=True, exist_ok=True)
         if is_agy and agy_plugins_enabled:
             (Path(home_dir) / ".config" / "antigravity").mkdir(parents=True, exist_ok=True)
             _ensure_safe_gemini_plugin_mountpoint(home_dir, home_covered=True)
@@ -1248,6 +1410,7 @@ def build_mount_ns_argv(
     for dot_rel in (
         os.path.join(".local", "bin"),
         os.path.join(".config", "gh"),
+        os.path.join(".config", "flutter"),
         ".gemini",
         os.path.join(".config", "antigravity"),
         os.path.join(".config", "gcloud"),
@@ -1530,6 +1693,34 @@ def build_mount_ns_argv(
                             f"if [ -f {q_ucxh} ]; then {q_mount} --bind /dev/null {q_ucxh}; fi"
                         )
     else:
+        hc_local_dir = os.path.join(home_dir, ".local")
+        hc_local_bin = os.path.join(hc_local_dir, "bin")
+        hc_gitconfig = os.path.join(home_dir, ".gitconfig")
+        if os.path.islink(hc_local_dir) or os.path.islink(hc_local_bin) or os.path.islink(hc_gitconfig):
+            raise SandboxStorageError(
+                "Symlinked ~/.local, ~/.local/bin, or ~/.gitconfig is forbidden by security policy "
+                "when HOME is covered by allowed_workdirs"
+            )
+        if not use_isolated_agy_home and not use_isolated_codex_home and os.path.isdir(hc_local_bin):
+            q_hc_lb = shlex.quote(os.path.realpath(hc_local_bin))
+            q_dst_hc_lb = shlex.quote(f"{stage_dir}{hc_local_bin}")
+            lines.extend(
+                [
+                    f"[ ! -L {shlex.quote(hc_local_bin)} ] && [ -d {q_dst_hc_lb} ]",
+                    f"{q_mount} --bind {q_hc_lb} {q_dst_hc_lb}",
+                    _remount_ro_cmd(q_mount, q_dst_hc_lb),
+                ]
+            )
+        if os.path.isfile(hc_gitconfig):
+            q_hc_gc = shlex.quote(os.path.realpath(hc_gitconfig))
+            q_dst_hc_gc = shlex.quote(f"{stage_dir}{hc_gitconfig}")
+            lines.extend(
+                [
+                    f"[ ! -L {shlex.quote(hc_gitconfig)} ] && [ -f {q_dst_hc_gc} ]",
+                    f"{q_mount} --bind {q_hc_gc} {q_dst_hc_gc}",
+                    _remount_ro_cmd(q_mount, q_dst_hc_gc),
+                ]
+            )
         if is_agy and not use_isolated_agy_home:
             if plain_agy_sanitized_settings:
                 q_ps_src = shlex.quote(plain_agy_sanitized_settings)

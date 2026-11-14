@@ -83,7 +83,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         # 2b. Enforce strict version parity across package, manifests, pyproject.toml, and README
         pyproject_data = tomllib.loads((GATEWAY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         expected_ver = gateway.__version__
-        self.assertEqual(expected_ver, "1.5.18")
+        self.assertEqual(expected_ver, "1.5.19")
         self.assertEqual(root_manifest["version"], expected_ver)
         self.assertEqual(codex_manifest["version"], expected_ver)
         self.assertEqual(pyproject_data["project"]["version"], expected_ver)

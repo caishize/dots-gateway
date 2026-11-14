@@ -1650,6 +1650,14 @@ class SessionManager:
                 env[ks] = str(v)
         eff_home = env.get("HOME", "")
         if eff_home and eff_home != home_dir:
+            for xdg_key in (
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_STATE_HOME",
+            ):
+                if not trusted_env or xdg_key not in trusted_env:
+                    env.pop(xdg_key, None)
             iso_local_bin = os.path.join(eff_home, ".local", "bin")
             cur_parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
             if iso_local_bin not in cur_parts:

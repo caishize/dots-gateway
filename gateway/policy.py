@@ -3991,10 +3991,24 @@ class CommandPolicy:
             if ro_root not in writable_set and ")" not in ro_root:
                 _emit_allow(f"read_file({ro_root})")
 
+        host_gitconfig = os.path.join(home_res, ".gitconfig")
+        gitconfig_allowed = os.path.isfile(host_gitconfig) and not self.is_protected_path(
+            host_gitconfig
+        )
         if validated_plugins:
             iso_local_bin = os.path.join(iso_agy_home, ".local", "bin")
             if ")" not in iso_local_bin:
                 _emit_allow(f"read_file({iso_local_bin})")
+            if gitconfig_allowed:
+                iso_gitconfig = os.path.join(iso_agy_home, ".gitconfig")
+                if ")" not in iso_gitconfig:
+                    _emit_allow(f"read_file({iso_gitconfig})")
+        else:
+            host_local_bin = os.path.join(home_res, ".local", "bin")
+            if os.path.isdir(host_local_bin) and ")" not in host_local_bin:
+                _emit_allow(f"read_file({host_local_bin})")
+            if gitconfig_allowed and ")" not in host_gitconfig:
+                _emit_allow(f"read_file({host_gitconfig})")
 
         for plg in validated_plugins:
             if ")" not in plg.source_dir:

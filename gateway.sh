@@ -1817,6 +1817,19 @@ if subcmd in ("doctor", "check", "verify"):
                 f"python3 -I {shlex.quote(prepared_rt.vfs_runner_script)} --config {shlex.quote(hc)} < /dev/null\n"
                 for hc in nested_hook_cfgs
             )
+            iso_gh_dir = os.path.join(prepared_rt.isolated_home_dir, ".config", "gh")
+            host_gh_protected = probe_pol.is_protected_path(
+                str((pathlib.Path.home() / ".config" / "gh").resolve())
+            ) and str((pathlib.Path.home() / ".config" / "gh").resolve()) in {
+                str(pathlib.Path(x).expanduser().resolve())
+                for x in (cfg.protected_paths or [])
+                if str(x).strip()
+            }
+            gh_iso_line = (
+                ""
+                if host_gh_protected
+                else f"[ -d {shlex.quote(iso_gh_dir)} ] && [ -w {shlex.quote(iso_gh_dir)} ] || {{ echo 'gh_ro_or_missing' >&2; exit 24; }}\n"
+            )
             probe_script = (
                 "set -eu\n"
                 "for d in \"$@\"; do\n"
@@ -1829,6 +1842,7 @@ if subcmd in ("doctor", "check", "verify"):
                 "if [ -e \"$HOME/.config/dots-gateway/config.json\" ] || [ -e \"$HOME/.config/dots-gateway/tunnel.env\" ]; then\n"
                 "  echo 'secret_exposed' >&2; exit 23;\n"
                 "fi\n"
+                + gh_iso_line
                 + hook_probe_lines
             )
             check_targets = []
@@ -1857,7 +1871,31 @@ if subcmd in ("doctor", "check", "verify"):
                     f"[4/4] 真实沙箱 VFS 只读挂载与嵌套 Hook 沙箱探针失败 (rc={proc.returncode}): "
                     f"{proc.stderr.strip() or proc.stdout.strip()}"
                 )
-            print("[4/4] 真实沙箱 VFS 隔离发现、嵌套 Hook 沙箱、只读挂载与凭据屏蔽探针通过")
+            if not host_gh_protected:
+                exec_probe = (
+                    "set -eu\n"
+                    "[ -d \"$HOME/.config/gh\" ] && [ -w \"$HOME/.config/gh\" ] || { echo 'exec_gh_ro_or_missing' >&2; exit 25; }\n"
+                    "if [ -e \"$HOME/.config/dots-gateway/config.json\" ] || [ -e \"$HOME/.config/dots-gateway/tunnel.env\" ]; then\n"
+                    "  echo 'exec_secret_exposed' >&2; exit 26;\n"
+                    "fi\n"
+                )
+                exec_ns_argv = build_mount_ns_argv(
+                    ["/bin/sh", "-c", exec_probe],
+                    cwd=str(probe_cwd),
+                    allowed_workdirs=cfg.allowed_workdirs,
+                    protected_paths=cfg.protected_paths,
+                    sandbox_state_dir=cfg.sandbox_state_dir,
+                    masked_plugin_paths=probe_pol.get_configured_agy_plugin_paths(),
+                    sandbox_lock_timeout_seconds=lock_timeout,
+                    plugin_state_dir=effective_plugin_state_dir(cfg),
+                )
+                exec_proc = subprocess.run(exec_ns_argv, capture_output=True, text=True, timeout=15)
+                if exec_proc.returncode != 0:
+                    _err(
+                        f"[4/4] exec_command 沙箱 ~/.config/gh 读写或凭据屏蔽探针失败 (rc={exec_proc.returncode}): "
+                        f"{exec_proc.stderr.strip() or exec_proc.stdout.strip()}"
+                    )
+            print("[4/4] 真实沙箱 VFS 隔离发现、嵌套 Hook 沙箱、~/.config/gh 读写、只读挂载与凭据屏蔽探针通过")
         else:
             print("[4/4] 内核 unshare --user --mount 可用")
         raise SystemExit(0)
@@ -2286,6 +2324,19 @@ if subcmd in ("doctor", "check", "verify"):
                 f"python3 -I {shlex.quote(prepared_rt.vfs_runner_script)} --config {shlex.quote(hc)} < /dev/null\n"
                 for hc in nested_hook_cfgs
             )
+            iso_gh_dir = os.path.join(prepared_rt.isolated_home_dir, ".config", "gh")
+            host_gh_protected = probe_pol.is_protected_path(
+                str((pathlib.Path.home() / ".config" / "gh").resolve())
+            ) and str((pathlib.Path.home() / ".config" / "gh").resolve()) in {
+                str(pathlib.Path(x).expanduser().resolve())
+                for x in (cfg.protected_paths or [])
+                if str(x).strip()
+            }
+            gh_iso_line = (
+                ""
+                if host_gh_protected
+                else f"[ -d {shlex.quote(iso_gh_dir)} ] && [ -w {shlex.quote(iso_gh_dir)} ] || {{ echo 'gh_ro_or_missing' >&2; exit 24; }}\n"
+            )
             probe_script = (
                 "set -eu\n"
                 "for d in \"$@\"; do\n"
@@ -2298,6 +2349,7 @@ if subcmd in ("doctor", "check", "verify"):
                 "if [ -e \"$HOME/.config/dots-gateway/config.json\" ] || [ -e \"$HOME/.config/dots-gateway/tunnel.env\" ]; then\n"
                 "  echo 'secret_exposed' >&2; exit 23;\n"
                 "fi\n"
+                + gh_iso_line
                 + hook_probe_lines
             )
             check_targets = []
