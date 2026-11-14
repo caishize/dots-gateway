@@ -1,4 +1,4 @@
-# Dots <-> Local Dev, Antigravity (`agy`) & Codex MCP Plugin & Hardened Gateway (`v1.5.17`)
+# Dots <-> Local Dev, Antigravity (`agy`) & Codex MCP Plugin & Hardened Gateway (`v1.5.18`)
 
 A zero-dependency Python 3.11+ **OpenAI `dots` / Codex / Agent Plugins 1.0** package and remote development gateway. It enables **dots** (running on OpenAI cloud machines) to securely inspect/edit workspace files, execute allowlisted development commands inside a Linux User + Mount Namespace VFS jail, and delegate tasks to **`agy` (`--sandbox`, with optional isolated read-only plugins & native hook sandboxing)** and **`codex` (`codex exec`, with optional isolated read-only plugins & native hook sandboxing)** via the **Model Context Protocol (MCP)**.
 
@@ -21,8 +21,8 @@ OpenAI Cloud Machine (`dots`)                            Local Dev Machine (`~/g
 
 ## Plugin & Repository Layout
 
-- `plugin.json` & `.codex-plugin/plugin.json` — Portable **Agent Plugins 1.0** + OpenAI `extensions.com.openai` & Codex plugin manifests (`v1.5.17`)
-- `pyproject.toml` — Zero-dependency Python 3.11+ package metadata (`v1.5.17`), `pytest`, and `ruff` configuration
+- `plugin.json` & `.codex-plugin/plugin.json` — Portable **Agent Plugins 1.0** + OpenAI `extensions.com.openai` & Codex plugin manifests (`v1.5.18`)
+- `pyproject.toml` — Zero-dependency Python 3.11+ package metadata (`v1.5.18`), `pytest`, and `ruff` configuration
 - `mcp.json` — Bundled `stdio` MCP server definition (`./dots_mcp.py`) supporting self-signed TLS SHA-256 pinning & HMAC-SHA256
 - `mcp.remote.example.json` — Example `streamable-http` MCP configuration for direct `/mcp` connectors
 - `config.example.json` — Reference host gateway configuration including isolated plugin runtime (`agent_runtime_home_root`, `plugin_state_dir`), `agy` & `codex` plugins, and Docker proxy settings

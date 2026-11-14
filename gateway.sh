@@ -1799,7 +1799,24 @@ if subcmd in ("doctor", "check", "verify"):
             raise SystemExit(0)
 
         if validated and prepared_rt is not None:
+            import shlex
             mount_pairs = [(p.name, p.source_dir) for p in validated]
+            nested_hook_cfgs = []
+            for b in prepared_rt.bundles:
+                jdir = pathlib.Path(b.host_jail_config_dir)
+                existing_cfgs = sorted(jdir.glob("*.json")) if jdir.is_dir() else []
+                if existing_cfgs:
+                    probe_payload = json.loads(existing_cfgs[0].read_text(encoding="utf-8"))
+                    probe_payload["event_name"] = "SessionStart"
+                    probe_payload["resolved_argv"] = ["/bin/true"]
+                    pfile = jdir / "__doctor_probe.json"
+                    pfile.write_text(json.dumps(probe_payload, indent=2) + "\n", encoding="utf-8")
+                    os.chmod(pfile, 0o644)
+                    nested_hook_cfgs.append(os.path.join(b.vfs_jail_config_dir, "__doctor_probe.json"))
+            hook_probe_lines = "".join(
+                f"python3 -I {shlex.quote(prepared_rt.vfs_runner_script)} --config {shlex.quote(hc)} < /dev/null\n"
+                for hc in nested_hook_cfgs
+            )
             probe_script = (
                 "set -eu\n"
                 "for d in \"$@\"; do\n"
@@ -1812,6 +1829,7 @@ if subcmd in ("doctor", "check", "verify"):
                 "if [ -e \"$HOME/.config/dots-gateway/config.json\" ] || [ -e \"$HOME/.config/dots-gateway/tunnel.env\" ]; then\n"
                 "  echo 'secret_exposed' >&2; exit 23;\n"
                 "fi\n"
+                + hook_probe_lines
             )
             check_targets = []
             for p in validated:
@@ -1836,10 +1854,10 @@ if subcmd in ("doctor", "check", "verify"):
             proc = subprocess.run(ns_argv, capture_output=True, text=True, timeout=15)
             if proc.returncode != 0:
                 _err(
-                    f"[4/4] 真实沙箱 VFS 只读挂载与凭据屏蔽探针失败 (rc={proc.returncode}): "
+                    f"[4/4] 真实沙箱 VFS 只读挂载与嵌套 Hook 沙箱探针失败 (rc={proc.returncode}): "
                     f"{proc.stderr.strip() or proc.stdout.strip()}"
                 )
-            print("[4/4] 真实沙箱 VFS 隔离发现、只读挂载与凭据屏蔽探针通过")
+            print("[4/4] 真实沙箱 VFS 隔离发现、嵌套 Hook 沙箱、只读挂载与凭据屏蔽探针通过")
         else:
             print("[4/4] 内核 unshare --user --mount 可用")
         raise SystemExit(0)
@@ -2250,7 +2268,24 @@ if subcmd in ("doctor", "check", "verify"):
             raise SystemExit(0)
 
         if validated and prepared_rt is not None:
+            import shlex
             mount_pairs = [(p.name, p.source_dir) for p in validated]
+            nested_hook_cfgs = []
+            for b in prepared_rt.bundles:
+                jdir = pathlib.Path(b.host_jail_config_dir)
+                existing_cfgs = sorted(jdir.glob("*.json")) if jdir.is_dir() else []
+                if existing_cfgs:
+                    probe_payload = json.loads(existing_cfgs[0].read_text(encoding="utf-8"))
+                    probe_payload["event_name"] = "SessionStart"
+                    probe_payload["resolved_argv"] = ["/bin/true"]
+                    pfile = jdir / "__doctor_probe.json"
+                    pfile.write_text(json.dumps(probe_payload, indent=2) + "\n", encoding="utf-8")
+                    os.chmod(pfile, 0o644)
+                    nested_hook_cfgs.append(os.path.join(b.vfs_jail_config_dir, "__doctor_probe.json"))
+            hook_probe_lines = "".join(
+                f"python3 -I {shlex.quote(prepared_rt.vfs_runner_script)} --config {shlex.quote(hc)} < /dev/null\n"
+                for hc in nested_hook_cfgs
+            )
             probe_script = (
                 "set -eu\n"
                 "for d in \"$@\"; do\n"
@@ -2263,6 +2298,7 @@ if subcmd in ("doctor", "check", "verify"):
                 "if [ -e \"$HOME/.config/dots-gateway/config.json\" ] || [ -e \"$HOME/.config/dots-gateway/tunnel.env\" ]; then\n"
                 "  echo 'secret_exposed' >&2; exit 23;\n"
                 "fi\n"
+                + hook_probe_lines
             )
             check_targets = []
             for p in validated:
@@ -2287,10 +2323,10 @@ if subcmd in ("doctor", "check", "verify"):
             proc = subprocess.run(ns_argv, capture_output=True, text=True, timeout=15)
             if proc.returncode != 0:
                 _err(
-                    f"[4/4] 真实沙箱 VFS 只读挂载与凭据屏蔽探针失败 (rc={proc.returncode}): "
+                    f"[4/4] 真实沙箱 VFS 只读挂载与嵌套 Hook 沙箱探针失败 (rc={proc.returncode}): "
                     f"{proc.stderr.strip() or proc.stdout.strip()}"
                 )
-            print("[4/4] 真实沙箱 VFS 隔离 CODEX_HOME、只读挂载与凭据屏蔽探针通过")
+            print("[4/4] 真实沙箱 VFS 隔离 CODEX_HOME、嵌套 Hook 沙箱、只读挂载与凭据屏蔽探针通过")
         else:
             print("[4/4] 内核 unshare --user --mount 可用")
         raise SystemExit(0)

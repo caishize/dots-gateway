@@ -1854,23 +1854,26 @@ def _build_nested_jail_argv(
     lines.extend(
         [
             f"[ ! -L {{q_htmp}} ] && [ -d {{q_htmp}} ]",
-            f"{{q_mount}} --bind {{q_htmp}} {{q_dst_tmp}}",
+            f"{{q_mount}} --rbind {{q_htmp}} {{q_dst_tmp}}",
             f"mkdir -p {{q_dst_home}} {{q_dst_data}}",
             f"{{q_mount}} -o remount,bind,rw,nosuid,nodev,noexec {{q_dst_tmp}} 2>/dev/null || {{q_mount}} -o bind,remount,rw,nosuid,nodev,noexec {{q_dst_tmp}}",
             f"[ ! -L {{q_hdata}} ] && [ -d {{q_hdata}} ]",
-            f"{{q_mount}} --bind {{q_hdata}} {{q_dst_data}}",
+            f"{{q_mount}} --rbind {{q_hdata}} {{q_dst_data}}",
             f"{{q_mount}} -o remount,bind,rw,nosuid,nodev,noexec {{q_dst_data}} 2>/dev/null || {{q_mount}} -o bind,remount,rw,nosuid,nodev,noexec {{q_dst_data}}",
         ]
     )
 
-    # Mount ONLY the active plugin read-only at its isolated discovery path (all credentials under agent_runtime_home_root stay absent!)
+    # Mount ONLY the active plugin read-only at its isolated discovery path (all credentials under agent_runtime_home_root stay absent!).
+    # Must use `--rbind` (not `--bind`) because the outer VFS mounts a read-only `hooks.json` submount inside
+    # `active_plugin_src` and `plugin_source_dir`; in a nested user+mount namespace, Linux `do_loopback()`
+    # marks that child submount `MNT_LOCKED` and rejects non-recursive `--bind` with `EINVAL` (exit status 32).
     q_psrc = shlex.quote(active_plugin_src)
     q_pdst = shlex.quote(f"{{stage_dir}}{{plugin_vfs_dir}}")
     lines.extend(
         [
             f"[ ! -L {{q_psrc}} ] && [ -d {{q_psrc}} ]",
             f"mkdir -p {{q_pdst}}",
-            f"{{q_mount}} --bind {{q_psrc}} {{q_pdst}}",
+            f"{{q_mount}} --rbind {{q_psrc}} {{q_pdst}}",
             f"{{q_mount}} -o remount,bind,ro,nosuid,nodev {{q_pdst}} 2>/dev/null || {{q_mount}} -o remount,bind,ro {{q_pdst}} 2>/dev/null || {{q_mount}} -o bind,remount,ro {{q_pdst}}",
         ]
     )
@@ -1880,7 +1883,7 @@ def _build_nested_jail_argv(
         lines.extend(
             [
                 f"mkdir -p {{q_cdst}}",
-                f"{{q_mount}} --bind {{q_csrc}} {{q_cdst}}",
+                f"{{q_mount}} --rbind {{q_csrc}} {{q_cdst}}",
                 f"{{q_mount}} -o remount,bind,ro,nosuid,nodev {{q_cdst}} 2>/dev/null || {{q_mount}} -o remount,bind,ro {{q_cdst}} 2>/dev/null || {{q_mount}} -o bind,remount,ro {{q_cdst}}",
             ]
         )
@@ -1894,7 +1897,7 @@ def _build_nested_jail_argv(
             lines.extend(
                 [
                     f"mkdir -p {{q_adst}}",
-                    f"{{q_mount}} --bind {{q_asrc}} {{q_adst}}",
+                    f"{{q_mount}} --rbind {{q_asrc}} {{q_adst}}",
                     f"{{q_mount}} -o remount,bind,ro,nosuid,nodev,noexec {{q_adst}} 2>/dev/null || {{q_mount}} -o bind,remount,ro {{q_adst}}",
                 ]
             )
@@ -1971,7 +1974,7 @@ def _build_nested_jail_argv(
             lines.extend(
                 [
                     f"if [ -d {{q_rod}} ]; then",
-                    f"  {{q_mount}} --bind {{q_ros}} {{q_rod}}",
+                    f"  {{q_mount}} --rbind {{q_ros}} {{q_rod}}",
                     f"  {{q_mount}} -o remount,bind,ro,nosuid,nodev,noexec {{q_rod}} 2>/dev/null || {{q_mount}} -o bind,remount,ro {{q_rod}}",
                     "fi",
                 ]

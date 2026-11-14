@@ -2011,6 +2011,75 @@ class TestPluginIsolationAndHooksV1517(unittest.IsolatedAsyncioTestCase):
         finally:
             cleanup_prepared_plugin_runtime(prep_r2)
 
+    def test_nested_hook_jail_rbind_inside_outer_vfs_mount_namespace(self) -> None:
+        from gateway.hook_jail import render_hook_jail_runner_source
+        from gateway.sandbox import build_mount_ns_argv, can_use_mount_namespace
+
+        runner_src = render_hook_jail_runner_source()
+        self.assertIn("--rbind {q_psrc} {q_pdst}", runner_src)
+        self.assertIn("--rbind {q_csrc} {q_cdst}", runner_src)
+        self.assertNotIn("--bind {q_psrc} {q_pdst}", runner_src)
+        self.assertNotIn("--bind {q_csrc} {q_cdst}", runner_src)
+
+        if not can_use_mount_namespace():
+            return
+
+        import dataclasses
+
+        active_cfg = dataclasses.replace(
+            self.cfg,
+            agy_plugins_enabled=True,
+            agy_plugin_dirs=[str(self.oma_gemini_dir)],
+            agy_plugins_file=str(self.test_root / "nonexistent_agy_plg.json"),
+        )
+        pol = CommandPolicy(active_cfg)
+        val_agy = pol.validate_agy_plugins()
+        prep_agy = prepare_agy_plugin_runtime(
+            active_cfg,
+            validated_plugins=val_agy,
+            sandbox_state_root=self.sandbox_dir,
+            allowed_workspaces=[str(self.project_dir)],
+            masked_paths=active_cfg.protected_paths,
+            readonly_subpaths=[],
+            session_tag="sess_nested_mns",
+        )
+        try:
+            bundle = prep_agy.bundles[0]
+            existing_cfg = next(Path(bundle.host_jail_config_dir).glob("*.json"))
+            probe_payload = json.loads(existing_cfg.read_text(encoding="utf-8"))
+            probe_payload["event_name"] = "SessionStart"
+            probe_payload["resolved_argv"] = ["/bin/true"]
+            probe_payload["require_mount_ns"] = True
+            pfile = Path(bundle.host_jail_config_dir) / "__nested_mns_test.json"
+            pfile.write_text(json.dumps(probe_payload, indent=2) + "\n", encoding="utf-8")
+            os.chmod(pfile, 0o644)
+            vfs_probe_cfg = os.path.join(bundle.vfs_jail_config_dir, "__nested_mns_test.json")
+
+            ns_argv = build_mount_ns_argv(
+                [sys.executable, "-I", prep_agy.vfs_runner_script, "--config", vfs_probe_cfg],
+                cwd=str(self.project_dir),
+                allowed_workdirs=self.cfg.allowed_workdirs,
+                protected_paths=self.cfg.protected_paths,
+                is_agy=True,
+                sandbox_state_dir=str(self.sandbox_dir),
+                agy_plugins_enabled=True,
+                agy_plugin_mounts=[(p.name, p.source_dir) for p in val_agy],
+                prepared_plugin_runtime=prep_agy,
+                agent_runtime_home_root=self.cfg.agent_runtime_home_root,
+                masked_plugin_paths=[p.source_dir for p in val_agy],
+                plugin_state_dir=self.cfg.plugin_state_dir,
+            )
+            res = subprocess.run(
+                ns_argv,
+                input="",
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
+        finally:
+            cleanup_prepared_plugin_runtime(prep_agy)
+
 
 if __name__ == "__main__":
     unittest.main()
