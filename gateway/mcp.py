@@ -20,7 +20,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 from . import __version__
-from .config import GatewayConfig, redact_diagnostic_text
+from .config import GatewayConfig, effective_plugin_state_dir, redact_diagnostic_text
 from .executor import ExecutionSession, SessionManager
 from .files import FileService
 from .policy import CommandPolicy, redact_for_audit_log
@@ -30,9 +30,16 @@ logger = logging.getLogger("dots_gateway")
 _FORBIDDEN_TASK_PLUGIN_KEYS = (
     "plugin_dirs",
     "agy_plugin_dirs",
+    "codex_plugin_dirs",
     "plugins",
+    "codex_plugins",
     "plugin_root",
     "agy_plugins_enabled",
+    "codex_plugins_enabled",
+    "agy_plugins_file",
+    "codex_plugins_file",
+    "agent_runtime_home_root",
+    "plugin_state_dir",
 )
 
 
@@ -42,7 +49,7 @@ def _reject_task_plugin_overrides(payload: Any) -> None:
             if key in payload:
                 raise PermissionError(
                     f"Task-level '{key}' declaration is forbidden by security policy; "
-                    "register trusted AGY plugins via operator configuration only"
+                    "register trusted AGY/Codex plugins via operator configuration only"
                 )
 
 
@@ -1129,6 +1136,10 @@ class MCPHandler:
                     "allowed_workdirs": self.config.allowed_workdirs,
                     "isolate_mount_namespace": self.config.isolate_mount_namespace,
                     "sandbox_state_dir": self.config.sandbox_state_dir,
+                    "agent_runtime_home_root": self.config.agent_runtime_home_root,
+                    "plugin_state_dir": redact_diagnostic_text(
+                        effective_plugin_state_dir(self.config), self.config
+                    ),
                     "sandbox_lifecycle": self.sessions.get_sandbox_lifecycle_info(),
                     "enforce_allowlist": self.config.enforce_allowlist,
                     "allowed_commands_count": len(self.config.allowed_commands),
@@ -1150,6 +1161,7 @@ class MCPHandler:
                     "codex_sandbox_network_access": self.config.codex_sandbox_network_access,
                     "codex_writable_roots": self.policy.get_codex_writable_roots(),
                     "codex_auth_configured": self.sessions.has_codex_auth(),
+                    "codex_plugins": self.policy.get_codex_plugins_info(),
                     "tls_enabled": bool(self.config.tls_certfile and self.config.tls_keyfile),
                     "mtls_required": self.config.tls_require_client_cert,
                 }
@@ -1536,10 +1548,15 @@ class MCPHandler:
                     "agy_plugins": self.policy.get_agy_plugins_info(),
                     "docker": self.sessions.get_docker_info(),
                     "codex_auth_configured": self.sessions.has_codex_auth(),
+                    "codex_plugins": self.policy.get_codex_plugins_info(),
                     "session_persistence_enabled": bool(self.config.session_state_dir),
                     "persisted_sessions": len(self.sessions._persisted),
                     "default_workdir": self.config.default_workdir,
                     "sandbox_state_dir": self.config.sandbox_state_dir,
+                    "agent_runtime_home_root": self.config.agent_runtime_home_root,
+                    "plugin_state_dir": redact_diagnostic_text(
+                        effective_plugin_state_dir(self.config), self.config
+                    ),
                     "sandbox_lifecycle": self.sessions.get_sandbox_lifecycle_info(),
                 },
                 indent=2,
@@ -1565,6 +1582,10 @@ class MCPHandler:
                     "max_timeout_seconds": self.config.max_timeout_seconds,
                     "agy_queue_timeout_seconds": self.config.agy_queue_timeout_seconds,
                     "sandbox_state_dir": self.config.sandbox_state_dir,
+                    "agent_runtime_home_root": self.config.agent_runtime_home_root,
+                    "plugin_state_dir": redact_diagnostic_text(
+                        effective_plugin_state_dir(self.config), self.config
+                    ),
                     "sandbox_lifecycle": self.sessions.get_sandbox_lifecycle_info(),
                     "agy_default_sandbox": self.config.agy_default_sandbox,
                     "agy_sandbox_tool_permission": self.config.agy_sandbox_tool_permission,
@@ -1575,6 +1596,7 @@ class MCPHandler:
                     "codex_default_sandbox": self.config.codex_default_sandbox,
                     "codex_sandbox_network_access": self.config.codex_sandbox_network_access,
                     "codex_writable_roots": self.policy.get_codex_writable_roots(),
+                    "codex_plugins": self.policy.get_codex_plugins_info(),
                 },
                 indent=2,
                 ensure_ascii=False,

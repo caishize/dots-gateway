@@ -36,9 +36,17 @@ from .config import (
     GATEWAY_ROOT,
     GatewayConfig,
     agy_plugins_config_state,
+    codex_plugins_config_state,
     docker_access_enabled,
     docker_access_state,
+    effective_plugin_state_dir,
     redact_diagnostic_text,
+)
+from .hook_jail import (
+    PreparedAgentPluginRuntime,
+    cleanup_prepared_plugin_runtime,
+    prepare_agy_plugin_runtime,
+    prepare_codex_plugin_runtime,
 )
 from .policy import CommandPolicy
 from .sandbox import (
@@ -238,7 +246,13 @@ _STRIPPED_ENV_KEYS = {
     "AGY_PLUGIN_ROOT",
     "AGY_PLUGIN_DIRS",
     "AGY_REGISTERED_PLUGINS",
+    "CODEX_PLUGIN_ROOT",
+    "CODEX_PLUGIN_DIRS",
+    "CODEX_REGISTERED_PLUGINS",
+    "PLUGIN_ROOT",
+    "PLUGIN_DATA",
     "CLAUDE_PLUGIN_ROOT",
+    "CLAUDE_PLUGIN_DATA",
     "CLAUDE_PROJECT_DIR",
     "AGY_PROJECT_DIR",
     "HARNESS_PROJECT_DIR",
@@ -265,6 +279,7 @@ _BLOCKED_CALLER_ENV_KEYS = _STRIPPED_ENV_KEYS | {
     "AWS_EC2_METADATA_DISABLED",
     "CONTAINER_HOST",
     "HOME",
+    "CODEX_HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
@@ -353,6 +368,8 @@ class ExecutionSession:
         spawn_argv: Optional[List[str]] = None,
         on_persist: Optional[Callable[["ExecutionSession", bool], None]] = None,
         pre_spawn_check: Optional[Callable[[], None]] = None,
+        prepare_spawn: Optional[Callable[[], Optional[List[str]]]] = None,
+        on_cleanup: Optional[Callable[[], None]] = None,
         error_redactor: Optional[Callable[[str], str]] = None,
     ) -> None:
         self.session_id = session_id
@@ -370,6 +387,9 @@ class ExecutionSession:
         self.is_codex = is_codex
         self._on_persist = on_persist
         self._pre_spawn_check = pre_spawn_check
+        self._prepare_spawn = prepare_spawn
+        self._on_cleanup = on_cleanup
+        self._cleanup_done = False
         self._error_redactor = error_redactor
 
         self.status: str = "starting"
@@ -401,6 +421,16 @@ class ExecutionSession:
         self._subscribers: List[asyncio.Queue[Optional[SessionEvent]]] = []
         self._done_event = asyncio.Event()
         self._watch_tasks: List[asyncio.Task[Any]] = []
+
+    def _run_cleanup(self) -> None:
+        if self._cleanup_done:
+            return
+        self._cleanup_done = True
+        if self._on_cleanup is not None:
+            try:
+                self._on_cleanup()
+            except Exception:
+                pass
 
     def _notify_persist(self, force: bool = False) -> None:
         if self._on_persist is None:
@@ -481,8 +511,9 @@ class ExecutionSession:
 
         try:
             await self._spawn_process(initial_stdin=initial_stdin, close_stdin=close_stdin)
-        except Exception:
+        except BaseException:
             self._release_slot()
+            self._run_cleanup()
             raise
 
     def _release_slot(self) -> None:
@@ -496,6 +527,7 @@ class ExecutionSession:
             await asyncio.wait_for(self._slot_sem.acquire(), timeout=self._queue_timeout)
             self._slot_acquired = True
         except (asyncio.TimeoutError, asyncio.CancelledError):
+            self._run_cleanup()
             self.ended_at = time.time()
             self.returncode = -9
             if self.status != "killed":
@@ -519,6 +551,7 @@ class ExecutionSession:
 
         if self.status == "killed":
             self._release_slot()
+            self._run_cleanup()
             self.ended_at = time.time()
             self.returncode = -9
             self._emit(
@@ -541,6 +574,10 @@ class ExecutionSession:
         try:
             if self._pre_spawn_check is not None:
                 await asyncio.to_thread(self._pre_spawn_check)
+            if self._prepare_spawn is not None:
+                rebuilt = await asyncio.to_thread(self._prepare_spawn)
+                if rebuilt is not None:
+                    self._spawn_argv = rebuilt
             self.started_at = time.time()
             await self._spawn_process(initial_stdin=None, close_stdin=False)
             should_close = close_stdin
@@ -553,6 +590,7 @@ class ExecutionSession:
                 self._proc.stdin.close()
         except Exception as exc:
             self._release_slot()
+            self._run_cleanup()
             self.ended_at = time.time()
             self.returncode = -1
             self.status = "failed"
@@ -778,6 +816,7 @@ class ExecutionSession:
         if self.is_codex and not self.agent_conversation_id:
             self.agent_conversation_id = _discover_codex_rollout_id(self.cwd, self.started_at)
 
+        self._run_cleanup()
         self._emit(
             "exit",
             {
@@ -1434,14 +1473,111 @@ class SessionManager:
         return min(val, float(self.config.max_timeout_seconds))
 
     def _sandbox_forbidden_roots(self) -> List[str]:
+        home_lex = os.path.abspath(str(Path.home()))
         home_dir = str(Path.home().resolve())
+        non_home_prot: List[str] = []
+        for raw_p in self.config.protected_paths or ():
+            try:
+                p_exp = os.path.expanduser(str(raw_p).strip())
+                p_lex = os.path.abspath(p_exp)
+                p_res = os.path.realpath(p_exp)
+            except Exception:
+                continue
+            if p_lex in (home_lex, home_dir) or p_res in (home_lex, home_dir):
+                continue
+            non_home_prot.append(str(raw_p))
         return [
             str(GATEWAY_ROOT),
-            *list(self.config.protected_paths or ()),
+            *non_home_prot,
             os.path.join(home_dir, ".gemini"),
             os.path.join(home_dir, ".config"),
+            os.path.join(home_dir, ".codex"),
             *self.policy.get_configured_agy_plugin_paths(),
+            *self.policy.get_configured_codex_plugin_paths(),
         ]
+
+    def _hook_jail_masked_paths(self) -> List[str]:
+        """Return resolved protected roots masked inside `dots-hook-jail.py`."""
+        home_lex = os.path.abspath(str(Path.home()))
+        home_dir = str(Path.home().resolve())
+        masked: List[str] = [str(GATEWAY_ROOT)]
+        extra_mandatory = [
+            *(self.config.protected_paths or ()),
+            os.path.join(home_dir, ".gemini"),
+            os.path.join(home_dir, ".codex"),
+            os.path.join(home_dir, ".config"),
+            os.path.join(home_dir, ".ssh"),
+            os.path.join(home_dir, ".gnupg"),
+            os.path.join(home_dir, ".aws"),
+            os.path.join(home_dir, ".kube"),
+            effective_plugin_state_dir(self.config),
+        ]
+        if self.config.sandbox_state_dir:
+            extra_mandatory.append(
+                os.path.join(str(self.config.sandbox_state_dir), "plugin_bundles")
+            )
+        for raw_p in extra_mandatory:
+            if not raw_p:
+                continue
+            try:
+                p_exp = os.path.expanduser(str(raw_p).strip())
+                p_lex = os.path.abspath(p_exp)
+                p_res = os.path.realpath(p_exp)
+            except Exception:
+                continue
+            if p_lex not in ("/", home_lex, home_dir) and p_lex not in masked:
+                masked.append(p_lex)
+            if p_res not in ("/", home_lex, home_dir) and p_res not in masked:
+                masked.append(p_res)
+        return masked
+
+    def _ensure_codex_workspace_metadata_dirs(self, workspace_dir: str) -> None:
+        """Safely pre-create non-symlink `.codex/signals` and `.codex/metrics` for Codex plugins."""
+        dot_codex = os.path.join(workspace_dir, ".codex")
+        if os.path.islink(dot_codex):
+            raise PermissionError(
+                redact_diagnostic_text(
+                    f"Refusing to prepare Codex plugin workspace metadata: '{dot_codex}' is a symlink",
+                    self.config,
+                )
+            )
+        if os.path.exists(dot_codex):
+            if not os.path.isdir(dot_codex):
+                raise PermissionError(
+                    redact_diagnostic_text(
+                        f"Refusing to prepare Codex plugin workspace metadata: '{dot_codex}' is not a directory",
+                        self.config,
+                    )
+                )
+        else:
+            os.mkdir(dot_codex, 0o755)
+            try:
+                os.chmod(dot_codex, 0o755)
+            except OSError:
+                pass
+        for sub_name in ("signals", "metrics"):
+            sub_p = os.path.join(dot_codex, sub_name)
+            if os.path.islink(sub_p):
+                raise PermissionError(
+                    redact_diagnostic_text(
+                        f"Refusing to prepare Codex plugin workspace metadata: '{sub_p}' is a symlink",
+                        self.config,
+                    )
+                )
+            if os.path.exists(sub_p):
+                if not os.path.isdir(sub_p):
+                    raise PermissionError(
+                        redact_diagnostic_text(
+                            f"Refusing to prepare Codex plugin workspace metadata: '{sub_p}' is not a directory",
+                            self.config,
+                        )
+                    )
+            else:
+                os.mkdir(sub_p, 0o755)
+                try:
+                    os.chmod(sub_p, 0o755)
+                except OSError:
+                    pass
 
     def _prepare_env(
         self,
@@ -1512,6 +1648,13 @@ class SessionManager:
                 if ks in ("DOCKER_HOST", "DOCKER_CONTEXT") or ks.startswith("GATEWAY_"):
                     continue
                 env[ks] = str(v)
+        eff_home = env.get("HOME", "")
+        if eff_home and eff_home != home_dir:
+            iso_local_bin = os.path.join(eff_home, ".local", "bin")
+            cur_parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+            if iso_local_bin not in cur_parts:
+                cur_parts.insert(0, iso_local_bin)
+                env["PATH"] = os.pathsep.join(cur_parts)
         docker_sock = self._active_docker_proxy_socket()
         if docker_sock:
             env["DOCKER_HOST"] = (
@@ -1842,10 +1985,19 @@ class SessionManager:
         is_agy: bool = False,
         is_codex: bool = False,
         readonly_subpaths: Optional[Sequence[str]] = None,
+        readonly_subpaths_getter: Optional[Callable[[], Sequence[str]]] = None,
         trusted_env: Optional[Dict[str, str]] = None,
         agy_plugins_enabled: bool = False,
         agy_plugin_mounts: Optional[Sequence[Tuple[str, str]]] = None,
+        codex_plugins_enabled: bool = False,
+        codex_plugin_mounts: Optional[Sequence[Tuple[str, str]]] = None,
+        prepared_plugin_runtime: Optional[PreparedAgentPluginRuntime] = None,
+        prevalidated_sandbox_state: Optional[Path] = None,
         pre_spawn_check: Optional[Callable[[], None]] = None,
+        refresh_plugin_runtime: Optional[Callable[[], Optional[PreparedAgentPluginRuntime]]] = None,
+        on_cleanup: Optional[Callable[[], None]] = None,
+        session_id_override: Optional[str] = None,
+        session_workdirs: Optional[Sequence[str]] = None,
     ) -> ExecutionSession:
         """Validate command against security policy and start an ExecutionSession."""
         if self.active_count() >= self.config.max_concurrent_sessions:
@@ -1871,8 +2023,15 @@ class SessionManager:
             home_dir == r or home_dir.startswith(r.rstrip("/") + "/")
             for r in self.policy._allowed_roots
         )
-        prevalidated_sb: Optional[Path] = None
-        if not self.config.isolate_mount_namespace or not home_covered:
+        prevalidated_sb: Optional[Path] = prevalidated_sandbox_state
+        if prevalidated_sb is None and (
+            not self.config.isolate_mount_namespace
+            or not home_covered
+            or is_agy
+            or is_codex
+            or agy_plugins_enabled
+            or codex_plugins_enabled
+        ):
             prevalidated_sb = await asyncio.to_thread(
                 prepare_sandbox_runtime_state,
                 self.config.sandbox_state_dir,
@@ -1903,8 +2062,11 @@ class SessionManager:
             else:
                 shell_cmd = " ".join(shlex.quote(x) for x in decision.normalized_argv)
 
-        spawn_argv: Optional[List[str]] = None
-        if self.config.isolate_mount_namespace:
+        def _compute_mount_ns_spawn_argv(
+            active_runtime: Optional[PreparedAgentPluginRuntime],
+        ) -> Optional[List[str]]:
+            if not self.config.isolate_mount_namespace:
+                return None
             target_exec = (
                 ["/bin/bash", "-c", shell_cmd]
                 if shell_cmd is not None
@@ -1915,27 +2077,52 @@ class SessionManager:
                 and str(prepared_env.get("AGY_ADC_AUTH", "")).strip().lower()
                 in ("1", "true", "yes", "on")
             )
-            spawn_argv = build_mount_ns_argv(
+            masked_plugins = [
+                *self.policy.get_configured_agy_plugin_paths(),
+                *self.policy.get_configured_codex_plugin_paths(),
+            ]
+            active_ro_subpaths = (
+                readonly_subpaths_getter()
+                if readonly_subpaths_getter is not None
+                else readonly_subpaths
+            )
+            return build_mount_ns_argv(
                 target_argv=target_exec,
                 cwd=decision.resolved_cwd,
                 allowed_workdirs=self.config.allowed_workdirs,
                 protected_paths=self.config.protected_paths,
                 is_agy=is_agy,
                 is_codex=is_codex,
-                readonly_subpaths=readonly_subpaths,
+                readonly_subpaths=active_ro_subpaths,
                 sandbox_state_dir=self.config.sandbox_state_dir,
                 docker_mask_paths=self.config.docker_mask_paths,
                 docker_proxy_socket=self._active_docker_proxy_socket(),
                 mount_gcloud_adc=adc_active,
                 agy_plugins_enabled=agy_plugins_enabled,
                 agy_plugin_mounts=agy_plugin_mounts,
-                masked_plugin_paths=self.policy.get_configured_agy_plugin_paths(),
+                codex_plugins_enabled=codex_plugins_enabled,
+                codex_plugin_mounts=codex_plugin_mounts,
+                prepared_plugin_runtime=active_runtime,
+                agent_runtime_home_root=self.config.agent_runtime_home_root,
+                masked_plugin_paths=masked_plugins,
                 sandbox_lock_timeout_seconds=self.config.sandbox_lock_timeout_seconds,
                 prevalidated_sandbox_state=prevalidated_sb,
+                session_workdirs=session_workdirs,
+                plugin_state_dir=effective_plugin_state_dir(self.config),
             )
 
+        spawn_argv = await asyncio.to_thread(
+            _compute_mount_ns_spawn_argv, prepared_plugin_runtime
+        )
+
+        def _prepare_spawn_after_queue() -> Optional[List[str]]:
+            active_rt = prepared_plugin_runtime
+            if refresh_plugin_runtime is not None:
+                active_rt = refresh_plugin_runtime()
+            return _compute_mount_ns_spawn_argv(active_rt)
+
         self._cleanup_old_sessions()
-        session_id = f"sess_{uuid.uuid4().hex[:16]}"
+        session_id = session_id_override or f"sess_{uuid.uuid4().hex[:16]}"
         session = ExecutionSession(
             session_id=session_id,
             argv=decision.normalized_argv,
@@ -1960,6 +2147,12 @@ class SessionManager:
                 self._on_live_session_persist if self._state_dir is not None else None
             ),
             pre_spawn_check=pre_spawn_check,
+            prepare_spawn=(
+                _prepare_spawn_after_queue
+                if (self.config.isolate_mount_namespace or refresh_plugin_runtime is not None)
+                else None
+            ),
+            on_cleanup=on_cleanup,
             error_redactor=lambda s: redact_diagnostic_text(s, self.config),
         )
         self._sessions[session_id] = session
@@ -1992,40 +2185,64 @@ class SessionManager:
         close_stdin: bool = True,
     ) -> ExecutionSession:
         """Create a dedicated `agy` session with `--dangerously-skip-permissions` enabled by default."""
-        if not model and not any(
+        eff_model = model
+        if not eff_model and not any(
             str(a) == "--model" or str(a).startswith("--model=") for a in (args or [])
         ):
-            model, _ = self.get_agy_default_model()
-        argv = self.policy.build_agy_argv(
-            prompt=prompt,
-            args=args,
-            skip_permissions=skip_permissions,
-            print_mode=print_mode,
-            output_format=output_format,
-            input_format=input_format,
-            model=model,
-            effort=effort,
-            mode=mode,
-            conversation_id=conversation_id,
-            continue_last=continue_last,
-            add_dirs=add_dirs,
-            cwd=cwd,
-        )
-        plugins_state = agy_plugins_config_state(self.config)
-        validated_plugins = []
-        if plugins_state.get("config_error") or plugins_state.get("enabled"):
-            validated_plugins = self.policy.validate_agy_plugins(
-                cwd=cwd, add_dirs=add_dirs, require_mount_ns_check=True
+            eff_model, _ = self.get_agy_default_model()
+
+        def _validate_and_build_agy_inputs() -> Tuple[
+            List[str], List[str], List[Any], List[str], Dict[str, str]
+        ]:
+            plugins_state = agy_plugins_config_state(self.config)
+            val_plgs: List[Any] = []
+            if plugins_state.get("config_error") or plugins_state.get("enabled"):
+                val_plgs = self.policy.validate_agy_plugins(
+                    cwd=cwd, add_dirs=add_dirs, require_mount_ns_check=True
+                )
+            built_argv = self.policy.build_agy_argv(
+                prompt=prompt,
+                args=args,
+                skip_permissions=skip_permissions,
+                print_mode=print_mode,
+                output_format=output_format,
+                input_format=input_format,
+                model=eff_model,
+                effort=effort,
+                mode=mode,
+                conversation_id=conversation_id,
+                continue_last=continue_last,
+                add_dirs=add_dirs,
+                cwd=cwd,
+                _validated_plugins=val_plgs,
             )
-        _, ro_hook_dirs = self.policy.resolve_codex_git_metadata_dirs(
-            cwd=cwd, add_dirs=add_dirs
-        )
-        trusted_agy_env = self._load_agy_env()
+            ws_dirs = self.policy.get_agy_workspace_dirs(cwd=cwd, add_dirs=add_dirs)
+            _, ro_hooks = self.policy.resolve_codex_git_metadata_dirs(
+                cwd=cwd, add_dirs=add_dirs
+            )
+            loaded_env = self._load_agy_env()
+            return built_argv, ws_dirs, val_plgs, ro_hooks, loaded_env
+
+        (
+            argv,
+            session_ws_agy,
+            validated_plugins,
+            ro_hook_dirs,
+            trusted_agy_env,
+        ) = await asyncio.to_thread(_validate_and_build_agy_inputs)
         for strip_plg_key in (
+            "HOME",
+            "CODEX_HOME",
             "AGY_PLUGIN_ROOT",
             "AGY_PLUGIN_DIRS",
             "AGY_REGISTERED_PLUGINS",
+            "CODEX_PLUGIN_ROOT",
+            "CODEX_PLUGIN_DIRS",
+            "CODEX_REGISTERED_PLUGINS",
+            "PLUGIN_ROOT",
+            "PLUGIN_DATA",
             "CLAUDE_PLUGIN_ROOT",
+            "CLAUDE_PLUGIN_DATA",
             "CLAUDE_PROJECT_DIR",
             "AGY_PROJECT_DIR",
             "HARNESS_PROJECT_DIR",
@@ -2046,8 +2263,64 @@ class SessionManager:
                 elif vs:
                     caller_env[ks] = vs
 
+        session_id = f"sess_{uuid.uuid4().hex[:16]}"
+        prevalidated_sb: Optional[Path] = None
+        prepared_agy_runtime: Optional[PreparedAgentPluginRuntime] = None
+        allowed_ws: List[str] = []
         if validated_plugins:
+            ok_cwd, cwd_err, resolved_cwd = self.policy.validate_workdir(cwd)
+            if not ok_cwd:
+                raise PermissionError(cwd_err)
+            for ws_cand in (
+                resolved_cwd,
+                *session_ws_agy,
+                *self.policy._allowed_roots,
+            ):
+                if ws_cand and ws_cand not in allowed_ws:
+                    allowed_ws.append(ws_cand)
+            prevalidated_sb = await asyncio.to_thread(
+                prepare_sandbox_runtime_state,
+                self.config.sandbox_state_dir,
+                lock_timeout_seconds=self.config.sandbox_lock_timeout_seconds,
+                forbidden_roots=self._sandbox_forbidden_roots(),
+            )
+            prepared_agy_runtime = await asyncio.to_thread(
+                prepare_agy_plugin_runtime,
+                self.config,
+                validated_plugins=validated_plugins,
+                sandbox_state_root=prevalidated_sb,
+                allowed_workspaces=allowed_ws,
+                masked_paths=self._hook_jail_masked_paths(),
+                readonly_subpaths=ro_hook_dirs,
+                session_tag=session_id,
+            )
+            trusted_agy_env["HOME"] = prepared_agy_runtime.isolated_home_dir
             trusted_agy_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            agy_settings_env = await asyncio.to_thread(
+                self.policy.build_agy_sandbox_settings,
+                cwd=cwd,
+                add_dirs=add_dirs,
+                _validated_plugins=validated_plugins,
+            )
+            deny_read_roots: List[str] = []
+            for r_str in (agy_settings_env.get("permissions") or {}).get("deny") or []:
+                s_rule = str(r_str).strip()
+                if s_rule.startswith("read_file(") and s_rule.endswith(")"):
+                    deny_read_roots.append(
+                        os.path.abspath(
+                            os.path.expanduser(s_rule[len("read_file(") : -1].strip())
+                        )
+                    )
+
+            def _eff_agy_plugin_dir(plg_item: Any) -> str:
+                src_p = str(plg_item.source_dir)
+                if self.policy.is_protected_path(src_p) or any(
+                    src_p == dr or src_p.startswith(dr.rstrip("/") + "/")
+                    for dr in deny_read_roots
+                ):
+                    return str(plg_item.vfs_discovery_dir)
+                return src_p
+
             oma_plg = next(
                 (p for p in validated_plugins if p.name == "oh-my-agents"), None
             )
@@ -2055,12 +2328,18 @@ class SessionManager:
                 validated_plugins[0] if len(validated_plugins) == 1 else None
             )
             if primary_plg is not None:
-                trusted_agy_env["AGY_PLUGIN_ROOT"] = primary_plg.source_dir
+                trusted_agy_env["AGY_PLUGIN_ROOT"] = _eff_agy_plugin_dir(primary_plg)
             trusted_agy_env["AGY_REGISTERED_PLUGINS"] = os.pathsep.join(
-                p.source_dir for p in validated_plugins
+                _eff_agy_plugin_dir(p) for p in validated_plugins
             )
 
+        runtime_holder: List[Optional[PreparedAgentPluginRuntime]] = [prepared_agy_runtime]
+        ro_subpaths_holder: List[List[str]] = [list(ro_hook_dirs)]
         expected_plugin_mounts = [(p.name, p.source_dir) for p in validated_plugins]
+        expected_plugin_specs = [
+            (p.name, p.source_dir, p.has_hooks, p.hooks_relpath)
+            for p in validated_plugins
+        ]
 
         def _revalidate_agy_plugins_before_spawn() -> None:
             latest_state = agy_plugins_config_state(self.config)
@@ -2069,8 +2348,11 @@ class SessionManager:
                 current_plugins = self.policy.validate_agy_plugins(
                     cwd=cwd, add_dirs=add_dirs, require_mount_ns_check=True
                 )
-            current_mounts = [(p.name, p.source_dir) for p in current_plugins]
-            if current_mounts != expected_plugin_mounts:
+            current_specs = [
+                (p.name, p.source_dir, p.has_hooks, p.hooks_relpath)
+                for p in current_plugins
+            ]
+            if current_specs != expected_plugin_specs:
                 raise PermissionError(
                     redact_diagnostic_text(
                         "AGY plugin registration changed while session was queued; "
@@ -2079,29 +2361,62 @@ class SessionManager:
                     )
                 )
 
+        def _refresh_agy_runtime_after_queue() -> Optional[PreparedAgentPluginRuntime]:
+            _, fresh_ro_hook_dirs = self.policy.resolve_codex_git_metadata_dirs(
+                cwd=cwd, add_dirs=add_dirs
+            )
+            ro_subpaths_holder[0] = list(fresh_ro_hook_dirs)
+            if not validated_plugins or prevalidated_sb is None:
+                return runtime_holder[0]
+            current_plugins = self.policy.validate_agy_plugins(
+                cwd=cwd, add_dirs=add_dirs, require_mount_ns_check=True
+            )
+            refreshed = prepare_agy_plugin_runtime(
+                self.config,
+                validated_plugins=current_plugins,
+                sandbox_state_root=prevalidated_sb,
+                allowed_workspaces=allowed_ws,
+                masked_paths=self._hook_jail_masked_paths(),
+                readonly_subpaths=fresh_ro_hook_dirs,
+                session_tag=session_id,
+            )
+            runtime_holder[0] = refreshed
+            return refreshed
+
         is_stream_json = output_format == "stream-json" or "--output-format=stream-json" in argv
         eff_timeout = self._resolve_timeout(
             timeout, self.config.agent_default_timeout_seconds
         )
-        return await self.create_session(
-            command=argv,
-            cwd=cwd,
-            env=caller_env,
-            shell=False,
-            use_pty=use_pty,
-            stream_json=is_stream_json,
-            timeout=eff_timeout,
-            initial_stdin=initial_stdin,
-            close_stdin=close_stdin,
-            slot_sem=self._agy_sem,
-            queue_timeout=self.config.agy_queue_timeout_seconds,
-            is_agy=True,
-            readonly_subpaths=ro_hook_dirs,
-            trusted_env=trusted_agy_env,
-            agy_plugins_enabled=bool(validated_plugins),
-            agy_plugin_mounts=expected_plugin_mounts,
-            pre_spawn_check=_revalidate_agy_plugins_before_spawn,
-        )
+        try:
+            return await self.create_session(
+                command=argv,
+                cwd=cwd,
+                env=caller_env,
+                shell=False,
+                use_pty=use_pty,
+                stream_json=is_stream_json,
+                timeout=eff_timeout,
+                initial_stdin=initial_stdin,
+                close_stdin=close_stdin,
+                slot_sem=self._agy_sem,
+                queue_timeout=self.config.agy_queue_timeout_seconds,
+                is_agy=True,
+                readonly_subpaths=ro_hook_dirs,
+                readonly_subpaths_getter=lambda: ro_subpaths_holder[0],
+                trusted_env=trusted_agy_env,
+                agy_plugins_enabled=bool(validated_plugins),
+                agy_plugin_mounts=expected_plugin_mounts,
+                prepared_plugin_runtime=prepared_agy_runtime,
+                prevalidated_sandbox_state=prevalidated_sb,
+                pre_spawn_check=_revalidate_agy_plugins_before_spawn,
+                refresh_plugin_runtime=_refresh_agy_runtime_after_queue,
+                on_cleanup=lambda: cleanup_prepared_plugin_runtime(runtime_holder[0]),
+                session_id_override=session_id,
+                session_workdirs=session_ws_agy,
+            )
+        except BaseException:
+            cleanup_prepared_plugin_runtime(runtime_holder[0])
+            raise
 
     async def create_codex_session(
         self,
@@ -2126,49 +2441,231 @@ class SessionManager:
         initial_stdin: Optional[str] = None,
         close_stdin: bool = True,
     ) -> ExecutionSession:
-        """Create a dedicated `codex exec` session jailed to allowed_workdirs + `~/.codex`."""
-        argv = self.policy.build_codex_argv(
-            prompt=prompt,
-            args=args,
-            skip_permissions=skip_permissions,
-            sandbox_mode=sandbox_mode,
-            json_events=json_events,
-            model=model,
-            effort=effort,
-            search=search,
-            session_id=session_id,
-            continue_last=continue_last,
-            review=review,
-            skip_git_repo_check=skip_git_repo_check,
-            ephemeral=ephemeral,
-            add_dirs=add_dirs,
-            cwd=cwd,
-        )
-        _, ro_hook_dirs = self.policy.resolve_codex_git_metadata_dirs(
-            cwd=cwd, add_dirs=add_dirs
-        )
-        trusted_codex_env = self._load_codex_env()
+        """Create a dedicated `codex exec` session jailed to allowed_workdirs + isolated runtime."""
+        def _validate_and_build_codex_inputs() -> Tuple[
+            List[Any], str, List[str], List[str], List[str], Dict[str, str]
+        ]:
+            codex_plugins_state = codex_plugins_config_state(self.config)
+            val_cx_plgs: List[Any] = []
+            if codex_plugins_state.get("config_error") or codex_plugins_state.get("enabled"):
+                val_cx_plgs = self.policy.validate_codex_plugins(
+                    cwd=cwd, add_dirs=add_dirs, require_mount_ns_check=True
+                )
+            eff_sb = (
+                self.config.codex_default_sandbox
+                if sandbox_mode is None
+                else str(sandbox_mode).strip()
+            )
+            ok_cwd_cx, cwd_err_cx, res_cwd_cx = self.policy.validate_workdir(cwd)
+            if not ok_cwd_cx:
+                raise PermissionError(cwd_err_cx)
+            val_add_cx: List[str] = []
+            if add_dirs:
+                for d in add_dirs:
+                    ok_d, d_err, resolved_d = self.policy.validate_workdir(str(d))
+                    if not ok_d:
+                        raise PermissionError(d_err)
+                    if resolved_d not in val_add_cx:
+                        val_add_cx.append(resolved_d)
+            if val_cx_plgs and eff_sb == "workspace-write":
+                self._ensure_codex_workspace_metadata_dirs(res_cwd_cx)
+            built_cx_argv = self.policy.build_codex_argv(
+                prompt=prompt,
+                args=args,
+                skip_permissions=skip_permissions,
+                sandbox_mode=sandbox_mode,
+                json_events=json_events,
+                model=model,
+                effort=effort,
+                search=search,
+                session_id=session_id,
+                continue_last=continue_last,
+                review=review,
+                skip_git_repo_check=skip_git_repo_check,
+                ephemeral=ephemeral,
+                add_dirs=add_dirs,
+                cwd=cwd,
+            )
+            _, ro_hooks_cx = self.policy.resolve_codex_git_metadata_dirs(
+                cwd=cwd, add_dirs=add_dirs
+            )
+            loaded_cx_env = self._load_codex_env()
+            return (
+                val_cx_plgs,
+                res_cwd_cx,
+                val_add_cx,
+                built_cx_argv,
+                ro_hooks_cx,
+                loaded_cx_env,
+            )
+
+        (
+            validated_codex_plugins,
+            resolved_cwd_codex,
+            validated_add_dirs_codex,
+            argv,
+            ro_hook_dirs,
+            trusted_codex_env,
+        ) = await asyncio.to_thread(_validate_and_build_codex_inputs)
+        for strip_plg_key in (
+            "HOME",
+            "AGY_PLUGIN_ROOT",
+            "AGY_PLUGIN_DIRS",
+            "AGY_REGISTERED_PLUGINS",
+            "CODEX_PLUGIN_ROOT",
+            "CODEX_PLUGIN_DIRS",
+            "CODEX_REGISTERED_PLUGINS",
+            "PLUGIN_ROOT",
+            "PLUGIN_DATA",
+            "CLAUDE_PLUGIN_ROOT",
+            "CLAUDE_PLUGIN_DATA",
+            "CLAUDE_PROJECT_DIR",
+            "AGY_PROJECT_DIR",
+            "HARNESS_PROJECT_DIR",
+            "OH_MY_AGENTS_ROOT",
+        ):
+            trusted_codex_env.pop(strip_plg_key, None)
+
+        gw_session_id = f"sess_{uuid.uuid4().hex[:16]}"
+        prevalidated_sb: Optional[Path] = None
+        prepared_codex_runtime: Optional[PreparedAgentPluginRuntime] = None
+        allowed_ws_codex: List[str] = []
+        if validated_codex_plugins:
+            trusted_codex_env.pop("CODEX_HOME", None)
+            for ws_cand in (
+                resolved_cwd_codex,
+                *validated_add_dirs_codex,
+                *self.policy._allowed_roots,
+            ):
+                if ws_cand and ws_cand not in allowed_ws_codex:
+                    allowed_ws_codex.append(ws_cand)
+            prevalidated_sb = await asyncio.to_thread(
+                prepare_sandbox_runtime_state,
+                self.config.sandbox_state_dir,
+                lock_timeout_seconds=self.config.sandbox_lock_timeout_seconds,
+                forbidden_roots=self._sandbox_forbidden_roots(),
+            )
+            prepared_codex_runtime = await asyncio.to_thread(
+                prepare_codex_plugin_runtime,
+                self.config,
+                validated_plugins=validated_codex_plugins,
+                sandbox_state_root=prevalidated_sb,
+                allowed_workspaces=allowed_ws_codex,
+                masked_paths=self._hook_jail_masked_paths(),
+                readonly_subpaths=ro_hook_dirs,
+                session_tag=gw_session_id,
+            )
+            trusted_codex_env["HOME"] = prepared_codex_runtime.isolated_home_dir
+            trusted_codex_env["CODEX_HOME"] = str(
+                prepared_codex_runtime.vfs_codex_home_dir
+            )
+            trusted_codex_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            oma_plg = next(
+                (p for p in validated_codex_plugins if p.name == "oh-my-agents"), None
+            )
+            primary_plg = oma_plg or (
+                validated_codex_plugins[0] if len(validated_codex_plugins) == 1 else None
+            )
+            if primary_plg is not None:
+                trusted_codex_env["CODEX_PLUGIN_ROOT"] = (
+                    primary_plg.vfs_discovery_dir
+                    if self.policy.is_protected_path(primary_plg.source_dir)
+                    else primary_plg.source_dir
+                )
+            trusted_codex_env["CODEX_REGISTERED_PLUGINS"] = os.pathsep.join(
+                (
+                    p.vfs_discovery_dir
+                    if self.policy.is_protected_path(p.source_dir)
+                    else p.source_dir
+                )
+                for p in validated_codex_plugins
+            )
+
+        codex_runtime_holder: List[Optional[PreparedAgentPluginRuntime]] = [prepared_codex_runtime]
+        codex_ro_subpaths_holder: List[List[str]] = [list(ro_hook_dirs)]
+        expected_codex_mounts = [(p.name, p.source_dir) for p in validated_codex_plugins]
+        expected_codex_specs = [
+            (p.name, p.source_dir, p.marketplace_name, p.version, p.has_hooks, p.hooks_relpath)
+            for p in validated_codex_plugins
+        ]
+
+        def _revalidate_codex_plugins_before_spawn() -> None:
+            latest_state = codex_plugins_config_state(self.config)
+            current_plugins = []
+            if latest_state.get("config_error") or latest_state.get("enabled"):
+                current_plugins = self.policy.validate_codex_plugins(
+                    cwd=cwd, add_dirs=add_dirs, require_mount_ns_check=True
+                )
+            current_specs = [
+                (p.name, p.source_dir, p.marketplace_name, p.version, p.has_hooks, p.hooks_relpath)
+                for p in current_plugins
+            ]
+            if current_specs != expected_codex_specs:
+                raise PermissionError(
+                    redact_diagnostic_text(
+                        "Codex plugin registration changed while session was queued; "
+                        "aborting queued session fail-closed.",
+                        self.config,
+                    )
+                )
+
+        def _refresh_codex_runtime_after_queue() -> Optional[PreparedAgentPluginRuntime]:
+            _, fresh_ro_hook_dirs = self.policy.resolve_codex_git_metadata_dirs(
+                cwd=cwd, add_dirs=add_dirs
+            )
+            codex_ro_subpaths_holder[0] = list(fresh_ro_hook_dirs)
+            if not validated_codex_plugins or prevalidated_sb is None:
+                return codex_runtime_holder[0]
+            current_plugins = self.policy.validate_codex_plugins(
+                cwd=cwd, add_dirs=add_dirs, require_mount_ns_check=True
+            )
+            refreshed = prepare_codex_plugin_runtime(
+                self.config,
+                validated_plugins=current_plugins,
+                sandbox_state_root=prevalidated_sb,
+                allowed_workspaces=allowed_ws_codex,
+                masked_paths=self._hook_jail_masked_paths(),
+                readonly_subpaths=fresh_ro_hook_dirs,
+                session_tag=gw_session_id,
+            )
+            codex_runtime_holder[0] = refreshed
+            return refreshed
+
         caller_env = {str(k): str(v) for k, v in env.items()} if env else {}
         is_stream_json = json_events or "--json" in argv
         eff_timeout = self._resolve_timeout(
             timeout, self.config.agent_default_timeout_seconds
         )
-        return await self.create_session(
-            command=argv,
-            cwd=cwd,
-            env=caller_env,
-            shell=False,
-            use_pty=use_pty,
-            stream_json=is_stream_json,
-            timeout=eff_timeout,
-            initial_stdin=initial_stdin,
-            close_stdin=close_stdin,
-            slot_sem=self._codex_sem,
-            queue_timeout=self.config.agy_queue_timeout_seconds,
-            is_codex=True,
-            readonly_subpaths=ro_hook_dirs,
-            trusted_env=trusted_codex_env,
-        )
+        try:
+            return await self.create_session(
+                command=argv,
+                cwd=cwd,
+                env=caller_env,
+                shell=False,
+                use_pty=use_pty,
+                stream_json=is_stream_json,
+                timeout=eff_timeout,
+                initial_stdin=initial_stdin,
+                close_stdin=close_stdin,
+                slot_sem=self._codex_sem,
+                queue_timeout=self.config.agy_queue_timeout_seconds,
+                is_codex=True,
+                readonly_subpaths=ro_hook_dirs,
+                readonly_subpaths_getter=lambda: codex_ro_subpaths_holder[0],
+                trusted_env=trusted_codex_env,
+                codex_plugins_enabled=bool(validated_codex_plugins),
+                codex_plugin_mounts=expected_codex_mounts,
+                prepared_plugin_runtime=prepared_codex_runtime,
+                prevalidated_sandbox_state=prevalidated_sb,
+                pre_spawn_check=_revalidate_codex_plugins_before_spawn,
+                refresh_plugin_runtime=_refresh_codex_runtime_after_queue,
+                on_cleanup=lambda: cleanup_prepared_plugin_runtime(codex_runtime_holder[0]),
+                session_id_override=gw_session_id,
+                session_workdirs=[resolved_cwd_codex, *validated_add_dirs_codex],
+            )
+        except BaseException:
+            cleanup_prepared_plugin_runtime(codex_runtime_holder[0])
+            raise
 
     def get_session(
         self, session_id: str

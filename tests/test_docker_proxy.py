@@ -247,19 +247,22 @@ class DockerProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("command(docker)", policy.get_agy_denied_rules())
         self.assertFalse(policy.validate_command("podman ps", cwd=self.ws).allowed)
 
-        argv = build_mount_ns_argv(
-            ["true"], self.ws, [self.ws], [], sandbox_state_dir=os.path.join(self.tmp, "sb"),
-            docker_mask_paths=["/run/docker.sock"], docker_proxy_socket=None,
-        )
-        script = argv[argv.index("-c") + 1]
-        self.assertIn("--bind /dev/null", script)
-        self.assertIn("/run/docker.sock", script)
-        argv = build_mount_ns_argv(
-            ["true"], self.ws, [self.ws], [], sandbox_state_dir=os.path.join(self.tmp, "sb"),
-            docker_mask_paths=["/run/docker.sock"], docker_proxy_socket=self.sock,
-        )
-        script = argv[argv.index("-c") + 1]
-        self.assertIn(f"--bind {self.sock}", script)
+        from unittest.mock import patch
+
+        with patch("gateway.sandbox.can_use_mount_namespace", return_value=True):
+            argv = build_mount_ns_argv(
+                ["true"], self.ws, [self.ws], [], sandbox_state_dir=os.path.join(self.tmp, "sb"),
+                docker_mask_paths=["/run/docker.sock"], docker_proxy_socket=None,
+            )
+            script = argv[argv.index("-c") + 1]
+            self.assertIn("--bind /dev/null", script)
+            self.assertIn("/run/docker.sock", script)
+            argv = build_mount_ns_argv(
+                ["true"], self.ws, [self.ws], [], sandbox_state_dir=os.path.join(self.tmp, "sb"),
+                docker_mask_paths=["/run/docker.sock"], docker_proxy_socket=self.sock,
+            )
+            script = argv[argv.index("-c") + 1]
+            self.assertIn(f"--bind {self.sock}", script)
 
     async def test_chunked_body_restart_revalidation_and_head_timeout(self) -> None:
         # 1. Multi-chunk `Transfer-Encoding: chunked` JSON body on create

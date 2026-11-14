@@ -409,6 +409,20 @@ class GatewayConfig:
             or str(Path.home() / ".config" / "dots-gateway" / "agy-plugins.json")
         ).strip()
     )
+    # Configurable isolated VFS runtime HOME / plugin discovery root inside mount namespaces.
+    # Allows `agy` (`<root>/agy/.gemini/config/plugins/<name>`) and `codex`
+    # (`CODEX_HOME=<root>/codex/.codex`) to discover read-only plugins without opening real HOME
+    # or deleting parent `permissions.deny` rules.
+    agent_runtime_home_root: str = field(
+        default_factory=lambda: (
+            os.environ.get("GATEWAY_AGENT_RUNTIME_HOME_ROOT") or "/mnt/dots-agent-home"
+        ).strip()
+    )
+    # Optional dedicated writable state directory for plugin hook temp queues (`TMPDIR`) and
+    # `PLUGIN_DATA` (defaults to `<sandbox_state_dir>/plugin_state` when unset).
+    plugin_state_dir: Optional[str] = field(
+        default_factory=lambda: (os.environ.get("GATEWAY_PLUGIN_STATE_DIR") or "").strip() or None
+    )
     codex_binary: str = DEFAULT_CODEX_BIN
     bwrap_binary: str = DEFAULT_BWRAP_BIN
     codex_default_skip_permissions: bool = True
@@ -419,6 +433,17 @@ class GatewayConfig:
         default_factory=lambda: (
             os.environ.get("GATEWAY_CODEX_ENV_FILE")
             or str(Path.home() / ".config" / "dots-gateway" / "codex.env")
+        ).strip()
+    )
+    # Operator-confirmed read-only OpenAI Codex (`codex`) plugin resource registration (default OFF).
+    # Precedence: hot-reload `codex_plugins_file` (written by `dots-gateway codex-plugins`, 0600) >
+    # `codex_plugins_enabled` + `codex_plugin_dirs` in `config.json`.
+    codex_plugins_enabled: bool = False
+    codex_plugin_dirs: List[str] = field(default_factory=list)
+    codex_plugins_file: str = field(
+        default_factory=lambda: (
+            os.environ.get("GATEWAY_CODEX_PLUGINS_FILE")
+            or str(Path.home() / ".config" / "dots-gateway" / "codex-plugins.json")
         ).strip()
     )
     # Policy-filtered Docker access for sandboxed sessions (exec_command / run_agy / run_codex).
@@ -579,6 +604,12 @@ class GatewayConfig:
             ]
         if os.environ.get("GATEWAY_AGY_PLUGINS_FILE"):
             cfg.agy_plugins_file = os.environ["GATEWAY_AGY_PLUGINS_FILE"].strip()
+        if os.environ.get("GATEWAY_AGENT_RUNTIME_HOME_ROOT"):
+            cfg.agent_runtime_home_root = (
+                os.environ["GATEWAY_AGENT_RUNTIME_HOME_ROOT"].strip() or "/mnt/dots-agent-home"
+            )
+        if os.environ.get("GATEWAY_PLUGIN_STATE_DIR"):
+            cfg.plugin_state_dir = os.environ["GATEWAY_PLUGIN_STATE_DIR"].strip() or None
         if os.environ.get("GATEWAY_DOCKER_ENABLED"):
             cfg.docker_enabled = os.environ["GATEWAY_DOCKER_ENABLED"].strip().lower() in (
                 "1",
@@ -616,6 +647,19 @@ class GatewayConfig:
             ]
         if os.environ.get("GATEWAY_CODEX_ENV_FILE"):
             cfg.codex_env_file = os.environ["GATEWAY_CODEX_ENV_FILE"].strip()
+        if os.environ.get("GATEWAY_CODEX_PLUGINS_ENABLED"):
+            cfg.codex_plugins_enabled = (
+                os.environ["GATEWAY_CODEX_PLUGINS_ENABLED"].strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+        if os.environ.get("GATEWAY_CODEX_PLUGIN_DIRS"):
+            cfg.codex_plugin_dirs = [
+                x.strip()
+                for x in os.environ["GATEWAY_CODEX_PLUGIN_DIRS"].split(",")
+                if x.strip()
+            ]
+        if os.environ.get("GATEWAY_CODEX_PLUGINS_FILE"):
+            cfg.codex_plugins_file = os.environ["GATEWAY_CODEX_PLUGINS_FILE"].strip()
         if os.environ.get("GATEWAY_MAX_AGY"):
             cfg.max_concurrent_agy = max(1, int(os.environ["GATEWAY_MAX_AGY"]))
         if os.environ.get("GATEWAY_MAX_CODEX"):
@@ -905,16 +949,16 @@ def redact_diagnostic_text(
     return out
 
 
-def agy_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
-    """Return hot-reloaded AGY plugin registration config state.
-
-    Precedence: `agy_plugins_file` (JSON `{"enabled": bool, "plugin_dirs": [...]}` managed by
-    `dots-gateway agy-plugins`, mode 0600) > `cfg.agy_plugins_enabled` + `cfg.agy_plugin_dirs`.
-    Defaults to disabled (`enabled=False`) when neither is configured. Any corrupted, symlinked,
-    or world-writable `agy_plugins_file` returns `enabled=True` with `config_error` so AGY
-    sessions fail closed rather than silently bypassing operator policy.
-    """
-    raw_pf = str(getattr(cfg, "agy_plugins_file", "") or "").strip()
+def _load_plugins_registry_state(
+    cfg: "GatewayConfig",
+    *,
+    file_attr: str,
+    enabled_attr: str,
+    dirs_attr: str,
+    config_source_label: str,
+) -> Dict[str, Any]:
+    """Load and fail-closed validate hot-reloadable plugin registration state."""
+    raw_pf = str(getattr(cfg, file_attr, "") or "").strip()
     if raw_pf:
         pf_path = os.path.expanduser(raw_pf)
         try:
@@ -928,7 +972,7 @@ def agy_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
                 "source": redact_diagnostic_text(pf_path, cfg),
                 "raw_dirs": [],
                 "config_error": redact_diagnostic_text(
-                    f"Cannot inspect agy_plugins_file '{pf_path}': {exc}", cfg
+                    f"Cannot inspect {file_attr} '{pf_path}': {exc}", cfg
                 ),
             }
         if lst is not None:
@@ -939,7 +983,7 @@ def agy_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
                     "source": redact_diagnostic_text(pf_path, cfg),
                     "raw_dirs": [],
                     "config_error": redact_diagnostic_text(
-                        f"agy_plugins_file '{pf_path}' must be a regular file, not a symlink or special file",
+                        f"{file_attr} '{pf_path}' must be a regular file, not a symlink or special file",
                         cfg,
                     ),
                 }
@@ -950,7 +994,7 @@ def agy_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
                     "source": redact_diagnostic_text(pf_path, cfg),
                     "raw_dirs": [],
                     "config_error": redact_diagnostic_text(
-                        f"agy_plugins_file '{pf_path}' must not be world-writable",
+                        f"{file_attr} '{pf_path}' must not be world-writable",
                         cfg,
                     ),
                 }
@@ -961,7 +1005,7 @@ def agy_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
                     "source": redact_diagnostic_text(pf_path, cfg),
                     "raw_dirs": [],
                     "config_error": redact_diagnostic_text(
-                        f"agy_plugins_file '{pf_path}' is owned by untrusted uid {lst.st_uid}",
+                        f"{file_attr} '{pf_path}' is owned by untrusted uid {lst.st_uid}",
                         cfg,
                     ),
                 }
@@ -975,7 +1019,7 @@ def agy_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
                     "source": redact_diagnostic_text(pf_path, cfg),
                     "raw_dirs": [],
                     "config_error": redact_diagnostic_text(
-                        f"Invalid JSON in agy_plugins_file '{pf_path}': {exc}",
+                        f"Invalid JSON in {file_attr} '{pf_path}': {exc}",
                         cfg,
                     ),
                 }
@@ -986,7 +1030,7 @@ def agy_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
                     "source": redact_diagnostic_text(pf_path, cfg),
                     "raw_dirs": [],
                     "config_error": redact_diagnostic_text(
-                        f"agy_plugins_file '{pf_path}' must contain a JSON object",
+                        f"{file_attr} '{pf_path}' must contain a JSON object",
                         cfg,
                     ),
                 }
@@ -998,7 +1042,7 @@ def agy_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
                     "source": redact_diagnostic_text(pf_path, cfg),
                     "raw_dirs": [],
                     "config_error": redact_diagnostic_text(
-                        f"agy_plugins_file '{pf_path}' field 'enabled' must be a boolean",
+                        f"{file_attr} '{pf_path}' field 'enabled' must be a boolean",
                         cfg,
                     ),
                 }
@@ -1010,7 +1054,7 @@ def agy_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
                     "source": redact_diagnostic_text(pf_path, cfg),
                     "raw_dirs": [],
                     "config_error": redact_diagnostic_text(
-                        f"agy_plugins_file '{pf_path}' field 'plugin_dirs' must be a list of strings",
+                        f"{file_attr} '{pf_path}' field 'plugin_dirs' must be a list of strings",
                         cfg,
                     ),
                 }
@@ -1023,29 +1067,77 @@ def agy_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
                 "config_error": None,
             }
 
-    cfg_enabled = getattr(cfg, "agy_plugins_enabled", False)
-    cfg_dirs = getattr(cfg, "agy_plugin_dirs", [])
+    cfg_enabled = getattr(cfg, enabled_attr, False)
+    cfg_dirs = getattr(cfg, dirs_attr, [])
     if not isinstance(cfg_enabled, bool):
         return {
             "enabled": True,
             "configured": True,
-            "source": "config.agy_plugins",
+            "source": config_source_label,
             "raw_dirs": [],
-            "config_error": "config field 'agy_plugins_enabled' must be a boolean",
+            "config_error": f"config field '{enabled_attr}' must be a boolean",
         }
     if not isinstance(cfg_dirs, (list, tuple)) or any(not isinstance(x, str) for x in cfg_dirs):
         return {
             "enabled": True,
             "configured": True,
-            "source": "config.agy_plugins",
+            "source": config_source_label,
             "raw_dirs": [],
-            "config_error": "config field 'agy_plugin_dirs' must be a list of strings",
+            "config_error": f"config field '{dirs_attr}' must be a list of strings",
         }
     clean_cfg_dirs = [x.strip() for x in cfg_dirs if x.strip()]
     return {
         "enabled": cfg_enabled,
         "configured": bool(cfg_enabled or clean_cfg_dirs),
-        "source": "config.agy_plugins",
+        "source": config_source_label,
         "raw_dirs": clean_cfg_dirs,
         "config_error": None,
     }
+
+
+def agy_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
+    """Return hot-reloaded AGY plugin registration config state.
+
+    Precedence: `agy_plugins_file` (JSON `{"enabled": bool, "plugin_dirs": [...]}` managed by
+    `dots-gateway agy-plugins`, mode 0600) > `cfg.agy_plugins_enabled` + `cfg.agy_plugin_dirs`.
+    Defaults to disabled (`enabled=False`) when neither is configured. Any corrupted, symlinked,
+    or world-writable `agy_plugins_file` returns `enabled=True` with `config_error` so AGY
+    sessions fail closed rather than silently bypassing operator policy.
+    """
+    return _load_plugins_registry_state(
+        cfg,
+        file_attr="agy_plugins_file",
+        enabled_attr="agy_plugins_enabled",
+        dirs_attr="agy_plugin_dirs",
+        config_source_label="config.agy_plugins",
+    )
+
+
+def codex_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
+    """Return hot-reloaded OpenAI Codex plugin registration config state.
+
+    Precedence: `codex_plugins_file` (JSON `{"enabled": bool, "plugin_dirs": [...]}` managed by
+    `dots-gateway codex-plugins`, mode 0600) > `cfg.codex_plugins_enabled` + `cfg.codex_plugin_dirs`.
+    Defaults to disabled (`enabled=False`) when neither is configured. Any corrupted, symlinked,
+    or world-writable `codex_plugins_file` returns `enabled=True` with `config_error` so Codex
+    sessions fail closed rather than silently bypassing operator policy.
+    """
+    return _load_plugins_registry_state(
+        cfg,
+        file_attr="codex_plugins_file",
+        enabled_attr="codex_plugins_enabled",
+        dirs_attr="codex_plugin_dirs",
+        config_source_label="config.codex_plugins",
+    )
+
+
+def effective_plugin_state_dir(cfg: "GatewayConfig") -> str:
+    """Return configured `plugin_state_dir` or default `<sandbox_state_dir>/plugin_state`."""
+    raw_override = str(getattr(cfg, "plugin_state_dir", "") or "").strip()
+    if raw_override:
+        return raw_override
+    base_sb = str(getattr(cfg, "sandbox_state_dir", "") or "").strip()
+    if not base_sb:
+        base_sb = detect_default_sandbox_state_dir()
+    return os.path.join(os.path.expanduser(base_sb), "plugin_state")
+

@@ -18,8 +18,15 @@ from .config import (
     GATEWAY_ROOT,
     GatewayConfig,
     agy_plugins_config_state,
+    codex_plugins_config_state,
     docker_access_enabled,
+    effective_plugin_state_dir,
     redact_diagnostic_text,
+)
+from .hook_jail import (
+    WORKSPACE_HOOK_INJECTION_RELPATHS,
+    _expand_host_tilde_in_agy_rule,
+    validate_plugin_hooks_manifest,
 )
 from .sandbox import can_use_mount_namespace
 
@@ -39,9 +46,30 @@ class ValidatedAgyPlugin:
     source_dir: str
     vfs_discovery_dir: str
     manifest: str
+    hooks_relpath: Optional[str] = None
+
+    @property
+    def has_hooks(self) -> bool:
+        return bool(self.hooks_relpath)
+
+
+@dataclass(frozen=True)
+class ValidatedCodexPlugin:
+    name: str
+    marketplace_name: str
+    version: str
+    source_dir: str
+    vfs_discovery_dir: str
+    hooks_relpath: Optional[str]
+    manifest: str
+
+    @property
+    def has_hooks(self) -> bool:
+        return bool(self.hooks_relpath)
 
 
 _SAFE_AGY_PLUGIN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_SAFE_CODEX_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _READ_FILE_RULE_RE = re.compile(r"^read_file\((.+)\)$")
 _WRITE_FILE_RULE_RE = re.compile(r"^write_file\((.+)\)$")
 
@@ -801,6 +829,16 @@ class CommandPolicy:
         self._allowed_fullpaths = {
             cmd for cmd in config.allowed_commands if "/" in cmd
         }
+        for op_bin in (config.agy_binary, config.codex_binary):
+            if op_bin and ("/" in op_bin or str(op_bin).startswith("~")):
+                try:
+                    exp_bin = os.path.expanduser(str(op_bin).strip())
+                    if exp_bin.startswith("/"):
+                        self._allowed_fullpaths.add(os.path.abspath(exp_bin))
+                        if os.path.exists(exp_bin):
+                            self._allowed_fullpaths.add(os.path.realpath(exp_bin))
+                except OSError:
+                    pass
         self._blocked_basenames = {
             os.path.basename(cmd) for cmd in config.blocked_commands
         }
@@ -815,10 +853,10 @@ class CommandPolicy:
                 prot_roots.append(lex_p)
             try:
                 res_p = str(exp.resolve())
-                if res_p not in prot_roots:
-                    prot_roots.append(res_p)
             except OSError:
-                pass
+                res_p = ""
+            if res_p and res_p not in prot_roots:
+                prot_roots.append(res_p)
         self._protected_roots = prot_roots
 
     def is_protected_path(self, resolved_path: str) -> bool:
@@ -827,16 +865,8 @@ class CommandPolicy:
                 return True
         return False
 
-    def get_configured_agy_plugin_paths(self) -> List[str]:
-        """Return lexical and resolved paths of operator-configured AGY plugin directories (active or inactive)."""
-        state = agy_plugins_config_state(self.config)
-        raw_candidates: List[str] = list(state.get("raw_dirs") or [])
-        cfg_dirs = getattr(self.config, "agy_plugin_dirs", None)
-        if isinstance(cfg_dirs, (list, tuple)):
-            for item in cfg_dirs:
-                if isinstance(item, str) and item.strip():
-                    raw_candidates.append(item.strip())
-
+    @staticmethod
+    def _collect_plugin_paths_from_candidates(raw_candidates: Sequence[str]) -> List[str]:
         home_lex = os.path.abspath(str(Path.home()))
         try:
             home_res = str(Path.home().resolve())
@@ -856,7 +886,6 @@ class CommandPolicy:
             home_lex,
             home_res,
         }
-
         out: List[str] = []
         for raw in raw_candidates:
             try:
@@ -874,12 +903,86 @@ class CommandPolicy:
                 continue
         return out
 
+    def get_configured_agy_plugin_paths(self) -> List[str]:
+        """Return lexical and resolved paths of operator-configured AGY plugin directories (active or inactive)."""
+        state = agy_plugins_config_state(self.config)
+        raw_candidates: List[str] = list(state.get("raw_dirs") or [])
+        cfg_dirs = getattr(self.config, "agy_plugin_dirs", None)
+        if isinstance(cfg_dirs, (list, tuple)):
+            for item in cfg_dirs:
+                if isinstance(item, str) and item.strip():
+                    raw_candidates.append(item.strip())
+        return self._collect_plugin_paths_from_candidates(raw_candidates)
+
+    def get_configured_codex_plugin_paths(self) -> List[str]:
+        """Return lexical and resolved paths of operator-configured Codex plugin directories (active or inactive)."""
+        state = codex_plugins_config_state(self.config)
+        raw_candidates: List[str] = list(state.get("raw_dirs") or [])
+        cfg_dirs = getattr(self.config, "codex_plugin_dirs", None)
+        if isinstance(cfg_dirs, (list, tuple)):
+            for item in cfg_dirs:
+                if isinstance(item, str) and item.strip():
+                    raw_candidates.append(item.strip())
+        return self._collect_plugin_paths_from_candidates(raw_candidates)
+
     def is_agy_plugin_path(self, candidate_path: str) -> bool:
         """Return True if `candidate_path` lies within any configured AGY plugin directory."""
         if not candidate_path:
             return False
         for plg_root in self.get_configured_agy_plugin_paths():
             if _path_is_within(candidate_path, plg_root):
+                return True
+        return False
+
+    def is_codex_plugin_path(self, candidate_path: str) -> bool:
+        """Return True if `candidate_path` lies within any configured Codex plugin directory."""
+        if not candidate_path:
+            return False
+        for plg_root in self.get_configured_codex_plugin_paths():
+            if _path_is_within(candidate_path, plg_root):
+                return True
+        return False
+
+    def is_plugin_state_path(self, candidate_path: str) -> bool:
+        """Return True if `candidate_path` lies within `plugin_state_dir`, `plugin_bundles`, or `agent_runtime_home_root`."""
+        if not candidate_path:
+            return False
+        guards: List[str] = []
+        raw_state = effective_plugin_state_dir(self.config)
+        if raw_state:
+            try:
+                exp_s = os.path.expanduser(str(raw_state).strip())
+                if exp_s.startswith("/"):
+                    guards.append(os.path.abspath(exp_s))
+                    if os.path.exists(exp_s):
+                        guards.append(os.path.realpath(exp_s))
+            except OSError:
+                pass
+        raw_sb = getattr(self.config, "sandbox_state_dir", "")
+        if raw_sb:
+            try:
+                exp_sb = os.path.expanduser(str(raw_sb).strip())
+                if exp_sb.startswith("/") and exp_sb != "/":
+                    bundles_lex = os.path.join(os.path.abspath(exp_sb), "plugin_bundles")
+                    guards.append(bundles_lex)
+                    if os.path.exists(exp_sb):
+                        guards.append(os.path.join(os.path.realpath(exp_sb), "plugin_bundles"))
+                    if os.path.exists(bundles_lex):
+                        guards.append(os.path.realpath(bundles_lex))
+            except OSError:
+                pass
+        raw_rt = getattr(self.config, "agent_runtime_home_root", "/mnt/dots-agent-home")
+        if raw_rt:
+            try:
+                exp_rt = os.path.expanduser(str(raw_rt).strip())
+                if exp_rt.startswith("/") and exp_rt != "/":
+                    guards.append(os.path.abspath(exp_rt))
+                    if os.path.exists(exp_rt):
+                        guards.append(os.path.realpath(exp_rt))
+            except OSError:
+                pass
+        for g in guards:
+            if g != "/" and _path_is_within(candidate_path, g):
                 return True
         return False
 
@@ -891,8 +994,38 @@ class CommandPolicy:
                 return True
         return False
 
+    def is_workspace_hook_injection_path(self, candidate_path: str) -> bool:
+        """Return True if `candidate_path` targets any repo-local hook or agent-config injection path."""
+        norm_t = os.path.abspath(candidate_path)
+        roots = list(self._allowed_roots)
+        if not roots and self.config.default_workdir:
+            try:
+                roots.append(str(Path(self.config.default_workdir).expanduser().resolve()))
+            except OSError:
+                pass
+        for ws_r in roots:
+            if not _path_is_within(norm_t, ws_r):
+                continue
+            rel_posix = os.path.relpath(norm_t, ws_r).replace(os.sep, "/")
+            if rel_posix in ("", "."):
+                continue
+            for rel_inj in WORKSPACE_HOOK_INJECTION_RELPATHS:
+                inj_posix = rel_inj.replace(os.sep, "/").strip("/")
+                if (
+                    rel_posix == inj_posix
+                    or rel_posix.startswith(f"{inj_posix}/")
+                    or rel_posix.endswith(f"/{inj_posix}")
+                    or f"/{inj_posix}/" in rel_posix
+                ):
+                    return True
+        return False
+
     def validate_path(
-        self, target: str, base_cwd: Optional[str] = None
+        self,
+        target: str,
+        base_cwd: Optional[str] = None,
+        *,
+        for_write: bool = False,
     ) -> Tuple[bool, str, str]:
         """Validate a filesystem path (for `/v1/files` or `cwd`) against allowed & protected roots."""
         try:
@@ -915,10 +1048,34 @@ class CommandPolicy:
                 resolved,
             )
 
+        if self.is_codex_plugin_path(lexical_abs) or self.is_codex_plugin_path(resolved):
+            return (
+                False,
+                f"Access to Codex plugin resource path '{target}' is forbidden outside Codex sessions",
+                resolved,
+            )
+
+        if self.is_plugin_state_path(lexical_abs) or self.is_plugin_state_path(resolved):
+            return (
+                False,
+                f"Access to isolated plugin runtime/state path '{target}' is forbidden",
+                resolved,
+            )
+
         if not self.is_within_allowed_workdirs(lexical_abs) or not self.is_within_allowed_workdirs(resolved):
             return (
                 False,
                 f"Path '{resolved}' is outside allowed roots {self.config.allowed_workdirs}",
+                resolved,
+            )
+
+        if for_write and (
+            self.is_workspace_hook_injection_path(lexical_abs)
+            or self.is_workspace_hook_injection_path(resolved)
+        ):
+            return (
+                False,
+                f"Modifying protected workspace hook/configuration path '{target}' is forbidden by security policy",
                 resolved,
             )
         return True, "", resolved
@@ -956,7 +1113,7 @@ class CommandPolicy:
             if real_base in self._blocked_basenames or real_str in self.config.blocked_commands:
                 return False, f"Executable '{exe}' resolves to blocked binary '{real_base}'"
 
-            if exe in self._allowed_fullpaths or real_str in self._allowed_fullpaths:
+            if exe in self._allowed_fullpaths or real_str in self._allowed_fullpaths or lex_abs in self._allowed_fullpaths:
                 return True, ""
 
             if self.is_protected_path(lex_abs) or self.is_protected_path(real_str):
@@ -964,6 +1121,12 @@ class CommandPolicy:
 
             if self.is_agy_plugin_path(lex_abs) or self.is_agy_plugin_path(real_str):
                 return False, f"Executable '{exe}' resides in an AGY-only plugin resource path"
+
+            if self.is_codex_plugin_path(lex_abs) or self.is_codex_plugin_path(real_str):
+                return False, f"Executable '{exe}' resides in a Codex-only plugin resource path"
+
+            if self.is_plugin_state_path(lex_abs) or self.is_plugin_state_path(real_str):
+                return False, f"Executable '{exe}' resides in an isolated plugin runtime/state path"
 
             # Workspace-local script, compiled binary, or virtualenv entrypoint
             if self.is_within_allowed_workdirs(lex_abs):
@@ -1046,6 +1209,13 @@ class CommandPolicy:
             "AGY_PLUGIN_ROOT",
             "AGY_PLUGIN_DIRS",
             "AGY_REGISTERED_PLUGINS",
+            "CODEX_HOME",
+            "CODEX_PLUGIN_ROOT",
+            "CODEX_PLUGIN_DIRS",
+            "CODEX_REGISTERED_PLUGINS",
+            "PLUGIN_ROOT",
+            "PLUGIN_DATA",
+            "CLAUDE_PLUGIN_DATA",
             "CLAUDE_PLUGIN_ROOT",
             "CLAUDE_PROJECT_DIR",
             "AGY_PROJECT_DIR",
@@ -1177,13 +1347,18 @@ class CommandPolicy:
         tokens: Sequence[str],
         resolved_cwd: str,
         _trusted_agy_argv: bool = False,
+        _trusted_codex_argv: bool = False,
     ) -> Tuple[bool, str]:
         """Block CLI arguments targeting protected paths or escaping allowed_workdirs."""
         tok_list = list(tokens)
         is_agy_bin = bool(
             tok_list and self._is_agy_executable_token(tok_list[0], resolved_cwd)
         )
+        is_codex_bin = bool(
+            tok_list and self._is_codex_executable_token(tok_list[0], resolved_cwd)
+        )
         saw_trusted_settings = False
+        saw_codex_exec = False
         after_double_dash = False
         _safe_zero_arg_before_dd = {
             "--help",
@@ -1230,6 +1405,12 @@ class CommandPolicy:
                     or (after_double_dash and tok_list[-2] == "--")
                 ):
                     continue
+            if _trusted_codex_argv:
+                if not after_double_dash and tok == "exec":
+                    saw_codex_exec = True
+                    continue
+                if saw_codex_exec and idx == len(tok_list) - 1:
+                    continue
             if not after_double_dash:
                 if (
                     tok
@@ -1270,6 +1451,21 @@ class CommandPolicy:
                         return (
                             False,
                             f"Subcommand 'agy {tok}' is forbidden in task execution; manage plugins via 'dots-gateway agy-plugins'",
+                        )
+                if is_codex_bin:
+                    if tok in ("--plugin", "--plugins") or tok.startswith(
+                        ("--plugin=", "--plugins=")
+                    ):
+                        return False, f"Flag '{tok}' on 'codex' is forbidden by gateway security policy"
+                    if tok in ("plugin", "plugins") and tok_list[idx - 1] not in (
+                        "-m",
+                        "--model",
+                        "-c",
+                        "--config",
+                    ):
+                        return (
+                            False,
+                            f"Subcommand 'codex {tok}' is forbidden in task execution; manage plugins via 'dots-gateway codex-plugins'",
                         )
                 if tok in ("-s", "--sandbox") and idx + 1 < len(tok_list):
                     if tok_list[idx + 1] == "danger-full-access":
@@ -1352,6 +1548,18 @@ class CommandPolicy:
                     return (
                         False,
                         f"Argument '{val}' targets an AGY-only plugin resource path",
+                    )
+
+                if self.is_codex_plugin_path(lex) or self.is_codex_plugin_path(res):
+                    return (
+                        False,
+                        f"Argument '{val}' targets a Codex-only plugin resource path",
+                    )
+
+                if self.is_plugin_state_path(lex) or self.is_plugin_state_path(res):
+                    return (
+                        False,
+                        f"Argument '{val}' targets an isolated plugin runtime/state path",
                     )
 
                 # Block home-directory, /root, or parent-traversal ('..') escapes outside allowed_workdirs
@@ -1564,6 +1772,7 @@ class CommandPolicy:
                 seg_tokens[idx:],
                 resolved_cwd,
                 _trusted_agy_argv=(_trusted_agy_argv and _depth == 0 and idx == 0),
+                _trusted_codex_argv=(_trusted_codex_argv and _depth == 0 and idx == 0),
             )
             if not ok_prot:
                 return PolicyDecision(False, reason=prot_err, resolved_cwd=resolved_cwd)
@@ -1947,6 +2156,7 @@ class CommandPolicy:
         continue_last: bool = False,
         add_dirs: Optional[Sequence[str]] = None,
         cwd: Optional[str] = None,
+        _validated_plugins: Optional[Sequence[ValidatedAgyPlugin]] = None,
     ) -> List[str]:
         """Construct a validated `agy` CLI invocation list confined to allowed_workdirs."""
         agy_bin = (
@@ -2085,19 +2295,23 @@ class CommandPolicy:
             raise PermissionError(err_extra)
 
         plugins_state = agy_plugins_config_state(self.config)
+        active_validated_plugins: Optional[Sequence[ValidatedAgyPlugin]] = _validated_plugins
         if plugins_state.get("config_error") or plugins_state.get("enabled"):
             if not use_sandbox:
                 raise PermissionError(
                     "AGY plugins require '--sandbox' to stay synchronized with read-only VFS mounts"
                 )
-            self.validate_agy_plugins(cwd=cwd, add_dirs=add_dirs)
+            if active_validated_plugins is None:
+                active_validated_plugins = self.validate_agy_plugins(cwd=cwd, add_dirs=add_dirs)
 
         if use_skip and "--dangerously-skip-permissions" not in extra:
             argv.append("--dangerously-skip-permissions")
         if use_sandbox:
             if "--sandbox" not in extra:
                 argv.append("--sandbox")
-            agy_settings = self.build_agy_sandbox_settings(cwd=cwd, add_dirs=add_dirs)
+            agy_settings = self.build_agy_sandbox_settings(
+                cwd=cwd, add_dirs=add_dirs, _validated_plugins=active_validated_plugins
+            )
             argv.append(f"--settings={json.dumps(agy_settings, separators=(',', ':'))}")
 
         if model and "--model" not in extra:
@@ -2148,87 +2362,29 @@ class CommandPolicy:
     def _raise_plugin_policy_error(self, message: str) -> None:
         raise PermissionError(redact_diagnostic_text(message, self.config))
 
-    def validate_agy_plugins(
+    def _check_no_symlink_ancestors(self, abs_path: str, label: str) -> None:
+        """Fail closed if any existing path component of `abs_path` is a symlink."""
+        cur = "/"
+        for part in [p for p in abs_path.split("/") if p]:
+            cur = os.path.join(cur, part)
+            if os.path.islink(cur):
+                self._raise_plugin_policy_error(
+                    f"{label} '{abs_path}' traverses symlink component '{cur}', which is forbidden"
+                )
+
+    def _build_plugin_boundary_sets(
         self,
+        *,
+        home_lex: str,
+        home_res: str,
         cwd: Optional[str] = None,
         add_dirs: Optional[Sequence[str]] = None,
-        require_mount_ns_check: bool = False,
-    ) -> List[ValidatedAgyPlugin]:
-        """Validate operator-registered AGY plugin directories fail-closed.
-
-        Enforces strict separation between:
-        1. Read-only plugin resources (`skills/`, `hooks/`, `rules/`, scripts, `plugin.json`),
-        2. Per-task writable project workspaces & runtime sandbox caches, and
-        3. Gateway/tunnel credentials & AGY login state (`~/.gemini`, `~/.config/*`).
-
-        Never deletes parent `permissions.deny` rules or weakens `deny > allow` precedence: if a
-        plugin source or `~/.gemini/config/plugins/<name>` discovery path falls under a denied
-        parent rule, validation fails explicitly with a secret-redacted diagnostic.
-        """
-        state = agy_plugins_config_state(self.config)
-        if state.get("config_error"):
-            self._raise_plugin_policy_error(str(state["config_error"]))
-        if not state.get("enabled"):
-            return []
-
-        raw_dirs = list(state.get("raw_dirs") or [])
-        if not raw_dirs:
-            self._raise_plugin_policy_error(
-                "AGY plugins are enabled, but no plugin directories are registered "
-                "(configure 'agy_plugin_dirs' or run 'dots-gateway agy-plugins add <DIR>')"
-            )
-
-        if not self.config.isolate_mount_namespace:
-            self._raise_plugin_policy_error(
-                "AGY plugins require isolate_mount_namespace=True so kernel VFS read-only mounts "
-                "and AGY session permissions stay synchronized"
-            )
-        if not self.config.agy_default_sandbox:
-            self._raise_plugin_policy_error(
-                "AGY plugins require agy_default_sandbox=True so AGY '--sandbox' and '--settings' "
-                "read-only rules stay enforced"
-            )
-        if require_mount_ns_check and not can_use_mount_namespace():
-            self._raise_plugin_policy_error(
-                "AGY plugins require unprivileged Linux user+mount namespaces, "
-                "which are unavailable on this host"
-            )
-
-        home_lex = os.path.abspath(str(Path.home()))
-        try:
-            home_res = str(Path.home().resolve())
-        except OSError:
-            home_res = home_lex
-
-        if os.path.islink(home_lex) or home_lex != home_res:
-            self._raise_plugin_policy_error(
-                f"AGY plugins require a non-symlink HOME directory (got '{home_lex}' -> '{home_res}')"
-            )
-
-        home_covered_by_ws = any(_path_is_within(home_res, r) for r in self._allowed_roots)
-        gem_lex = os.path.join(home_res, ".gemini")
-        if home_covered_by_ws and os.path.islink(gem_lex):
-            self._raise_plugin_policy_error(
-                "AGY plugins forbid symlinked '~/.gemini' when $HOME is covered by allowed_workdirs"
-            )
-        if os.path.islink(gem_lex) and not os.path.exists(gem_lex):
-            self._raise_plugin_policy_error("Dangling symlink at '~/.gemini' is forbidden")
-        if os.path.exists(gem_lex):
-            gem_real = os.path.realpath(gem_lex)
-            for sub_rel, sub_label in (
-                ("config", "~/.gemini/config"),
-                (os.path.join("config", "plugins"), "~/.gemini/config/plugins"),
-            ):
-                sub_cand = os.path.join(gem_real, sub_rel)
-                if os.path.islink(sub_cand):
-                    self._raise_plugin_policy_error(
-                        f"Symlink at '{sub_label}' is forbidden when AGY plugins are enabled"
-                    )
-                if os.path.exists(sub_cand) and not os.path.isdir(sub_cand):
-                    self._raise_plugin_policy_error(
-                        f"'{sub_label}' must be a directory when AGY plugins are enabled"
-                    )
-
+    ) -> Tuple[
+        set[str],
+        Tuple[str, ...],
+        List[Tuple[str, str]],
+        List[Tuple[str, str]],
+    ]:
         forbidden_exact_roots = {
             "/",
             "/bin",
@@ -2302,6 +2458,7 @@ class CommandPolicy:
             ("agy_model_file", "agy_model_file"),
             ("agy_plugins_file", "agy_plugins_file"),
             ("codex_env_file", "codex_env_file"),
+            ("codex_plugins_file", "codex_plugins_file"),
             ("docker_mode_file", "docker_mode_file"),
             ("docker_proxy_socket", "docker_proxy_socket"),
             ("docker_upstream_socket", "docker_upstream_socket"),
@@ -2329,6 +2486,12 @@ class CommandPolicy:
                 _register_boundary(
                     protected_boundaries, os.path.join(h_base, dot_sub), dot_label
                 )
+        if self.config.sandbox_state_dir:
+            _register_boundary(
+                protected_boundaries,
+                os.path.join(str(self.config.sandbox_state_dir), "plugin_bundles"),
+                "sandbox plugin_bundles staging",
+            )
 
         writable_boundaries: List[Tuple[str, str]] = []
         for ws_p in self.config.allowed_workdirs:
@@ -2351,6 +2514,17 @@ class CommandPolicy:
         _register_boundary(
             writable_boundaries, self.config.sandbox_state_dir, "sandbox_state_dir"
         )
+        if self.config.sandbox_state_dir:
+            _register_boundary(
+                writable_boundaries,
+                os.path.join(str(self.config.sandbox_state_dir), "plugin_bundles"),
+                "sandbox plugin_bundles staging",
+            )
+        _register_boundary(
+            writable_boundaries,
+            effective_plugin_state_dir(self.config),
+            "plugin_state_dir",
+        )
         _register_boundary(
             writable_boundaries, "/opt/flutter/bin/cache", "writable SDK cache"
         )
@@ -2366,10 +2540,452 @@ class CommandPolicy:
                     os.path.join(h_base, cache_sub),
                     f"writable toolchain cache (~/{cache_sub})",
                 )
+        return (
+            forbidden_exact_roots,
+            forbidden_system_trees,
+            protected_boundaries,
+            writable_boundaries,
+        )
+
+    def validate_agent_runtime_home_root(
+        self,
+        *,
+        home_lex: str,
+        home_res: str,
+        forbidden_exact_roots: set[str],
+        forbidden_system_trees: Sequence[str],
+        protected_boundaries: Sequence[Tuple[str, str]],
+        writable_boundaries: Sequence[Tuple[str, str]],
+    ) -> str:
+        """Validate `agent_runtime_home_root` (default `/mnt/dots-agent-home`) fail-closed."""
+        raw_rt = str(
+            getattr(self.config, "agent_runtime_home_root", None)
+            or "/mnt/dots-agent-home"
+        ).strip()
+        if not raw_rt or any(ch in raw_rt for ch in ("\x00", "\r", "\n", ")")):
+            self._raise_plugin_policy_error(
+                f"Invalid characters or empty agent_runtime_home_root '{raw_rt}'"
+            )
+        exp_rt = os.path.expanduser(raw_rt)
+        if not exp_rt.startswith("/"):
+            self._raise_plugin_policy_error(
+                f"agent_runtime_home_root '{raw_rt}' must be an absolute path"
+            )
+        rt_root = os.path.abspath(exp_rt)
+        if not re.match(r"^/[A-Za-z0-9._/-]+$", rt_root):
+            self._raise_plugin_policy_error(
+                f"agent_runtime_home_root '{rt_root}' contains unsupported characters; "
+                "only ASCII letters, digits, '.', '_', '-', and '/' are permitted"
+            )
+        if (
+            rt_root in forbidden_exact_roots
+            or _path_is_within(home_lex, rt_root)
+            or _path_is_within(home_res, rt_root)
+        ):
+            self._raise_plugin_policy_error(
+                f"agent_runtime_home_root '{rt_root}' cannot be a top-level system or HOME root"
+            )
+        self._check_no_symlink_ancestors(rt_root, "agent_runtime_home_root")
+        for sys_tree in (*forbidden_system_trees, "/opt", "/var", "/usr", "/srv"):
+            if _paths_overlap_any_direction(rt_root, sys_tree):
+                self._raise_plugin_policy_error(
+                    f"agent_runtime_home_root '{rt_root}' overlaps forbidden or read-only system tree '{sys_tree}'"
+                )
+        for prot_root, prot_label in protected_boundaries:
+            if _paths_overlap_any_direction(rt_root, prot_root):
+                self._raise_plugin_policy_error(
+                    f"agent_runtime_home_root '{rt_root}' overlaps protected {prot_label} ('{prot_root}'); "
+                    "keep agent_runtime_home_root outside protected HOME and credential umbrellas"
+                )
+        for wr_root, wr_label in writable_boundaries:
+            if _paths_overlap_any_direction(rt_root, wr_root):
+                self._raise_plugin_policy_error(
+                    f"agent_runtime_home_root '{rt_root}' overlaps writable {wr_label} ('{wr_root}')"
+                )
+        return rt_root
+
+    def validate_plugin_state_dir(
+        self,
+        *,
+        home_lex: str,
+        home_res: str,
+        rt_root: str,
+        forbidden_exact_roots: set[str],
+        forbidden_system_trees: Sequence[str],
+        protected_boundaries: Sequence[Tuple[str, str]],
+        cwd: Optional[str] = None,
+        add_dirs: Optional[Sequence[str]] = None,
+    ) -> str:
+        """Validate `plugin_state_dir` fail-closed against workspaces, credentials, and plugin code."""
+        raw_st = effective_plugin_state_dir(self.config)
+        if not raw_st or any(ch in raw_st for ch in ("\x00", "\r", "\n", ")")):
+            self._raise_plugin_policy_error(
+                f"Invalid characters or empty plugin_state_dir '{raw_st}'"
+            )
+        exp_st = os.path.expanduser(str(raw_st).strip())
+        if not exp_st.startswith("/"):
+            self._raise_plugin_policy_error(
+                f"plugin_state_dir '{raw_st}' must be an absolute path"
+            )
+        st_dir = os.path.abspath(exp_st)
+        if st_dir in forbidden_exact_roots or st_dir in ("/tmp", "/var/tmp"):
+            self._raise_plugin_policy_error(
+                f"plugin_state_dir '{st_dir}' cannot be a top-level system, temp, or HOME root"
+            )
+        self._check_no_symlink_ancestors(st_dir, "plugin_state_dir")
+        if os.path.lexists(st_dir):
+            try:
+                st_info = os.lstat(st_dir)
+            except OSError as exc:
+                self._raise_plugin_policy_error(
+                    f"Cannot inspect plugin_state_dir '{st_dir}': {exc}"
+                )
+            if stat.S_ISLNK(st_info.st_mode) or not stat.S_ISDIR(st_info.st_mode):
+                self._raise_plugin_policy_error(
+                    f"plugin_state_dir '{st_dir}' must be a regular non-symlink directory"
+                )
+            if st_info.st_mode & 0o002:
+                self._raise_plugin_policy_error(
+                    f"plugin_state_dir '{st_dir}' must not be world-writable"
+                )
+            if hasattr(os, "getuid") and st_info.st_uid not in (os.getuid(), 0):
+                self._raise_plugin_policy_error(
+                    f"plugin_state_dir '{st_dir}' is owned by untrusted uid {st_info.st_uid}"
+                )
+        if _paths_overlap_any_direction(st_dir, rt_root):
+            self._raise_plugin_policy_error(
+                f"plugin_state_dir '{st_dir}' cannot overlap agent_runtime_home_root '{rt_root}'"
+            )
+        for sys_tree in forbidden_system_trees:
+            if sys_tree in ("/tmp", "/var/tmp"):
+                continue
+            if _paths_overlap_any_direction(st_dir, sys_tree):
+                self._raise_plugin_policy_error(
+                    f"plugin_state_dir '{st_dir}' overlaps forbidden system/SDK path '{sys_tree}'"
+                )
+        for prot_root, prot_label in protected_boundaries:
+            # Allow default `~/.cache/dots-sandbox/plugin_state` when broad `$HOME` is in `protected_paths`
+            # unless `home_covered` by `allowed_workdirs` (workspace check below still rejects workspace overlap).
+            if prot_root in (home_lex, home_res) and st_dir not in (home_lex, home_res):
+                continue
+            if _paths_overlap_any_direction(st_dir, prot_root):
+                self._raise_plugin_policy_error(
+                    f"plugin_state_dir '{st_dir}' overlaps protected {prot_label} ('{prot_root}')"
+                )
+
+        ws_candidates: List[str] = [
+            *self._allowed_roots,
+            *[
+                os.path.abspath(os.path.expanduser(str(x)))
+                for x in (
+                    *self.config.agy_extra_workspace_dirs,
+                    *self.config.codex_extra_writable_roots,
+                    *self.config.docker_extra_bind_roots,
+                )
+                if str(x).strip()
+            ],
+        ]
+        if self.config.default_workdir:
+            ws_candidates.append(
+                os.path.abspath(os.path.expanduser(str(self.config.default_workdir)))
+            )
+        if cwd:
+            ws_candidates.append(os.path.abspath(os.path.expanduser(str(cwd))))
+        if add_dirs:
+            for ad in add_dirs:
+                ws_candidates.append(os.path.abspath(os.path.expanduser(str(ad))))
+        for ws_c in ws_candidates:
+            if ws_c in (home_lex, home_res):
+                continue
+            if _paths_overlap_any_direction(st_dir, ws_c):
+                self._raise_plugin_policy_error(
+                    f"plugin_state_dir '{st_dir}' overlaps project workspace '{ws_c}'; "
+                    "keep plugin runtime state separate from task workspaces"
+                )
+        return st_dir
+
+    def _validate_plugin_source_directory_tree(
+        self,
+        raw_dir: str,
+        *,
+        agent_label: str,
+        home_lex: str,
+        home_res: str,
+        rt_root: str,
+        st_dir: str,
+        forbidden_exact_roots: set[str],
+        forbidden_system_trees: Sequence[str],
+        protected_boundaries: Sequence[Tuple[str, str]],
+        writable_boundaries: Sequence[Tuple[str, str]],
+        allow_internal_symlinks: bool = True,
+    ) -> str:
+        if any(ch in raw_dir for ch in ("\x00", "\r", "\n", ")")):
+            self._raise_plugin_policy_error(
+                f"Invalid characters in registered {agent_label} plugin path '{raw_dir}'"
+            )
+        expanded = os.path.expanduser(raw_dir.strip())
+        if not expanded.startswith("/"):
+            self._raise_plugin_policy_error(
+                f"Registered {agent_label} plugin path '{raw_dir}' must be an absolute path"
+            )
+        source_dir = os.path.abspath(expanded)
+
+        if (
+            source_dir in forbidden_exact_roots
+            or _path_is_within(home_lex, source_dir)
+            or _path_is_within(home_res, source_dir)
+        ):
+            self._raise_plugin_policy_error(
+                f"Registered {agent_label} plugin path '{source_dir}' cannot be a top-level system or HOME root"
+            )
+
+        if os.path.islink(source_dir):
+            self._raise_plugin_policy_error(
+                f"Registered {agent_label} plugin path '{source_dir}' must be a real directory, not a symlink"
+            )
+        try:
+            st_src = os.lstat(source_dir)
+        except FileNotFoundError:
+            self._raise_plugin_policy_error(
+                f"Registered {agent_label} plugin directory '{source_dir}' does not exist"
+            )
+        except OSError as exc:
+            self._raise_plugin_policy_error(
+                f"Cannot stat registered {agent_label} plugin directory '{source_dir}': {exc}"
+            )
+
+        if stat.S_ISLNK(st_src.st_mode) or not stat.S_ISDIR(st_src.st_mode):
+            self._raise_plugin_policy_error(
+                f"Registered {agent_label} plugin path '{source_dir}' is not a directory"
+            )
+        if os.path.realpath(source_dir) != source_dir:
+            self._raise_plugin_policy_error(
+                f"Registered {agent_label} plugin path '{source_dir}' traverses a symlinked parent directory "
+                f"(resolves to '{os.path.realpath(source_dir)}'); use the canonical directory path"
+            )
+        if st_src.st_mode & 0o002:
+            self._raise_plugin_policy_error(
+                f"Registered {agent_label} plugin directory '{source_dir}' must not be world-writable"
+            )
+        if hasattr(os, "getuid") and st_src.st_uid not in (os.getuid(), 0):
+            self._raise_plugin_policy_error(
+                f"Registered {agent_label} plugin directory '{source_dir}' is owned by untrusted uid {st_src.st_uid}"
+            )
+        if not os.access(source_dir, os.R_OK | os.X_OK):
+            self._raise_plugin_policy_error(
+                f"Registered {agent_label} plugin directory '{source_dir}' is not readable/traversable by gateway user"
+            )
+
+        for sys_tree in forbidden_system_trees:
+            if _paths_overlap_any_direction(source_dir, sys_tree):
+                self._raise_plugin_policy_error(
+                    f"Registered {agent_label} plugin directory '{source_dir}' overlaps forbidden system/temp/SDK path '{sys_tree}'"
+                )
+
+        for prot_root, prot_label in protected_boundaries:
+            # When broad `$HOME` itself is in `protected_paths`, every credential/gateway/login
+            # subdirectory (`~/gateway`, `~/.config`, `~/.gemini`, `~/.codex`, `~/.ssh`, `~/.local`,
+            # etc.) and every explicit non-`$HOME` umbrella path is still enforced individually
+            # in `protected_boundaries`, while plugin discovery runs outside `$HOME` under
+            # `agent_runtime_home_root` without weakening `read_file($HOME)` in `permissions.deny`.
+            if prot_root in (home_lex, home_res) and source_dir not in (home_lex, home_res):
+                continue
+            if _paths_overlap_any_direction(source_dir, prot_root):
+                self._raise_plugin_policy_error(
+                    f"Registered {agent_label} plugin directory '{source_dir}' overlaps protected {prot_label} "
+                    f"('{prot_root}'); separate plugin resources from gateway/tunnel secrets and login state"
+                )
+
+        for wr_root, wr_label in [
+            *writable_boundaries,
+            (rt_root, "agent_runtime_home_root"),
+            (st_dir, "plugin_state_dir"),
+        ]:
+            if _paths_overlap_any_direction(source_dir, wr_root):
+                self._raise_plugin_policy_error(
+                    f"Registered {agent_label} plugin directory '{source_dir}' overlaps writable {wr_label} "
+                    f"('{wr_root}'); plugin resources must stay strictly read-only and disjoint from workspaces/caches"
+                )
+
+        entry_count = 0
+        max_entries = 20000
+        for walk_root, dirnames, filenames in os.walk(
+            source_dir, topdown=True, followlinks=False
+        ):
+            for entry_name in list(dirnames) + list(filenames):
+                entry_count += 1
+                if entry_count > max_entries:
+                    self._raise_plugin_policy_error(
+                        f"{agent_label} plugin directory '{source_dir}' exceeds maximum file count ({max_entries})"
+                    )
+                entry_full = os.path.join(walk_root, entry_name)
+                try:
+                    est = os.lstat(entry_full)
+                except OSError as exc:
+                    self._raise_plugin_policy_error(
+                        f"Cannot inspect plugin entry '{entry_full}': {exc}"
+                    )
+                if stat.S_ISLNK(est.st_mode):
+                    if not allow_internal_symlinks:
+                        self._raise_plugin_policy_error(
+                            f"Symlink '{entry_full}' inside {agent_label} plugin '{source_dir}' is forbidden "
+                            "(Codex plugin content hash verification rejects symlinks)"
+                        )
+                    if not os.path.exists(entry_full):
+                        self._raise_plugin_policy_error(
+                            f"Dangling symlink '{entry_full}' inside {agent_label} plugin '{source_dir}' is forbidden"
+                        )
+                    target_real = os.path.realpath(entry_full)
+                    if not _path_is_within(target_real, source_dir):
+                        self._raise_plugin_policy_error(
+                            f"Symlink '{entry_full}' inside {agent_label} plugin '{source_dir}' escapes to "
+                            f"'{target_real}', which is forbidden by security policy"
+                        )
+                elif stat.S_ISREG(est.st_mode):
+                    if est.st_mode & 0o002:
+                        self._raise_plugin_policy_error(
+                            f"World-writable file '{entry_full}' inside {agent_label} plugin '{source_dir}' is forbidden"
+                        )
+                    if est.st_mode & (stat.S_ISUID | stat.S_ISGID):
+                        self._raise_plugin_policy_error(
+                            f"Setuid/setgid file '{entry_full}' inside {agent_label} plugin '{source_dir}' is forbidden"
+                        )
+                elif stat.S_ISDIR(est.st_mode):
+                    if est.st_mode & 0o002:
+                        self._raise_plugin_policy_error(
+                            f"World-writable subdirectory '{entry_full}' inside {agent_label} plugin '{source_dir}' is forbidden"
+                        )
+                else:
+                    self._raise_plugin_policy_error(
+                        f"Special device/socket/FIFO '{entry_full}' inside {agent_label} plugin '{source_dir}' is forbidden"
+                    )
+        return source_dir
+
+    def validate_agy_plugins(
+        self,
+        cwd: Optional[str] = None,
+        add_dirs: Optional[Sequence[str]] = None,
+        require_mount_ns_check: bool = False,
+    ) -> List[ValidatedAgyPlugin]:
+        """Validate operator-registered AGY plugin directories fail-closed.
+
+        Enforces strict separation between:
+        1. Read-only plugin resources (`skills/`, `hooks/`, `rules/`, scripts, `plugin.json`),
+        2. Per-task writable project workspaces & isolated plugin runtime state, and
+        3. Gateway/tunnel credentials & AGY login state (`~/.gemini`, `~/.config/*`, or broad `HOME`).
+
+        Plugin discovery runs inside `agent_runtime_home_root/agy/.gemini/config/plugins/<name>`
+        so parent `permissions.deny` rules on `$HOME` or credential directories are never deleted
+        or weakened, and native hooks are validated for mandatory hook-jail wrapping.
+        """
+        state = agy_plugins_config_state(self.config)
+        if state.get("config_error"):
+            self._raise_plugin_policy_error(str(state["config_error"]))
+        if not state.get("enabled"):
+            return []
+
+        raw_dirs = list(state.get("raw_dirs") or [])
+        if not raw_dirs:
+            self._raise_plugin_policy_error(
+                "AGY plugins are enabled, but no plugin directories are registered "
+                "(configure 'agy_plugin_dirs' or run 'dots-gateway agy-plugins add <DIR>')"
+            )
+
+        if not self.config.isolate_mount_namespace:
+            self._raise_plugin_policy_error(
+                "AGY plugins require isolate_mount_namespace=True so kernel VFS read-only mounts "
+                "and AGY session permissions stay synchronized"
+            )
+        if not self.config.agy_default_sandbox:
+            self._raise_plugin_policy_error(
+                "AGY plugins require agy_default_sandbox=True so AGY '--sandbox' and '--settings' "
+                "read-only rules stay enforced"
+            )
+        if require_mount_ns_check and not can_use_mount_namespace():
+            self._raise_plugin_policy_error(
+                "AGY plugins require unprivileged Linux user+mount namespaces, "
+                "which are unavailable on this host"
+            )
+
+        home_lex = os.path.abspath(str(Path.home()))
+        try:
+            home_res = str(Path.home().resolve())
+        except OSError:
+            home_res = home_lex
+
+        if os.path.islink(home_lex) or home_lex != home_res:
+            self._raise_plugin_policy_error(
+                f"AGY plugins require a non-symlink HOME directory (got '{home_lex}' -> '{home_res}')"
+            )
+
+        home_covered_by_ws = any(_path_is_within(home_res, r) for r in self._allowed_roots)
+        gem_lex = os.path.join(home_res, ".gemini")
+        if home_covered_by_ws and os.path.islink(gem_lex):
+            self._raise_plugin_policy_error(
+                "AGY plugins forbid symlinked '~/.gemini' when $HOME is covered by allowed_workdirs"
+            )
+        if os.path.islink(gem_lex) and not os.path.exists(gem_lex):
+            self._raise_plugin_policy_error("Dangling symlink at '~/.gemini' is forbidden")
+        if os.path.exists(gem_lex):
+            gem_real = os.path.realpath(gem_lex)
+            for sub_rel, sub_label in (
+                ("config", "~/.gemini/config"),
+                (os.path.join("config", "plugins"), "~/.gemini/config/plugins"),
+                ("antigravity-cli", "~/.gemini/antigravity-cli"),
+            ):
+                sub_cand = os.path.join(gem_real, sub_rel)
+                if os.path.islink(sub_cand):
+                    self._raise_plugin_policy_error(
+                        f"Symlink at '{sub_label}' is forbidden when AGY plugins are enabled"
+                    )
+                if os.path.exists(sub_cand) and not os.path.isdir(sub_cand):
+                    self._raise_plugin_policy_error(
+                        f"'{sub_label}' must be a directory when AGY plugins are enabled"
+                    )
+
+        (
+            forbidden_exact_roots,
+            forbidden_system_trees,
+            protected_boundaries,
+            writable_boundaries,
+        ) = self._build_plugin_boundary_sets(
+            home_lex=home_lex, home_res=home_res, cwd=cwd, add_dirs=add_dirs
+        )
+        rt_root = self.validate_agent_runtime_home_root(
+            home_lex=home_lex,
+            home_res=home_res,
+            forbidden_exact_roots=forbidden_exact_roots,
+            forbidden_system_trees=forbidden_system_trees,
+            protected_boundaries=protected_boundaries,
+            writable_boundaries=writable_boundaries,
+        )
+        st_dir = self.validate_plugin_state_dir(
+            home_lex=home_lex,
+            home_res=home_res,
+            rt_root=rt_root,
+            forbidden_exact_roots=forbidden_exact_roots,
+            forbidden_system_trees=forbidden_system_trees,
+            protected_boundaries=protected_boundaries,
+            cwd=cwd,
+            add_dirs=add_dirs,
+        )
 
         settings_deny_rules: List[str] = []
-        settings_path = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
-        if settings_path.exists() or settings_path.is_symlink():
+        cli_dir = Path.home() / ".gemini" / "antigravity-cli"
+        if cli_dir.is_symlink():
+            self._raise_plugin_policy_error(
+                f"Symlinked AGY settings directory '{cli_dir}' is forbidden"
+            )
+        settings_path = cli_dir / "settings.json"
+        if settings_path.is_symlink():
+            self._raise_plugin_policy_error(
+                f"Symlinked AGY settings file '{settings_path}' is forbidden"
+            )
+        if settings_path.exists():
+            if not settings_path.is_file():
+                self._raise_plugin_policy_error(
+                    f"AGY settings path '{settings_path}' must be a regular file"
+                )
             try:
                 raw_settings = json.loads(settings_path.read_text(encoding="utf-8"))
             except Exception as exc:
@@ -2381,7 +2997,10 @@ class CommandPolicy:
             ):
                 raw_deny = raw_settings["permissions"].get("deny")
                 if isinstance(raw_deny, list):
-                    settings_deny_rules = [str(x) for x in raw_deny]
+                    settings_deny_rules = [
+                        _expand_host_tilde_in_agy_rule(str(x), home_res)
+                        for x in raw_deny
+                    ]
 
         effective_deny_rules = list(self.get_agy_denied_rules())
         for s_rule in settings_deny_rules:
@@ -2397,7 +3016,15 @@ class CommandPolicy:
             if not raw_dp:
                 continue
             try:
-                dp_exp = os.path.expanduser(raw_dp)
+                dp_exp = (
+                    home_res
+                    if raw_dp == "~"
+                    else (
+                        os.path.join(home_res, raw_dp[2:])
+                        if raw_dp.startswith("~/")
+                        else os.path.expanduser(raw_dp)
+                    )
+                )
                 dp_lex = os.path.abspath(dp_exp)
                 denied_read_paths.append((dp_lex, rule))
                 if os.path.exists(dp_exp):
@@ -2411,80 +3038,18 @@ class CommandPolicy:
         seen_names: Dict[str, str] = {}
 
         for raw_dir in raw_dirs:
-            if any(ch in raw_dir for ch in ("\x00", "\r", "\n", ")")):
-                self._raise_plugin_policy_error(
-                    f"Invalid characters in registered AGY plugin path '{raw_dir}'"
-                )
-            expanded = os.path.expanduser(raw_dir.strip())
-            if not expanded.startswith("/"):
-                self._raise_plugin_policy_error(
-                    f"Registered AGY plugin path '{raw_dir}' must be an absolute path"
-                )
-            source_dir = os.path.abspath(expanded)
-
-            if source_dir in forbidden_exact_roots or _path_is_within(
-                home_lex, source_dir
-            ) or _path_is_within(home_res, source_dir):
-                self._raise_plugin_policy_error(
-                    f"Registered AGY plugin path '{source_dir}' cannot be a top-level system or HOME root"
-                )
-
-            if os.path.islink(source_dir):
-                self._raise_plugin_policy_error(
-                    f"Registered AGY plugin path '{source_dir}' must be a real directory, not a symlink"
-                )
-            try:
-                st_src = os.lstat(source_dir)
-            except FileNotFoundError:
-                self._raise_plugin_policy_error(
-                    f"Registered AGY plugin directory '{source_dir}' does not exist"
-                )
-            except OSError as exc:
-                self._raise_plugin_policy_error(
-                    f"Cannot stat registered AGY plugin directory '{source_dir}': {exc}"
-                )
-
-            if stat.S_ISLNK(st_src.st_mode) or not stat.S_ISDIR(st_src.st_mode):
-                self._raise_plugin_policy_error(
-                    f"Registered AGY plugin path '{source_dir}' is not a directory"
-                )
-            if os.path.realpath(source_dir) != source_dir:
-                self._raise_plugin_policy_error(
-                    f"Registered AGY plugin path '{source_dir}' traverses a symlinked parent directory "
-                    f"(resolves to '{os.path.realpath(source_dir)}'); use the canonical directory path"
-                )
-            if st_src.st_mode & 0o002:
-                self._raise_plugin_policy_error(
-                    f"Registered AGY plugin directory '{source_dir}' must not be world-writable"
-                )
-            if hasattr(os, "getuid") and st_src.st_uid not in (os.getuid(), 0):
-                self._raise_plugin_policy_error(
-                    f"Registered AGY plugin directory '{source_dir}' is owned by untrusted uid {st_src.st_uid}"
-                )
-            if not os.access(source_dir, os.R_OK | os.X_OK):
-                self._raise_plugin_policy_error(
-                    f"Registered AGY plugin directory '{source_dir}' is not readable/traversable by gateway user"
-                )
-
-            for sys_tree in forbidden_system_trees:
-                if _paths_overlap_any_direction(source_dir, sys_tree):
-                    self._raise_plugin_policy_error(
-                        f"Registered AGY plugin directory '{source_dir}' overlaps forbidden system/temp/SDK path '{sys_tree}'"
-                    )
-
-            for prot_root, prot_label in protected_boundaries:
-                if _paths_overlap_any_direction(source_dir, prot_root):
-                    self._raise_plugin_policy_error(
-                        f"Registered AGY plugin directory '{source_dir}' overlaps protected {prot_label} "
-                        f"('{prot_root}'); separate plugin resources from gateway/tunnel secrets and login state"
-                    )
-
-            for wr_root, wr_label in writable_boundaries:
-                if _paths_overlap_any_direction(source_dir, wr_root):
-                    self._raise_plugin_policy_error(
-                        f"Registered AGY plugin directory '{source_dir}' overlaps writable {wr_label} "
-                        f"('{wr_root}'); plugin resources must stay strictly read-only and disjoint from workspaces/caches"
-                    )
+            source_dir = self._validate_plugin_source_directory_tree(
+                raw_dir,
+                agent_label="AGY",
+                home_lex=home_lex,
+                home_res=home_res,
+                rt_root=rt_root,
+                st_dir=st_dir,
+                forbidden_exact_roots=forbidden_exact_roots,
+                forbidden_system_trees=forbidden_system_trees,
+                protected_boundaries=protected_boundaries,
+                writable_boundaries=writable_boundaries,
+            )
 
             dir_base = os.path.basename(source_dir)
             if not _SAFE_AGY_PLUGIN_NAME_RE.match(dir_base):
@@ -2531,9 +3096,23 @@ class CommandPolicy:
                             f"Invalid 'name' field in '{manifest_path}'"
                         )
                     plugin_name = raw_mname.strip()
+                raw_hooks_ref = manifest_data.get("hooks")
+                if raw_hooks_ref is not None:
+                    if not isinstance(raw_hooks_ref, str) or os.path.normpath(
+                        raw_hooks_ref.strip()
+                    ) not in ("hooks.json", os.path.join("hooks", "hooks.json")):
+                        self._raise_plugin_policy_error(
+                            f"Unsupported 'hooks' path '{raw_hooks_ref}' in '{manifest_path}'; "
+                            "must be './hooks.json' or './hooks/hooks.json'"
+                        )
                 manifest_label = "plugin.json"
 
-            has_hooks_json = os.path.isfile(os.path.join(source_dir, "hooks.json"))
+            hooks_relpath: Optional[str] = None
+            if os.path.isfile(os.path.join(source_dir, "hooks.json")):
+                hooks_relpath = "hooks.json"
+            elif os.path.isfile(os.path.join(source_dir, "hooks", "hooks.json")):
+                hooks_relpath = os.path.join("hooks", "hooks.json")
+            has_hooks_json = hooks_relpath is not None
             has_component_dir = any(
                 os.path.isdir(os.path.join(source_dir, comp))
                 for comp in ("skills", "hooks", "rules")
@@ -2555,72 +3134,40 @@ class CommandPolicy:
                         f"Registered AGY plugin directories '{prev.source_dir}' and '{source_dir}' overlap"
                     )
 
-            entry_count = 0
-            max_entries = 20000
-            for walk_root, dirnames, filenames in os.walk(
-                source_dir, topdown=True, followlinks=False
-            ):
-                for entry_name in list(dirnames) + list(filenames):
-                    entry_count += 1
-                    if entry_count > max_entries:
-                        self._raise_plugin_policy_error(
-                            f"AGY plugin directory '{source_dir}' exceeds maximum file count ({max_entries})"
-                        )
-                    entry_full = os.path.join(walk_root, entry_name)
-                    try:
-                        est = os.lstat(entry_full)
-                    except OSError as exc:
-                        self._raise_plugin_policy_error(
-                            f"Cannot inspect plugin entry '{entry_full}': {exc}"
-                        )
-                    if stat.S_ISLNK(est.st_mode):
-                        if not os.path.exists(entry_full):
-                            self._raise_plugin_policy_error(
-                                f"Dangling symlink '{entry_full}' inside AGY plugin '{source_dir}' is forbidden"
-                            )
-                        target_real = os.path.realpath(entry_full)
-                        if not _path_is_within(target_real, source_dir):
-                            self._raise_plugin_policy_error(
-                                f"Symlink '{entry_full}' inside AGY plugin '{source_dir}' escapes to "
-                                f"'{target_real}', which is forbidden by security policy"
-                            )
-                    elif stat.S_ISREG(est.st_mode):
-                        if est.st_mode & 0o002:
-                            self._raise_plugin_policy_error(
-                                f"World-writable file '{entry_full}' inside AGY plugin '{source_dir}' is forbidden"
-                            )
-                        if est.st_mode & (stat.S_ISUID | stat.S_ISGID):
-                            self._raise_plugin_policy_error(
-                                f"Setuid/setgid file '{entry_full}' inside AGY plugin '{source_dir}' is forbidden"
-                            )
-                    elif stat.S_ISDIR(est.st_mode):
-                        if est.st_mode & 0o002:
-                            self._raise_plugin_policy_error(
-                                f"World-writable subdirectory '{entry_full}' inside AGY plugin '{source_dir}' is forbidden"
-                            )
-                    else:
-                        self._raise_plugin_policy_error(
-                            f"Special device/socket/FIFO '{entry_full}' inside AGY plugin '{source_dir}' is forbidden"
-                        )
-
             vfs_discovery_dir = os.path.join(
-                home_res, ".gemini", "config", "plugins", plugin_name
+                rt_root, "agy", ".gemini", "config", "plugins", plugin_name
             )
             if ")" in vfs_discovery_dir:
                 self._raise_plugin_policy_error(
                     f"AGY plugin discovery path '{vfs_discovery_dir}' contains unsupported ')' character"
                 )
 
+            for hooks_cand_rel in ("hooks.json", os.path.join("hooks", "hooks.json")):
+                hooks_cand_full = Path(source_dir) / hooks_cand_rel
+                if hooks_cand_full.exists() or hooks_cand_full.is_symlink():
+                    try:
+                        validate_plugin_hooks_manifest(
+                            hooks_cand_full,
+                            agent="agy",
+                            plugin_name=plugin_name,
+                            source_dir=source_dir,
+                            vfs_discovery_dir=vfs_discovery_dir,
+                        )
+                    except Exception as exc:
+                        self._raise_plugin_policy_error(str(exc))
+
             for denied_p, deny_rule in denied_read_paths:
+                if _path_is_within(vfs_discovery_dir, denied_p):
+                    self._raise_plugin_policy_error(
+                        f"AGY plugin discovery path '{vfs_discovery_dir}' is blocked by parent permissions.deny "
+                        f"rule '{deny_rule}'; configure 'agent_runtime_home_root' outside denied paths"
+                    )
+                if denied_p in (home_lex, home_res) and source_dir not in (home_lex, home_res):
+                    continue
                 if _paths_overlap_any_direction(source_dir, denied_p):
                     self._raise_plugin_policy_error(
                         f"AGY plugin '{source_dir}' conflicts with permissions.deny rule '{deny_rule}' "
                         "(deny takes precedence over allow in AGY; move plugin resources outside protected parent directories)"
-                    )
-                if _path_is_within(vfs_discovery_dir, denied_p):
-                    self._raise_plugin_policy_error(
-                        f"AGY plugin discovery path '{vfs_discovery_dir}' is blocked by parent permissions.deny "
-                        f"rule '{deny_rule}'; remove the broad HOME umbrella from protected_paths and protect specific credential directories instead"
                     )
 
             seen_names[plugin_name] = source_dir
@@ -2630,6 +3177,7 @@ class CommandPolicy:
                     source_dir=source_dir,
                     vfs_discovery_dir=vfs_discovery_dir,
                     manifest=manifest_label,
+                    hooks_relpath=hooks_relpath,
                 )
             )
 
@@ -2640,6 +3188,13 @@ class CommandPolicy:
         state = agy_plugins_config_state(self.config)
         plugins_file_display = redact_diagnostic_text(
             str(self.config.agy_plugins_file or ""), self.config
+        )
+        rt_display = redact_diagnostic_text(
+            str(self.config.agent_runtime_home_root or "/mnt/dots-agent-home"),
+            self.config,
+        )
+        state_dir_display = redact_diagnostic_text(
+            effective_plugin_state_dir(self.config), self.config
         )
         enabled = bool(state.get("enabled"))
         configured = bool(state.get("configured"))
@@ -2655,6 +3210,8 @@ class CommandPolicy:
                 "configured": True,
                 "source": source,
                 "plugins_file": plugins_file_display,
+                "agent_runtime_home_root": rt_display,
+                "plugin_state_dir": state_dir_display,
                 "configured_dirs": raw_dirs,
                 "valid": False,
                 "status": "error",
@@ -2668,6 +3225,8 @@ class CommandPolicy:
                 "configured": configured,
                 "source": source,
                 "plugins_file": plugins_file_display,
+                "agent_runtime_home_root": rt_display,
+                "plugin_state_dir": state_dir_display,
                 "configured_dirs": raw_dirs,
                 "valid": True,
                 "status": "disabled",
@@ -2683,6 +3242,8 @@ class CommandPolicy:
                 "configured": True,
                 "source": source,
                 "plugins_file": plugins_file_display,
+                "agent_runtime_home_root": rt_display,
+                "plugin_state_dir": state_dir_display,
                 "configured_dirs": raw_dirs,
                 "valid": False,
                 "status": "error",
@@ -2695,8 +3256,11 @@ class CommandPolicy:
             "configured": True,
             "source": source,
             "plugins_file": plugins_file_display,
+            "agent_runtime_home_root": rt_display,
+            "plugin_state_dir": state_dir_display,
             "configured_dirs": raw_dirs,
             "mount_namespace_available": bool(can_use_mount_namespace()),
+            "hook_jail_enforced": True,
             "valid": True,
             "status": "active",
             "plugins": [
@@ -2706,6 +3270,359 @@ class CommandPolicy:
                     "vfs_discovery_dir": redact_diagnostic_text(
                         p.vfs_discovery_dir, self.config
                     ),
+                    "manifest": p.manifest,
+                    "mode": "ro",
+                }
+                for p in validated
+            ],
+            "error": None,
+        }
+
+    def validate_codex_plugins(
+        self,
+        cwd: Optional[str] = None,
+        add_dirs: Optional[Sequence[str]] = None,
+        require_mount_ns_check: bool = False,
+    ) -> List[ValidatedCodexPlugin]:
+        """Validate operator-registered Codex plugin directories fail-closed."""
+        state = codex_plugins_config_state(self.config)
+        if state.get("config_error"):
+            self._raise_plugin_policy_error(str(state["config_error"]))
+        if not state.get("enabled"):
+            return []
+
+        raw_dirs = list(state.get("raw_dirs") or [])
+        if not raw_dirs:
+            self._raise_plugin_policy_error(
+                "Codex plugins are enabled, but no plugin directories are registered "
+                "(configure 'codex_plugin_dirs' or run 'dots-gateway codex-plugins add <DIR>')"
+            )
+
+        if not self.config.isolate_mount_namespace:
+            self._raise_plugin_policy_error(
+                "Codex plugins require isolate_mount_namespace=True so kernel VFS read-only mounts "
+                "and Codex hook-jail sandboxing stay enforced"
+            )
+        if self.config.codex_default_sandbox not in ("read-only", "workspace-write"):
+            self._raise_plugin_policy_error(
+                f"Codex plugins require codex_default_sandbox in ('read-only', 'workspace-write'), "
+                f"got '{self.config.codex_default_sandbox}'"
+            )
+        if require_mount_ns_check and not can_use_mount_namespace():
+            self._raise_plugin_policy_error(
+                "Codex plugins require unprivileged Linux user+mount namespaces, "
+                "which are unavailable on this host"
+            )
+
+        home_lex = os.path.abspath(str(Path.home()))
+        try:
+            home_res = str(Path.home().resolve())
+        except OSError:
+            home_res = home_lex
+
+        if os.path.islink(home_lex) or home_lex != home_res:
+            self._raise_plugin_policy_error(
+                f"Codex plugins require a non-symlink HOME directory (got '{home_lex}' -> '{home_res}')"
+            )
+
+        codex_home_lex = os.path.join(home_res, ".codex")
+        if os.path.islink(codex_home_lex):
+            self._raise_plugin_policy_error(
+                "Codex plugins forbid symlinked '~/.codex'"
+            )
+
+        (
+            forbidden_exact_roots,
+            forbidden_system_trees,
+            protected_boundaries,
+            writable_boundaries,
+        ) = self._build_plugin_boundary_sets(
+            home_lex=home_lex, home_res=home_res, cwd=cwd, add_dirs=add_dirs
+        )
+        rt_root = self.validate_agent_runtime_home_root(
+            home_lex=home_lex,
+            home_res=home_res,
+            forbidden_exact_roots=forbidden_exact_roots,
+            forbidden_system_trees=forbidden_system_trees,
+            protected_boundaries=protected_boundaries,
+            writable_boundaries=writable_boundaries,
+        )
+        st_dir = self.validate_plugin_state_dir(
+            home_lex=home_lex,
+            home_res=home_res,
+            rt_root=rt_root,
+            forbidden_exact_roots=forbidden_exact_roots,
+            forbidden_system_trees=forbidden_system_trees,
+            protected_boundaries=protected_boundaries,
+            cwd=cwd,
+            add_dirs=add_dirs,
+        )
+
+        validated: List[ValidatedCodexPlugin] = []
+        seen_names: Dict[str, str] = {}
+
+        for raw_dir in raw_dirs:
+            source_dir = self._validate_plugin_source_directory_tree(
+                raw_dir,
+                agent_label="Codex",
+                home_lex=home_lex,
+                home_res=home_res,
+                rt_root=rt_root,
+                st_dir=st_dir,
+                forbidden_exact_roots=forbidden_exact_roots,
+                forbidden_system_trees=forbidden_system_trees,
+                protected_boundaries=protected_boundaries,
+                writable_boundaries=writable_boundaries,
+                allow_internal_symlinks=False,
+            )
+
+            dir_base = os.path.basename(source_dir)
+            if not _SAFE_AGY_PLUGIN_NAME_RE.match(dir_base):
+                self._raise_plugin_policy_error(
+                    f"Invalid Codex plugin directory name '{dir_base}' at '{source_dir}'"
+                )
+
+            plugin_name = dir_base
+            plugin_version = "local"
+            manifest_label = ""
+
+            codex_manifest_p = Path(source_dir) / ".codex-plugin" / "plugin.json"
+            fallback_manifest_p = Path(source_dir) / "plugin.json"
+            active_manifest_p: Optional[Path] = None
+            if codex_manifest_p.exists() or codex_manifest_p.is_symlink():
+                active_manifest_p = codex_manifest_p
+                manifest_label = ".codex-plugin/plugin.json"
+            elif fallback_manifest_p.exists() or fallback_manifest_p.is_symlink():
+                active_manifest_p = fallback_manifest_p
+                manifest_label = "plugin.json"
+
+            if active_manifest_p is not None:
+                mst = os.lstat(active_manifest_p)
+                if stat.S_ISLNK(mst.st_mode) or not stat.S_ISREG(mst.st_mode):
+                    self._raise_plugin_policy_error(
+                        f"Codex plugin manifest '{active_manifest_p}' must be a regular non-symlink file"
+                    )
+                try:
+                    m_data = json.loads(active_manifest_p.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    self._raise_plugin_policy_error(
+                        f"Invalid JSON in Codex plugin manifest '{active_manifest_p}': {exc}"
+                    )
+                if not isinstance(m_data, dict):
+                    self._raise_plugin_policy_error(
+                        f"Codex plugin manifest '{active_manifest_p}' must contain a JSON object"
+                    )
+                if m_data.get("disabled") is True:
+                    self._raise_plugin_policy_error(
+                        f"Codex plugin '{source_dir}' has 'disabled: true' in '{manifest_label}'"
+                    )
+                raw_mname = m_data.get("name")
+                if raw_mname is not None:
+                    if not isinstance(raw_mname, str) or not _SAFE_AGY_PLUGIN_NAME_RE.match(
+                        raw_mname.strip()
+                    ):
+                        self._raise_plugin_policy_error(
+                            f"Invalid 'name' field in '{active_manifest_p}'"
+                        )
+                    plugin_name = raw_mname.strip()
+                raw_ver = m_data.get("version")
+                if raw_ver is not None:
+                    if not isinstance(raw_ver, str) or not _SAFE_CODEX_VERSION_RE.match(
+                        raw_ver.strip()
+                    ):
+                        self._raise_plugin_policy_error(
+                            f"Invalid 'version' field in '{active_manifest_p}'"
+                        )
+                    plugin_version = raw_ver.strip()
+                raw_hooks_ref = m_data.get("hooks")
+                if raw_hooks_ref is not None:
+                    if not isinstance(raw_hooks_ref, str) or os.path.normpath(
+                        raw_hooks_ref.strip()
+                    ) not in (os.path.join("hooks", "hooks.json"), "hooks.json"):
+                        self._raise_plugin_policy_error(
+                            f"Unsupported 'hooks' path '{raw_hooks_ref}' in '{active_manifest_p}'; "
+                            "must be './hooks/hooks.json' or './hooks.json'"
+                        )
+
+            marketplace_name = f"dots-gateway-{plugin_name}"[:64]
+            mkt_manifest_p = Path(source_dir) / ".agents" / "plugins" / "marketplace.json"
+            if mkt_manifest_p.exists() or mkt_manifest_p.is_symlink():
+                mk_st = os.lstat(mkt_manifest_p)
+                if stat.S_ISLNK(mk_st.st_mode) or not stat.S_ISREG(mk_st.st_mode):
+                    self._raise_plugin_policy_error(
+                        f"Codex marketplace manifest '{mkt_manifest_p}' must be a regular non-symlink file"
+                    )
+                try:
+                    mk_data = json.loads(mkt_manifest_p.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    self._raise_plugin_policy_error(
+                        f"Invalid JSON in '{mkt_manifest_p}': {exc}"
+                    )
+                if isinstance(mk_data, dict) and mk_data.get("name") is not None:
+                    raw_mk = mk_data.get("name")
+                    if not isinstance(raw_mk, str) or not _SAFE_AGY_PLUGIN_NAME_RE.match(
+                        raw_mk.strip()
+                    ):
+                        self._raise_plugin_policy_error(
+                            f"Invalid marketplace 'name' in '{mkt_manifest_p}'"
+                        )
+                    marketplace_name = raw_mk.strip()
+
+            hooks_relpath: Optional[str] = None
+            if (Path(source_dir) / "hooks" / "hooks.json").is_file():
+                hooks_relpath = os.path.join("hooks", "hooks.json")
+            elif (Path(source_dir) / "hooks.json").is_file():
+                hooks_relpath = "hooks.json"
+
+            has_skills = os.path.isdir(os.path.join(source_dir, "skills"))
+            if not (manifest_label or hooks_relpath or has_skills):
+                self._raise_plugin_policy_error(
+                    f"Directory '{source_dir}' is not a valid Codex plugin "
+                    "(missing .codex-plugin/plugin.json, skills/, or hooks/hooks.json)"
+                )
+            if not manifest_label:
+                manifest_label = hooks_relpath or "directory"
+
+            if plugin_name in seen_names:
+                self._raise_plugin_policy_error(
+                    f"Duplicate Codex plugin name '{plugin_name}' between '{seen_names[plugin_name]}' and '{source_dir}'"
+                )
+            for prev in validated:
+                if _paths_overlap_any_direction(source_dir, prev.source_dir):
+                    self._raise_plugin_policy_error(
+                        f"Registered Codex plugin directories '{prev.source_dir}' and '{source_dir}' overlap"
+                    )
+
+            vfs_discovery_dir = os.path.join(
+                rt_root,
+                "codex",
+                ".codex",
+                "plugins",
+                "cache",
+                marketplace_name,
+                plugin_name,
+                plugin_version,
+            )
+
+            for hooks_cand_rel in (os.path.join("hooks", "hooks.json"), "hooks.json"):
+                hooks_cand_full = Path(source_dir) / hooks_cand_rel
+                if hooks_cand_full.exists() or hooks_cand_full.is_symlink():
+                    try:
+                        validate_plugin_hooks_manifest(
+                            hooks_cand_full,
+                            agent="codex",
+                            plugin_name=plugin_name,
+                            source_dir=source_dir,
+                            vfs_discovery_dir=vfs_discovery_dir,
+                        )
+                    except Exception as exc:
+                        self._raise_plugin_policy_error(str(exc))
+
+            seen_names[plugin_name] = source_dir
+            validated.append(
+                ValidatedCodexPlugin(
+                    name=plugin_name,
+                    marketplace_name=marketplace_name,
+                    version=plugin_version,
+                    source_dir=source_dir,
+                    vfs_discovery_dir=vfs_discovery_dir,
+                    hooks_relpath=hooks_relpath,
+                    manifest=manifest_label,
+                )
+            )
+
+        return validated
+
+    def get_codex_plugins_info(self) -> Dict[str, Any]:
+        """Return safe, secret-redacted diagnostic state for operator-registered Codex plugins."""
+        state = codex_plugins_config_state(self.config)
+        plugins_file_display = redact_diagnostic_text(
+            str(self.config.codex_plugins_file or ""), self.config
+        )
+        rt_display = redact_diagnostic_text(
+            str(self.config.agent_runtime_home_root or "/mnt/dots-agent-home"),
+            self.config,
+        )
+        state_dir_display = redact_diagnostic_text(
+            effective_plugin_state_dir(self.config), self.config
+        )
+        enabled = bool(state.get("enabled"))
+        configured = bool(state.get("configured"))
+        source = redact_diagnostic_text(str(state.get("source") or ""), self.config)
+        raw_dirs = [
+            redact_diagnostic_text(str(d), self.config)
+            for d in (state.get("raw_dirs") or [])
+        ]
+
+        if state.get("config_error"):
+            return {
+                "enabled": True,
+                "configured": True,
+                "source": source,
+                "plugins_file": plugins_file_display,
+                "agent_runtime_home_root": rt_display,
+                "plugin_state_dir": state_dir_display,
+                "configured_dirs": raw_dirs,
+                "valid": False,
+                "status": "error",
+                "plugins": [],
+                "error": redact_diagnostic_text(str(state["config_error"]), self.config),
+            }
+
+        if not enabled:
+            return {
+                "enabled": False,
+                "configured": configured,
+                "source": source,
+                "plugins_file": plugins_file_display,
+                "agent_runtime_home_root": rt_display,
+                "plugin_state_dir": state_dir_display,
+                "configured_dirs": raw_dirs,
+                "valid": True,
+                "status": "disabled",
+                "plugins": [],
+                "error": None,
+            }
+
+        try:
+            validated = self.validate_codex_plugins()
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "configured": True,
+                "source": source,
+                "plugins_file": plugins_file_display,
+                "agent_runtime_home_root": rt_display,
+                "plugin_state_dir": state_dir_display,
+                "configured_dirs": raw_dirs,
+                "valid": False,
+                "status": "error",
+                "plugins": [],
+                "error": redact_diagnostic_text(str(exc), self.config),
+            }
+
+        return {
+            "enabled": True,
+            "configured": True,
+            "source": source,
+            "plugins_file": plugins_file_display,
+            "agent_runtime_home_root": rt_display,
+            "plugin_state_dir": state_dir_display,
+            "configured_dirs": raw_dirs,
+            "mount_namespace_available": bool(can_use_mount_namespace()),
+            "hook_jail_enforced": True,
+            "valid": True,
+            "status": "active",
+            "plugins": [
+                {
+                    "name": p.name,
+                    "marketplace": p.marketplace_name,
+                    "version": p.version,
+                    "source_dir": redact_diagnostic_text(p.source_dir, self.config),
+                    "vfs_discovery_dir": redact_diagnostic_text(
+                        p.vfs_discovery_dir, self.config
+                    ),
+                    "hooks_relpath": p.hooks_relpath,
                     "manifest": p.manifest,
                     "mode": "ro",
                 }
@@ -2742,6 +3659,8 @@ class CommandPolicy:
             if (
                 self.is_protected_path(norm)
                 or self.is_agy_plugin_path(norm)
+                or self.is_codex_plugin_path(norm)
+                or self.is_plugin_state_path(norm)
                 or not self.is_within_allowed_workdirs(norm)
             ):
                 return
@@ -2794,7 +3713,11 @@ class CommandPolicy:
 
         def _add(cand_path: str) -> None:
             norm = os.path.abspath(cand_path)
-            if norm not in seen and not self.is_agy_plugin_path(norm):
+            if (
+                norm not in seen
+                and not self.is_agy_plugin_path(norm)
+                and not self.is_codex_plugin_path(norm)
+            ):
                 seen.add(norm)
                 roots.append(norm)
 
@@ -2803,9 +3726,35 @@ class CommandPolicy:
             _add(ws_dir)
         for root in self.get_codex_writable_roots(add_dirs=add_dirs, cwd=cwd):
             _add(root)
+
+        agy_state = agy_plugins_config_state(self.config)
+        if agy_state.get("enabled") and not agy_state.get("config_error"):
+            rt_root = os.path.abspath(
+                os.path.expanduser(
+                    str(
+                        self.config.agent_runtime_home_root or "/mnt/dots-agent-home"
+                    ).strip()
+                )
+            )
+            iso_agy_home = os.path.join(rt_root, "agy")
+            for rel in (
+                ".pub-cache",
+                os.path.join(".config", "flutter"),
+                ".dart-tool",
+                ".dartServer",
+                ".cache",
+                ".npm",
+                os.path.join(".local", "share"),
+                os.path.join(".config", "gh"),
+                ".docker",
+            ):
+                _add(os.path.join(iso_agy_home, rel))
         return roots
 
-    def get_agy_readonly_roots(self) -> List[str]:
+    def get_agy_readonly_roots(
+        self,
+        _validated_plugins: Optional[Sequence[ValidatedAgyPlugin]] = None,
+    ) -> List[str]:
         """Compute safe `read_file(...)` mount roots for `agy --sandbox`.
 
         `agy --sandbox` on Linux mounts standard OS system paths (`/usr`, `/etc`, etc.)
@@ -2830,6 +3779,10 @@ class CommandPolicy:
                 or self.is_protected_path(res)
                 or self.is_agy_plugin_path(lex)
                 or self.is_agy_plugin_path(res)
+                or self.is_codex_plugin_path(lex)
+                or self.is_codex_plugin_path(res)
+                or self.is_plugin_state_path(lex)
+                or self.is_plugin_state_path(res)
             ):
                 return
             for cand in (lex, res):
@@ -2853,10 +3806,13 @@ class CommandPolicy:
 
         plugins_state = agy_plugins_config_state(self.config)
         if plugins_state.get("enabled") and not plugins_state.get("config_error"):
-            try:
-                valid_plgs = self.validate_agy_plugins()
-            except Exception:
-                valid_plgs = []
+            if _validated_plugins is not None:
+                valid_plgs: Sequence[ValidatedAgyPlugin] = _validated_plugins
+            else:
+                try:
+                    valid_plgs = self.validate_agy_plugins()
+                except Exception:
+                    valid_plgs = []
             for plg in valid_plgs:
                 if plg.source_dir not in seen and ")" not in plg.source_dir:
                     seen.add(plg.source_dir)
@@ -2936,6 +3892,7 @@ class CommandPolicy:
         self,
         cwd: Optional[str] = None,
         add_dirs: Optional[Sequence[str]] = None,
+        _validated_plugins: Optional[Sequence[ValidatedAgyPlugin]] = None,
     ) -> Dict[str, Any]:
         """Build per-session `--settings` JSON for `agy --sandbox`.
 
@@ -2956,12 +3913,33 @@ class CommandPolicy:
 
         plugins_state = agy_plugins_config_state(self.config)
         validated_plugins: List[ValidatedAgyPlugin] = []
-        if plugins_state.get("config_error") or plugins_state.get("enabled"):
+        if _validated_plugins is not None:
+            validated_plugins = list(_validated_plugins)
+        elif plugins_state.get("config_error") or plugins_state.get("enabled"):
             validated_plugins = self.validate_agy_plugins(cwd=cwd, add_dirs=add_dirs)
 
+        home_lex = os.path.abspath(str(Path.home()))
+        try:
+            home_res = str(Path.home().resolve())
+        except OSError:
+            home_res = home_lex
+
         perms: Dict[str, Any] = {}
-        settings_path = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
-        if settings_path.exists() or settings_path.is_symlink():
+        cli_dir = Path.home() / ".gemini" / "antigravity-cli"
+        if cli_dir.is_symlink():
+            self._raise_plugin_policy_error(
+                f"Symlinked AGY settings directory '{cli_dir}' is forbidden"
+            )
+        settings_path = cli_dir / "settings.json"
+        if settings_path.is_symlink():
+            self._raise_plugin_policy_error(
+                f"Symlinked AGY settings file '{settings_path}' is forbidden"
+            )
+        if settings_path.exists():
+            if not settings_path.is_file():
+                self._raise_plugin_policy_error(
+                    f"AGY settings path '{settings_path}' must be a regular file"
+                )
             try:
                 raw = json.loads(settings_path.read_text(encoding="utf-8"))
             except Exception as exc:
@@ -2971,20 +3949,30 @@ class CommandPolicy:
             if isinstance(raw, dict) and isinstance(raw.get("permissions"), dict):
                 for k, v in raw["permissions"].items():
                     if isinstance(v, list):
-                        perms[k] = [str(x) for x in v]
+                        perms[k] = [
+                            _expand_host_tilde_in_agy_rule(str(x), home_res)
+                            for x in v
+                        ]
 
         writable_roots = self.get_agy_writable_roots(cwd=cwd, add_dirs=add_dirs)
         writable_set = set(writable_roots)
 
-        home_lex = os.path.abspath(str(Path.home()))
-        try:
-            home_res = str(Path.home().resolve())
-        except OSError:
-            home_res = home_lex
+        rt_root = os.path.abspath(
+            os.path.expanduser(
+                str(
+                    self.config.agent_runtime_home_root or "/mnt/dots-agent-home"
+                ).strip()
+            )
+        )
+        iso_agy_home = os.path.join(rt_root, "agy")
+        iso_agy_plugins_root = os.path.join(iso_agy_home, ".gemini", "config", "plugins")
+
         ro_plugin_guards: List[str] = [
             os.path.join(home_lex, ".gemini", "config", "plugins"),
             os.path.join(home_res, ".gemini", "config", "plugins"),
+            iso_agy_plugins_root,
             *self.get_configured_agy_plugin_paths(),
+            *self.get_configured_codex_plugin_paths(),
         ]
         for plg in validated_plugins:
             for p_guard in (plg.source_dir, plg.vfs_discovery_dir):
@@ -2999,9 +3987,14 @@ class CommandPolicy:
                 allow_seen.add(rule)
                 allow_list.append(rule)
 
-        for ro_root in self.get_agy_readonly_roots():
+        for ro_root in self.get_agy_readonly_roots(_validated_plugins=validated_plugins):
             if ro_root not in writable_set and ")" not in ro_root:
                 _emit_allow(f"read_file({ro_root})")
+
+        if validated_plugins:
+            iso_local_bin = os.path.join(iso_agy_home, ".local", "bin")
+            if ")" not in iso_local_bin:
+                _emit_allow(f"read_file({iso_local_bin})")
 
         for plg in validated_plugins:
             if ")" not in plg.source_dir:
@@ -3017,6 +4010,7 @@ class CommandPolicy:
         plugin_discovery_roots = (
             os.path.join(home_lex, ".gemini", "config", "plugins"),
             os.path.join(home_res, ".gemini", "config", "plugins"),
+            iso_agy_plugins_root,
         )
 
         for existing_rule in perms.get("allow") or []:
@@ -3040,6 +4034,8 @@ class CommandPolicy:
                     continue
                 if self.is_agy_plugin_path(rd_cand) and rd_cand not in active_plugin_allow_paths:
                     continue
+                if self.is_codex_plugin_path(rd_cand):
+                    continue
                 if (
                     any(
                         _path_is_within(rd_cand, disc_root)
@@ -3061,10 +4057,43 @@ class CommandPolicy:
 
         deny_list: List[str] = list(perms.get("deny") or [])
         deny_seen = set(deny_list)
-        for rule in self.get_agy_denied_rules():
-            if rule not in deny_seen:
+
+        def _emit_deny(rule: str) -> None:
+            if rule and rule not in deny_seen:
                 deny_seen.add(rule)
                 deny_list.append(rule)
+
+        for rule in self.get_agy_denied_rules():
+            _emit_deny(rule)
+
+        # Prevent task tools from modifying repo-local hook/settings injection paths while
+        # keeping `.claude/signals`, `.claude/metrics`, and `docs/exec-plans` writable.
+        ok_cwd, _, resolved_cwd = self.validate_workdir(cwd)
+        seed_ws_roots: List[str] = []
+        if ok_cwd:
+            seed_ws_roots.append(resolved_cwd)
+            for ws_d in self.get_agy_workspace_dirs(cwd=cwd, add_dirs=add_dirs):
+                if ws_d not in seed_ws_roots:
+                    seed_ws_roots.append(ws_d)
+        for root_w in self._allowed_roots:
+            if root_w not in seed_ws_roots:
+                seed_ws_roots.append(root_w)
+        session_ws_roots: List[str] = []
+        for seed_r in seed_ws_roots:
+            cur_r = os.path.abspath(seed_r)
+            while self.is_within_allowed_workdirs(cur_r):
+                if cur_r not in session_ws_roots:
+                    session_ws_roots.append(cur_r)
+                parent_r = os.path.dirname(cur_r)
+                if parent_r == cur_r:
+                    break
+                cur_r = parent_r
+        for ws_r in session_ws_roots:
+            for inj_rel in WORKSPACE_HOOK_INJECTION_RELPATHS:
+                inj_abs = os.path.join(ws_r, inj_rel)
+                if ")" not in inj_abs:
+                    _emit_deny(f"read_file({inj_abs})")
+
         perms["deny"] = deny_list
 
         return {
@@ -3124,7 +4153,11 @@ class CommandPolicy:
                 seen_git_dirs.add(resolved_gd)
                 writable_git_dirs.append(resolved_gd)
             hooks_cand = os.path.join(resolved_gd, "hooks")
-            if not os.path.islink(hooks_cand) and os.path.isdir(hooks_cand):
+            if os.path.islink(hooks_cand):
+                self._raise_plugin_policy_error(
+                    f"Symlinked git hooks path '{hooks_cand}' is forbidden by security policy"
+                )
+            if os.path.isdir(hooks_cand):
                 ok_hk, _, resolved_hk = self.validate_workdir(hooks_cand)
                 if ok_hk and resolved_hk not in seen_hook_dirs:
                     seen_hook_dirs.add(resolved_hk)
@@ -3134,9 +4167,12 @@ class CommandPolicy:
         def _record_commondir_if_present(validated_git_dir: str) -> Optional[str]:
             common_file = Path(validated_git_dir) / "commondir"
             try:
+                if common_file.is_symlink():
+                    self._raise_plugin_policy_error(
+                        f"Symlinked git commondir file '{common_file}' is forbidden by security policy"
+                    )
                 if (
-                    not common_file.is_symlink()
-                    and common_file.is_file()
+                    common_file.is_file()
                     and common_file.stat().st_size <= 8192
                 ):
                     lines = [
@@ -3154,6 +4190,8 @@ class CommandPolicy:
                             else (Path(validated_git_dir) / raw_common)
                         )
                         return _record_git_dir(cand_common)
+            except PermissionError:
+                raise
             except OSError:
                 pass
             return None
@@ -3168,15 +4206,18 @@ class CommandPolicy:
                 dot_git_lex = os.path.abspath(str(dot_git))
                 if not self.is_protected_path(dot_git_lex):
                     try:
-                        if not dot_git.is_symlink() and dot_git.is_dir():
+                        if dot_git.is_symlink():
+                            self._raise_plugin_policy_error(
+                                f"Symlinked .git path '{dot_git_lex}' is forbidden by security policy"
+                            )
+                        if dot_git.is_dir():
                             ok_dg, _, prelim_gd = self.validate_workdir(str(dot_git))
                             if ok_dg:
                                 _record_commondir_if_present(prelim_gd)
                                 _record_git_dir(Path(prelim_gd))
                             break
                         if (
-                            not dot_git.is_symlink()
-                            and dot_git.is_file()
+                            dot_git.is_file()
                             and dot_git.stat().st_size <= 8192
                         ):
                             first_lines = [
@@ -3199,6 +4240,8 @@ class CommandPolicy:
                                         _record_commondir_if_present(prelim_gd)
                                         _record_git_dir(Path(prelim_gd))
                             break
+                    except PermissionError:
+                        raise
                     except OSError:
                         break
 
@@ -3219,22 +4262,37 @@ class CommandPolicy:
         Exposes all configured `allowed_workdirs`, validated Git `commondir` & worktree
         `gitdir` metadata directories for `cwd` / `add_dirs` (so `git add` & `git commit`
         succeed inside standalone repos and linked `git worktree` checkouts while `.git/hooks`
-        is locked read-only by `sandbox.py`), Flutter SDK's `bin/cache`, and isolated
+        is locked read-only by `sandbox.py`), `.codex/signals` and `.codex/metrics` inside
+        project workspaces (so `oh-my-agents` verify contracts succeed even though `codex`
+        mounts `<workspace>/.codex` read-only), Flutter SDK's `bin/cache`, and isolated
         developer toolchain caches mounted by `sandbox.py`, while keeping SDK binaries,
-        `~/gateway`, `~/.ssh`, `~/.codex`, `~/.gemini`, and `~/.config/dots-gateway`
-        read-only or hidden.
+        plugin code directories, `~/gateway`, `~/.ssh`, `~/.codex`, `~/.gemini`, and
+        `~/.config/dots-gateway` read-only or hidden.
         """
         roots: List[str] = []
         seen: set[str] = set()
 
         def _add(cand_path: str) -> None:
             norm = os.path.abspath(cand_path)
-            if norm not in seen and not self.is_agy_plugin_path(norm):
+            if (
+                norm not in seen
+                and not self.is_agy_plugin_path(norm)
+                and not self.is_codex_plugin_path(norm)
+            ):
                 seen.add(norm)
                 roots.append(norm)
 
+        ws_scan_dirs: List[str] = []
         for allowed in self._allowed_roots:
             _add(allowed)
+            ws_scan_dirs.append(allowed)
+
+        if cwd is not None:
+            ok_cwd, cwd_err, resolved_cwd = self.validate_workdir(str(cwd))
+            if not ok_cwd:
+                raise PermissionError(cwd_err)
+            if resolved_cwd not in ws_scan_dirs:
+                ws_scan_dirs.append(resolved_cwd)
 
         if add_dirs:
             for d in add_dirs:
@@ -3242,12 +4300,28 @@ class CommandPolicy:
                 if not ok_dir:
                     raise PermissionError(dir_err)
                 _add(resolved_dir)
+                if resolved_dir not in ws_scan_dirs:
+                    ws_scan_dirs.append(resolved_dir)
 
         git_writable_dirs, _ = self.resolve_codex_git_metadata_dirs(
             cwd=cwd, add_dirs=add_dirs
         )
         for gd in git_writable_dirs:
             _add(gd)
+
+        # `codex-linux-sandbox` mounts `<workspace>/.codex` read-only when `<workspace>/.codex`
+        # exists; explicitly re-expose existing non-symlink `.codex/signals` & `.codex/metrics`
+        # subdirectories while `.codex/hooks.json` and `.codex/config.toml` remain masked.
+        for ws_d in ws_scan_dirs:
+            dot_codex = os.path.join(ws_d, ".codex")
+            if os.path.islink(dot_codex):
+                continue
+            for meta_sub in ("signals", "metrics"):
+                sub_p = os.path.join(dot_codex, meta_sub)
+                if not os.path.islink(sub_p) and os.path.isdir(sub_p):
+                    ok_sub, _, resolved_sub = self.validate_workdir(sub_p)
+                    if ok_sub:
+                        _add(resolved_sub)
 
         flutter_cache_candidates: List[str] = ["/opt/flutter/bin/cache"]
         flutter_bin = shutil.which("flutter")
@@ -3266,19 +4340,20 @@ class CommandPolicy:
             home_dir == r or home_dir.startswith(r.rstrip("/") + "/")
             for r in self._allowed_roots
         )
+        cache_rels = (
+            ".pub-cache",
+            os.path.join(".config", "flutter"),
+            ".dart-tool",
+            ".dartServer",
+            ".cache",
+            ".npm",
+            os.path.join(".local", "share"),
+            os.path.join(".config", "gh"),
+            # Isolated per-sandbox Docker CLI config (buildx state, registry logins)
+            ".docker",
+        )
         if not home_already_covered:
-            for rel in (
-                ".pub-cache",
-                os.path.join(".config", "flutter"),
-                ".dart-tool",
-                ".dartServer",
-                ".cache",
-                ".npm",
-                os.path.join(".local", "share"),
-                os.path.join(".config", "gh"),
-                # Isolated per-sandbox Docker CLI config (buildx state, registry logins)
-                ".docker",
-            ):
+            for rel in cache_rels:
                 abs_cache = os.path.join(home_dir, rel)
                 if self.config.isolate_mount_namespace or os.path.isdir(abs_cache):
                     _add(abs_cache)
@@ -3291,6 +4366,20 @@ class CommandPolicy:
                         _add(sb_tmp)
                 except OSError:
                     pass
+
+        codex_state = codex_plugins_config_state(self.config)
+        if codex_state.get("enabled") and not codex_state.get("config_error"):
+            rt_root = os.path.abspath(
+                os.path.expanduser(
+                    str(
+                        self.config.agent_runtime_home_root or "/mnt/dots-agent-home"
+                    ).strip()
+                )
+            )
+            iso_codex_home = os.path.join(rt_root, "codex")
+            for rel in cache_rels:
+                _add(os.path.join(iso_codex_home, rel))
+            _add(os.path.join(iso_codex_home, ".codex", "plugins", "data"))
 
         for raw_extra in self.config.codex_extra_writable_roots:
             try:
@@ -3325,10 +4414,9 @@ class CommandPolicy:
         cwd: Optional[str] = None,
     ) -> List[str]:
         """Construct a validated non-interactive `codex exec` invocation list confined to allowed_workdirs."""
-        if cwd is not None:
-            ok_cwd, cwd_err, _ = self.validate_workdir(str(cwd))
-            if not ok_cwd:
-                raise PermissionError(cwd_err)
+        ok_cwd, cwd_err, resolved_cwd_codex = self.validate_workdir(cwd)
+        if not ok_cwd:
+            raise PermissionError(cwd_err)
 
         codex_bin = (
             self.config.codex_binary
@@ -3353,6 +4441,17 @@ class CommandPolicy:
             )
 
         extra = [str(a) for a in (args or [])]
+        forbidden_codex_cfg_tokens = (
+            "sandbox",
+            "approval",
+            "permission",
+            "plugin",
+            "marketplace",
+            "hook",
+            "project",
+            "mcp_server",
+            "notify",
+        )
         for idx, raw_arg in enumerate(extra):
             if raw_arg == "--add-dir" or raw_arg.startswith("--add-dir="):
                 raise PermissionError(
@@ -3369,7 +4468,21 @@ class CommandPolicy:
                 "--remote-control",
                 "-P",
                 "--permission-profile",
-            ) or raw_arg.startswith(("--remote-control=", "-P=", "--permission-profile=")):
+                "--plugin",
+                "--plugins",
+                "--plugin-dir",
+                "--plugin-dirs",
+            ) or raw_arg.startswith(
+                (
+                    "--remote-control=",
+                    "-P=",
+                    "--permission-profile=",
+                    "--plugin=",
+                    "--plugins=",
+                    "--plugin-dir=",
+                    "--plugin-dirs=",
+                )
+            ):
                 raise PermissionError(
                     f"Raw '{raw_arg}' flag in args is forbidden by gateway security policy"
                 )
@@ -3379,16 +4492,26 @@ class CommandPolicy:
                 )
             if raw_arg in ("-c", "--config") and idx + 1 < len(extra):
                 cfg_kv = extra[idx + 1].lower()
-                if "sandbox" in cfg_kv or "approval" in cfg_kv or "permission" in cfg_kv:
+                if any(tok_k in cfg_kv for tok_k in forbidden_codex_cfg_tokens):
                     raise PermissionError(
-                        "Overriding sandbox, approval, or permission policy via '-c/--config' is forbidden"
+                        "Overriding sandbox, approval, permission, plugin, or hook policy via '-c/--config' is forbidden"
                     )
             if raw_arg.startswith(("-c=", "--config=")):
                 cfg_kv = raw_arg.split("=", 1)[1].lower()
-                if "sandbox" in cfg_kv or "approval" in cfg_kv or "permission" in cfg_kv:
+                if any(tok_k in cfg_kv for tok_k in forbidden_codex_cfg_tokens):
                     raise PermissionError(
-                        "Overriding sandbox, approval, or permission policy via '-c/--config' is forbidden"
+                        "Overriding sandbox, approval, permission, plugin, or hook policy via '-c/--config' is forbidden"
                     )
+
+        ok_extra, err_extra = self._check_protected_arguments(
+            [codex_bin, *extra], resolved_cwd_codex, _trusted_agy_argv=False
+        )
+        if not ok_extra:
+            raise PermissionError(err_extra)
+
+        codex_plg_state = codex_plugins_config_state(self.config)
+        if codex_plg_state.get("config_error") or codex_plg_state.get("enabled"):
+            self.validate_codex_plugins(cwd=cwd, add_dirs=add_dirs)
 
         # Top-level Codex CLI options (placed before `exec` per codex-cli 0.166+ parser)
         if use_skip:

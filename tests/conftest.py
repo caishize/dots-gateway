@@ -28,3 +28,6 @@ os.environ.setdefault(
     "GATEWAY_AGY_PLUGINS_FILE", os.path.join(_TEST_ISOLATION_DIR, "agy-plugins.json")
 )
 os.environ.setdefault("GATEWAY_CODEX_ENV_FILE", os.path.join(_TEST_ISOLATION_DIR, "codex.env"))
+os.environ.setdefault(
+    "GATEWAY_CODEX_PLUGINS_FILE", os.path.join(_TEST_ISOLATION_DIR, "codex-plugins.json")
+)

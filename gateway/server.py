@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .auth import Authenticator, extract_mcp_path_token
-from .config import GatewayConfig, redact_diagnostic_text
+from .config import GatewayConfig, effective_plugin_state_dir, redact_diagnostic_text
 from .docker_proxy import DockerProxy
 from .executor import ExecutionSession, SessionManager
 from .files import FileService
@@ -41,9 +41,16 @@ _SESSION_ID_RE = re.compile(
 _FORBIDDEN_TASK_PLUGIN_KEYS = (
     "plugin_dirs",
     "agy_plugin_dirs",
+    "codex_plugin_dirs",
     "plugins",
+    "codex_plugins",
     "plugin_root",
     "agy_plugins_enabled",
+    "codex_plugins_enabled",
+    "agy_plugins_file",
+    "codex_plugins_file",
+    "agent_runtime_home_root",
+    "plugin_state_dir",
 )
 
 
@@ -53,7 +60,7 @@ def _reject_task_plugin_overrides(payload: Any) -> None:
             if key in payload:
                 raise PermissionError(
                     f"Task-level '{key}' declaration is forbidden by security policy; "
-                    "register trusted AGY plugins via operator configuration only"
+                    "register trusted AGY/Codex plugins via operator configuration only"
                 )
 
 
@@ -562,6 +569,10 @@ class GatewayServer:
                     "max_timeout_seconds": self.config.max_timeout_seconds,
                     "agy_queue_timeout_seconds": self.config.agy_queue_timeout_seconds,
                     "sandbox_state_dir": self.config.sandbox_state_dir,
+                    "agent_runtime_home_root": self.config.agent_runtime_home_root,
+                    "plugin_state_dir": redact_diagnostic_text(
+                        effective_plugin_state_dir(self.config), self.config
+                    ),
                     "sandbox_lifecycle": self.sessions.get_sandbox_lifecycle_info(),
                     "agy_binary": self.config.agy_binary,
                     "agy_default_skip_permissions": self.config.agy_default_skip_permissions,
@@ -579,6 +590,7 @@ class GatewayServer:
                     "codex_sandbox_network_access": self.config.codex_sandbox_network_access,
                     "codex_writable_roots": self.policy.get_codex_writable_roots(),
                     "codex_auth_configured": self.sessions.has_codex_auth(),
+                    "codex_plugins": self.policy.get_codex_plugins_info(),
                 },
             )
             return

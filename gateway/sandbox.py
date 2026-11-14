@@ -27,6 +27,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .config import redact_diagnostic_text
+from .hook_jail import (
+    WORKSPACE_HOOK_INJECTION_RELPATHS,
+    PreparedAgentPluginRuntime,
+    StagedPluginHookBundle,
+    sanitize_host_agy_settings_file,
+)
 
 SANDBOX_SUBDIRS: Tuple[str, ...] = (
     "tmp",
@@ -38,6 +44,8 @@ SANDBOX_SUBDIRS: Tuple[str, ...] = (
     "dart_tool",
     "dart_server",
     "docker_cfg",
+    "plugin_bundles",
+    "plugin_state",
 )
 SANDBOX_MANAGED_SUBDIRS: Tuple[str, ...] = (
     "tmp",
@@ -439,19 +447,156 @@ def _ensure_safe_gemini_plugin_mountpoint(home_dir: str, home_covered: bool) -> 
             raise SandboxStorageError(f"'{label}' must be a directory")
 
 
+def _remount_ro_cmd(q_mount: str, q_target: str, *, noexec: bool = False) -> str:
+    extra = "ro,nosuid,nodev,noexec" if noexec else "ro,nosuid,nodev"
+    return (
+        f"{q_mount} -o remount,bind,{extra} {q_target} 2>/dev/null "
+        f"|| {q_mount} -o remount,bind,ro {q_target} 2>/dev/null "
+        f"|| {q_mount} -o bind,remount,ro {q_target}"
+    )
+
+
+def _remount_rw_noexec_cmd(q_mount: str, q_target: str) -> str:
+    return (
+        f"{q_mount} -o remount,bind,rw,nosuid,nodev,noexec {q_target} 2>/dev/null "
+        f"|| {q_mount} -o bind,remount,rw,nosuid,nodev,noexec {q_target}"
+    )
+
+
+def _mount_user_home_skeleton_lines(
+    stage_dir: str,
+    target_home_dir: str,
+    host_home_dir: str,
+    sandbox_state: Path,
+    gh_cfg_dir: Path,
+    q_mount: str,
+) -> List[str]:
+    """Populate `target_home_dir` inside `stage_dir` with isolated caches, RO `.local/bin`, RO `.gitconfig`, and `gh`."""
+    out: List[str] = [f"mkdir -p {shlex.quote(f'{stage_dir}{target_home_dir}')}"]
+    for src_sub, dst_rel in (
+        ("cache", ".cache"),
+        ("npm", ".npm"),
+        ("local_share", os.path.join(".local", "share")),
+        ("pub_cache", ".pub-cache"),
+        ("flutter_cfg", os.path.join(".config", "flutter")),
+        ("dart_tool", ".dart-tool"),
+        ("dart_server", ".dartServer"),
+        ("docker_cfg", ".docker"),
+    ):
+        q_src = shlex.quote(str(sandbox_state / src_sub))
+        q_dst = shlex.quote(f"{stage_dir}{os.path.join(target_home_dir, dst_rel)}")
+        out.extend(
+            [
+                f"mkdir -p {q_dst}",
+                f"{q_mount} --rbind {q_src} {q_dst}",
+            ]
+        )
+
+    local_bin = os.path.join(host_home_dir, ".local", "bin")
+    if os.path.isdir(local_bin):
+        q_lb = shlex.quote(os.path.realpath(local_bin))
+        q_dst_lb = shlex.quote(f"{stage_dir}{os.path.join(target_home_dir, '.local', 'bin')}")
+        out.extend(
+            [
+                f"mkdir -p {q_dst_lb}",
+                f"{q_mount} --bind {q_lb} {q_dst_lb}",
+                _remount_ro_cmd(q_mount, q_dst_lb),
+            ]
+        )
+
+    gitconfig = os.path.join(host_home_dir, ".gitconfig")
+    if os.path.isfile(gitconfig):
+        q_gc = shlex.quote(os.path.realpath(gitconfig))
+        q_dst_gc = shlex.quote(f"{stage_dir}{os.path.join(target_home_dir, '.gitconfig')}")
+        out.extend(
+            [
+                f"touch {q_dst_gc}",
+                f"{q_mount} --bind {q_gc} {q_dst_gc}",
+                _remount_ro_cmd(q_mount, q_dst_gc),
+            ]
+        )
+
+    q_gh = shlex.quote(os.path.realpath(str(gh_cfg_dir)))
+    q_dst_gh = shlex.quote(f"{stage_dir}{os.path.join(target_home_dir, '.config', 'gh')}")
+    out.extend(
+        [
+            f"mkdir -p {q_dst_gh}",
+            f"{q_mount} --rbind {q_gh} {q_dst_gh}",
+        ]
+    )
+    return out
+
+
+def _plugin_runtime_jail_mount_lines(
+    stage_dir: str,
+    q_mount: str,
+    runtime: PreparedAgentPluginRuntime,
+) -> List[str]:
+    """Mount `dots-hook-jail.py` (`ro`), per-plugin jail configs (`ro`), and hook state dirs (`rw,noexec`)."""
+    q_run_src = shlex.quote(runtime.host_runner_script)
+    q_run_dst = shlex.quote(f"{stage_dir}{runtime.vfs_runner_script}")
+    q_run_parent = shlex.quote(f"{stage_dir}{os.path.dirname(runtime.vfs_runner_script)}")
+    out: List[str] = [
+        f"[ ! -L {q_run_src} ] && [ -f {q_run_src} ]",
+        f"mkdir -p {q_run_parent}",
+        f"touch {q_run_dst}",
+        f"{q_mount} --bind {q_run_src} {q_run_dst}",
+        _remount_ro_cmd(q_mount, q_run_dst),
+    ]
+    for bundle in runtime.bundles:
+        q_jcfg_src = shlex.quote(bundle.host_jail_config_dir)
+        q_jcfg_dst = shlex.quote(f"{stage_dir}{bundle.vfs_jail_config_dir}")
+        q_htmp_src = shlex.quote(bundle.host_hook_tmp_dir)
+        q_htmp_dst = shlex.quote(f"{stage_dir}{bundle.vfs_hook_tmp_dir}")
+        q_hdat_src = shlex.quote(bundle.host_hook_data_dir)
+        q_hdat_dst = shlex.quote(f"{stage_dir}{bundle.vfs_hook_data_dir}")
+        out.extend(
+            [
+                f"[ ! -L {q_jcfg_src} ] && [ -d {q_jcfg_src} ]",
+                f"mkdir -p {q_jcfg_dst}",
+                f"{q_mount} --bind {q_jcfg_src} {q_jcfg_dst}",
+                _remount_ro_cmd(q_mount, q_jcfg_dst, noexec=True),
+                f"[ ! -L {q_htmp_src} ] && [ -d {q_htmp_src} ]",
+                f"mkdir -p {q_htmp_dst}",
+                f"{q_mount} --bind {q_htmp_src} {q_htmp_dst}",
+                _remount_rw_noexec_cmd(q_mount, q_htmp_dst),
+                f"[ ! -L {q_hdat_src} ] && [ -d {q_hdat_src} ]",
+                f"mkdir -p {q_hdat_dst}",
+                f"{q_mount} --bind {q_hdat_src} {q_hdat_dst}",
+                _remount_rw_noexec_cmd(q_mount, q_hdat_dst),
+            ]
+        )
+        for vfs_data_d in bundle.vfs_data_dirs:
+            q_vd_dst = shlex.quote(f"{stage_dir}{vfs_data_d}")
+            out.extend(
+                [
+                    f"mkdir -p {q_vd_dst}",
+                    f"{q_mount} --bind {q_hdat_src} {q_vd_dst}",
+                    _remount_rw_noexec_cmd(q_mount, q_vd_dst),
+                ]
+            )
+    return out
+
+
 def _agy_registered_plugin_mount_lines(
     stage_dir: str,
-    home_dir: str,
+    discovery_home_dir: str,
     q_mount: str,
     plugin_mounts: Sequence[Tuple[str, str]],
+    prepared_plugin_runtime: Optional[PreparedAgentPluginRuntime] = None,
 ) -> List[str]:
     """Build fail-closed shell lines mounting registered AGY plugins read-only in VFS."""
-    gem_vfs = os.path.join(home_dir, ".gemini")
+    gem_vfs = os.path.join(discovery_home_dir, ".gemini")
     gem_cfg_vfs = os.path.join(gem_vfs, "config")
     plugins_vfs_root = os.path.join(gem_cfg_vfs, "plugins")
     q_gem_vfs = shlex.quote(f"{stage_dir}{gem_vfs}")
     q_gem_cfg_vfs = shlex.quote(f"{stage_dir}{gem_cfg_vfs}")
     q_plg_root = shlex.quote(f"{stage_dir}{plugins_vfs_root}")
+    bundle_by_name: Dict[str, StagedPluginHookBundle] = {}
+    if prepared_plugin_runtime is not None:
+        for b in prepared_plugin_runtime.bundles:
+            bundle_by_name[b.name] = b
+
     out: List[str] = [
         f"[ ! -L {q_gem_vfs} ] && [ ! -L {q_gem_cfg_vfs} ] && [ ! -L {q_plg_root} ]",
         f"mkdir -p {q_plg_root}",
@@ -460,8 +605,12 @@ def _agy_registered_plugin_mount_lines(
     ]
     for plg_name, plg_src in plugin_mounts:
         q_src = shlex.quote(plg_src)
-        q_dst_canon = shlex.quote(f"{stage_dir}{plg_src}")
-        q_dst_disc = shlex.quote(f"{stage_dir}{os.path.join(plugins_vfs_root, plg_name)}")
+        canon_mp = f"{stage_dir}{plg_src}"
+        disc_mp = f"{stage_dir}{os.path.join(plugins_vfs_root, plg_name)}"
+        q_dst_canon = shlex.quote(canon_mp)
+        q_dst_disc = shlex.quote(disc_mp)
+        bundle = bundle_by_name.get(plg_name)
+
         out.extend(
             [
                 f"[ ! -L {q_src} ] && [ -d {q_src} ]",
@@ -469,15 +618,460 @@ def _agy_registered_plugin_mount_lines(
                 f"[ -d {q_dst_canon} ] || mkdir -p {q_dst_canon}",
                 f"[ ! -L {q_dst_canon} ] && [ -d {q_dst_canon} ]",
                 f"{q_mount} --bind {q_src} {q_dst_canon}",
-                f"{q_mount} -o remount,bind,ro,nosuid,nodev {q_dst_canon} 2>/dev/null || {q_mount} -o remount,bind,ro {q_dst_canon} 2>/dev/null || {q_mount} -o bind,remount,ro {q_dst_canon}",
-                f"mkdir -p {q_dst_disc}",
-                f"{q_mount} --bind {q_src} {q_dst_disc}",
-                f"{q_mount} -o remount,bind,ro,nosuid,nodev {q_dst_disc} 2>/dev/null || {q_mount} -o remount,bind,ro {q_dst_disc} 2>/dev/null || {q_mount} -o bind,remount,ro {q_dst_disc}",
             ]
         )
+        if bundle and bundle.host_rewritten_hooks_file and bundle.hooks_relpath:
+            q_rw_hooks = shlex.quote(bundle.host_rewritten_hooks_file)
+            q_canon_hooks = shlex.quote(os.path.join(canon_mp, bundle.hooks_relpath))
+            out.extend(
+                [
+                    f"[ ! -L {q_rw_hooks} ] && [ -f {q_rw_hooks} ] && [ ! -L {q_canon_hooks} ] && [ -f {q_canon_hooks} ]",
+                    f"{q_mount} --bind {q_rw_hooks} {q_canon_hooks}",
+                    _remount_ro_cmd(q_mount, q_canon_hooks, noexec=True),
+                ]
+            )
+        out.append(_remount_ro_cmd(q_mount, q_dst_canon))
+
+        out.extend(
+            [
+                f"mkdir -p {q_dst_disc}",
+                f"{q_mount} --bind {q_src} {q_dst_disc}",
+            ]
+        )
+        if bundle and bundle.host_rewritten_hooks_file and bundle.hooks_relpath:
+            q_rw_hooks = shlex.quote(bundle.host_rewritten_hooks_file)
+            q_disc_hooks = shlex.quote(os.path.join(disc_mp, bundle.hooks_relpath))
+            out.extend(
+                [
+                    f"[ ! -L {q_rw_hooks} ] && [ -f {q_rw_hooks} ] && [ ! -L {q_disc_hooks} ] && [ -f {q_disc_hooks} ]",
+                    f"{q_mount} --bind {q_rw_hooks} {q_disc_hooks}",
+                    _remount_ro_cmd(q_mount, q_disc_hooks, noexec=True),
+                ]
+            )
+        out.append(_remount_ro_cmd(q_mount, q_dst_disc))
+
     out.append(
         f"{q_mount} -o remount,ro,nosuid,nodev {q_plg_root} 2>/dev/null || {q_mount} -o remount,ro {q_plg_root} 2>/dev/null || {q_mount} -o bind,remount,ro {q_plg_root}"
     )
+    return out
+
+
+def _codex_isolated_runtime_mount_lines(
+    stage_dir: str,
+    host_home_dir: str,
+    q_mount: str,
+    runtime: PreparedAgentPluginRuntime,
+) -> List[str]:
+    """Build fail-closed shell lines populating isolated `$CODEX_HOME` and read-only plugin bundles."""
+    if not runtime.vfs_codex_home_dir or not runtime.host_codex_config_toml:
+        raise SandboxStorageError("Incomplete PreparedAgentPluginRuntime for Codex")
+    vfs_codex_home = runtime.vfs_codex_home_dir
+    host_codex_dir = os.path.join(host_home_dir, ".codex")
+    q_vcx = shlex.quote(f"{stage_dir}{vfs_codex_home}")
+    out: List[str] = [f"mkdir -p {q_vcx}"]
+
+    # Mount auth.json read-only into outer VFS so Codex CLI can authenticate without mutating auth,
+    # while `dots-hook-jail.py` never mounts `vfs_codex_home`, keeping auth.json 100% invisible to hooks.
+    host_auth = os.path.join(host_codex_dir, "auth.json")
+    if os.path.isfile(host_auth) and not os.path.islink(host_auth):
+        q_auth_src = shlex.quote(os.path.realpath(host_auth))
+        q_auth_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_codex_home, 'auth.json')}")
+        out.extend(
+            [
+                f"touch {q_auth_dst}",
+                f"{q_mount} --bind {q_auth_src} {q_auth_dst}",
+                _remount_ro_cmd(q_mount, q_auth_dst, noexec=True),
+            ]
+        )
+
+    for rw_sub in ("sessions", "archived_sessions"):
+        host_sub = Path(host_codex_dir) / rw_sub
+        if rw_sub == "sessions":
+            if host_sub.is_symlink():
+                raise SandboxStorageError("Symlinked '~/.codex/sessions' is forbidden")
+            host_sub.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(host_sub, 0o700)
+            except OSError:
+                pass
+        if host_sub.is_dir() and not host_sub.is_symlink():
+            q_s_src = shlex.quote(str(host_sub.resolve()))
+            q_s_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_codex_home, rw_sub)}")
+            out.extend(
+                [
+                    f"mkdir -p {q_s_dst}",
+                    f"{q_mount} --rbind {q_s_src} {q_s_dst}",
+                ]
+            )
+
+    host_cx_bin = Path(host_codex_dir) / "bin"
+    if host_cx_bin.is_dir() and not host_cx_bin.is_symlink():
+        q_cb_src = shlex.quote(str(host_cx_bin.resolve()))
+        q_cb_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_codex_home, 'bin')}")
+        out.extend(
+            [
+                f"mkdir -p {q_cb_dst}",
+                f"{q_mount} --bind {q_cb_src} {q_cb_dst}",
+                _remount_ro_cmd(q_mount, q_cb_dst),
+            ]
+        )
+
+    q_toml_src = shlex.quote(runtime.host_codex_config_toml)
+    q_toml_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_codex_home, 'config.toml')}")
+    out.extend(
+        [
+            f"[ ! -L {q_toml_src} ] && [ -f {q_toml_src} ]",
+            f"touch {q_toml_dst}",
+            f"{q_mount} --bind {q_toml_src} {q_toml_dst}",
+            _remount_ro_cmd(q_mount, q_toml_dst, noexec=True),
+        ]
+    )
+
+    cache_root = os.path.join(vfs_codex_home, "plugins", "cache")
+    q_cache_root = shlex.quote(f"{stage_dir}{cache_root}")
+    out.extend(
+        [
+            f"mkdir -p {q_cache_root}",
+            f"{q_mount} -t tmpfs -o size=8m,mode=0755,nosuid,nodev tmpfs {q_cache_root}",
+        ]
+    )
+
+    for bundle in runtime.bundles:
+        q_src = shlex.quote(bundle.source_dir)
+        canon_mp = f"{stage_dir}{bundle.source_dir}"
+        disc_mp = f"{stage_dir}{bundle.vfs_discovery_dir}"
+        q_canon = shlex.quote(canon_mp)
+        q_disc = shlex.quote(disc_mp)
+
+        out.extend(
+            [
+                f"[ ! -L {q_src} ] && [ -d {q_src} ]",
+                f"[ ! -L {q_canon} ]",
+                f"[ -d {q_canon} ] || mkdir -p {q_canon}",
+                f"[ ! -L {q_canon} ] && [ -d {q_canon} ]",
+                f"{q_mount} --bind {q_src} {q_canon}",
+            ]
+        )
+        if bundle.host_rewritten_hooks_file and bundle.hooks_relpath:
+            q_rw_h = shlex.quote(bundle.host_rewritten_hooks_file)
+            q_canon_h = shlex.quote(os.path.join(canon_mp, bundle.hooks_relpath))
+            out.extend(
+                [
+                    f"[ ! -L {q_rw_h} ] && [ -f {q_rw_h} ] && [ ! -L {q_canon_h} ] && [ -f {q_canon_h} ]",
+                    f"{q_mount} --bind {q_rw_h} {q_canon_h}",
+                    _remount_ro_cmd(q_mount, q_canon_h, noexec=True),
+                ]
+            )
+        out.append(_remount_ro_cmd(q_mount, q_canon))
+
+        out.extend(
+            [
+                f"mkdir -p {q_disc}",
+                f"{q_mount} --bind {q_src} {q_disc}",
+            ]
+        )
+        if bundle.host_rewritten_hooks_file and bundle.hooks_relpath:
+            q_rw_h = shlex.quote(bundle.host_rewritten_hooks_file)
+            q_disc_h = shlex.quote(os.path.join(disc_mp, bundle.hooks_relpath))
+            out.extend(
+                [
+                    f"[ ! -L {q_rw_h} ] && [ -f {q_rw_h} ] && [ ! -L {q_disc_h} ] && [ -f {q_disc_h} ]",
+                    f"{q_mount} --bind {q_rw_h} {q_disc_h}",
+                    _remount_ro_cmd(q_mount, q_disc_h, noexec=True),
+                ]
+            )
+        out.append(_remount_ro_cmd(q_mount, q_disc))
+
+    out.append(
+        f"{q_mount} -o remount,ro,nosuid,nodev {q_cache_root} 2>/dev/null || {q_mount} -o remount,ro {q_cache_root} 2>/dev/null || {q_mount} -o bind,remount,ro {q_cache_root}"
+    )
+    out.extend(_plugin_runtime_jail_mount_lines(stage_dir, q_mount, runtime))
+    return out
+
+
+def _mask_protected_and_workspace_hook_lines(
+    stage_dir: str,
+    q_mount: str,
+    *,
+    home_dir: str,
+    allowed_roots: Sequence[str],
+    protected_paths: Sequence[str],
+    is_agy: bool,
+    is_codex: bool,
+    preserve_readonly_exec_file: Optional[str] = None,
+    resolved_cwd: Optional[str] = None,
+    session_workdirs: Optional[Sequence[str]] = None,
+    sandbox_state: Optional[Path] = None,
+    sandbox_state_dir_raw: Optional[str] = None,
+    plugin_state_dir: Optional[str] = None,
+    mount_gcloud_adc: bool = False,
+    use_isolated_agy_home: bool = False,
+    use_isolated_codex_home: bool = False,
+) -> List[str]:
+    """Mask `protected_paths`, gateway staging/state dirs, and workspace hook-injection subpaths."""
+    out: List[str] = []
+    seen_prot: set[str] = set()
+    skip_system = {"/", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/var", "/opt", "/home", home_dir}
+    credential_exts = (
+        ".env",
+        ".json",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".pem",
+        ".key",
+        ".crt",
+        ".conf",
+        ".ini",
+        ".sqlite",
+        ".db",
+        ".p12",
+        ".pfx",
+    )
+    credential_basenames = {
+        "auth.json",
+        "hosts.yml",
+        "oauth_creds.json",
+        "credentials.json",
+        "google_accounts.json",
+        "id_rsa",
+        "id_ed25519",
+        "known_hosts",
+        "config",
+    }
+
+    def _home_dot_variants(rel: str) -> set[str]:
+        p_lex = os.path.abspath(os.path.join(home_dir, rel))
+        variants = {p_lex}
+        if os.path.exists(p_lex):
+            try:
+                variants.add(os.path.realpath(p_lex))
+            except OSError:
+                pass
+        return variants
+
+    skip_dot_umbrellas: set[str] = set()
+    if is_agy or is_codex:
+        skip_dot_umbrellas.update(_home_dot_variants(".local"))
+    if is_agy and not use_isolated_agy_home:
+        skip_dot_umbrellas.update(_home_dot_variants(".gemini"))
+        skip_dot_umbrellas.update(_home_dot_variants(".config"))
+    if is_codex and not use_isolated_codex_home:
+        skip_dot_umbrellas.update(_home_dot_variants(".codex"))
+
+    resolved_prots: List[str] = []
+    for raw_prot in protected_paths:
+        try:
+            prot_cand = str(Path(raw_prot).expanduser().resolve())
+        except Exception:
+            continue
+        if prot_cand in seen_prot or prot_cand in skip_system or prot_cand in skip_dot_umbrellas:
+            continue
+        seen_prot.add(prot_cand)
+        resolved_prots.append(prot_cand)
+
+    # Always mask sensitive ~/.config subtrees even when the ~/.config umbrella was skipped
+    # (e.g. plain AGY with allowed_workdirs covering HOME).
+    mandatory_config_subs = [
+        os.path.join(home_dir, ".config", "dots-gateway"),
+        os.path.join(home_dir, ".config", "tunnel-client"),
+        os.path.join(home_dir, ".config", "systemd"),
+    ]
+    if not (is_agy and mount_gcloud_adc and not use_isolated_agy_home):
+        mandatory_config_subs.append(os.path.join(home_dir, ".config", "gcloud"))
+    for cfg_sub_lex in mandatory_config_subs:
+        if os.path.islink(cfg_sub_lex) and _is_covered_by_roots(cfg_sub_lex, allowed_roots):
+            raise SandboxStorageError(
+                f"Symlinked protected configuration path '{redact_diagnostic_text(cfg_sub_lex)}' "
+                "is forbidden when covered by allowed_workdirs"
+            )
+        if os.path.exists(cfg_sub_lex):
+            for cand_cfg_p in (os.path.abspath(cfg_sub_lex), os.path.realpath(cfg_sub_lex)):
+                if cand_cfg_p not in seen_prot and cand_cfg_p not in skip_system:
+                    seen_prot.add(cand_cfg_p)
+                    resolved_prots.append(cand_cfg_p)
+
+    resolved_prots.sort(key=lambda p: (len(p), p))
+
+    preserve_lex: Optional[str] = None
+    preserve_real: Optional[str] = None
+    if (is_agy or is_codex) and preserve_readonly_exec_file:
+        try:
+            cand_exp = os.path.expanduser(str(preserve_readonly_exec_file).strip())
+            if cand_exp.startswith("/"):
+                cand_lex = os.path.abspath(cand_exp)
+                cand_real = os.path.realpath(cand_exp)
+                base_lower = os.path.basename(cand_real).lower()
+                if (
+                    os.path.isfile(cand_real)
+                    and os.access(cand_real, os.R_OK | os.X_OK)
+                    and base_lower not in credential_basenames
+                    and not base_lower.endswith(credential_exts)
+                    and not cand_lex.startswith(
+                        ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/opt/")
+                    )
+                ):
+                    preserve_lex = cand_lex
+                    preserve_real = cand_real
+        except OSError:
+            preserve_lex = None
+            preserve_real = None
+
+    if preserve_lex is not None and preserve_real is not None:
+        for prot_chk in resolved_prots:
+            if os.path.isfile(prot_chk) and (
+                preserve_lex == prot_chk or preserve_real == prot_chk
+            ):
+                preserve_lex = None
+                preserve_real = None
+                break
+            if (
+                preserve_real != preserve_lex
+                and (
+                    preserve_real == prot_chk
+                    or preserve_real.startswith(prot_chk.rstrip("/") + "/")
+                )
+                and not (
+                    preserve_lex == prot_chk
+                    or preserve_lex.startswith(prot_chk.rstrip("/") + "/")
+                )
+            ):
+                preserve_lex = None
+                preserve_real = None
+                break
+
+    preserved_in_masked_prot = False
+    masked_prot_dirs: List[str] = []
+    for prot in resolved_prots:
+        if any(prot.startswith(mp_d.rstrip("/") + "/") for mp_d in masked_prot_dirs):
+            continue
+        q_dp = shlex.quote(f"{stage_dir}{prot}")
+        if os.path.isdir(prot):
+            masked_prot_dirs.append(prot)
+            if (
+                preserve_lex is not None
+                and preserve_real is not None
+                and preserve_lex.startswith(prot.rstrip("/") + "/")
+            ):
+                preserved_in_masked_prot = True
+                q_real_bin = shlex.quote(preserve_real)
+                q_dst_bin = shlex.quote(f"{stage_dir}{preserve_lex}")
+                q_dst_parent = shlex.quote(f"{stage_dir}{os.path.dirname(preserve_lex)}")
+                out.extend(
+                    [
+                        f"mkdir -p {q_dp}",
+                        f"{q_mount} -t tmpfs -o size=16k,mode=0755,nosuid,nodev tmpfs {q_dp}",
+                        f"[ ! -L {q_real_bin} ] && [ -f {q_real_bin} ] && [ -x {q_real_bin} ]",
+                        f"mkdir -p {q_dst_parent}",
+                        f": > {q_dst_bin}",
+                        f"{q_mount} --bind {q_real_bin} {q_dst_bin}",
+                        _remount_ro_cmd(q_mount, q_dst_bin),
+                        f"{q_mount} -o remount,ro,nosuid,nodev {q_dp} 2>/dev/null || {q_mount} -o remount,ro {q_dp}",
+                    ]
+                )
+            else:
+                out.append(
+                    f"if [ -d {q_dp} ]; then {q_mount} -t tmpfs -o size=4k,mode=0555,ro tmpfs {q_dp}; fi"
+                )
+        elif os.path.isfile(prot):
+            out.append(
+                f"if [ -f {q_dp} ]; then {q_mount} --bind /dev/null {q_dp}; fi"
+            )
+
+    if (
+        preserve_lex is not None
+        and preserve_real is not None
+        and not preserved_in_masked_prot
+        and not any(preserve_lex == r or preserve_lex.startswith(r.rstrip("/") + "/") for r in allowed_roots)
+    ):
+        q_real_bin = shlex.quote(preserve_real)
+        q_dst_bin = shlex.quote(f"{stage_dir}{preserve_lex}")
+        q_dst_parent = shlex.quote(f"{stage_dir}{os.path.dirname(preserve_lex)}")
+        out.extend(
+            [
+                f"if [ ! -e {q_dst_bin} ]; then [ ! -L {q_real_bin} ] && [ -f {q_real_bin} ] && [ -x {q_real_bin} ] && mkdir -p {q_dst_parent} && : > {q_dst_bin} && {q_mount} --bind {q_real_bin} {q_dst_bin} && ({_remount_ro_cmd(q_mount, q_dst_bin)}); fi",
+            ]
+        )
+
+    # Mask host-side `plugin_bundles` and `plugin_state` directories inside `{stage_dir}` AFTER
+    # isolated `/mnt/dots-agent-home/...` and sanitized settings mounts have already completed,
+    # preventing in-place inode tampering when `allowed_workdirs` covers `HOME` or `sandbox_state_dir`.
+    internal_host_dirs: List[str] = []
+    if sandbox_state is not None:
+        internal_host_dirs.append(os.path.abspath(str(sandbox_state / "plugin_bundles")))
+        internal_host_dirs.append(os.path.abspath(str(sandbox_state / "plugin_state")))
+    if sandbox_state_dir_raw:
+        try:
+            sb_lex = os.path.abspath(os.path.expanduser(str(sandbox_state_dir_raw).strip()))
+            internal_host_dirs.append(os.path.join(sb_lex, "plugin_bundles"))
+            internal_host_dirs.append(os.path.join(sb_lex, "plugin_state"))
+        except OSError:
+            pass
+    if plugin_state_dir:
+        try:
+            ps_exp = os.path.expanduser(str(plugin_state_dir).strip())
+            if ps_exp.startswith("/"):
+                ps_lex = os.path.abspath(ps_exp)
+                internal_host_dirs.append(ps_lex)
+                if os.path.exists(ps_lex):
+                    internal_host_dirs.append(os.path.realpath(ps_lex))
+        except OSError:
+            pass
+    seen_internal: set[str] = set()
+    for int_d in internal_host_dirs:
+        if not int_d or int_d in seen_internal or int_d in skip_system:
+            continue
+        seen_internal.add(int_d)
+        if os.path.islink(int_d) and _is_covered_by_roots(int_d, allowed_roots):
+            raise SandboxStorageError(
+                f"Symlinked internal plugin staging/state directory '{redact_diagnostic_text(int_d)}' "
+                "is forbidden by security policy"
+            )
+        if any(int_d.startswith(mp_d.rstrip("/") + "/") for mp_d in masked_prot_dirs):
+            continue
+        q_int_dst = shlex.quote(f"{stage_dir}{int_d}")
+        out.append(
+            f"if [ -d {q_int_dst} ]; then {q_mount} -t tmpfs -o size=4k,mode=0555,ro,nosuid,nodev,noexec tmpfs {q_int_dst}; fi"
+        )
+
+    if is_agy or is_codex:
+        ws_targets: List[str] = []
+        seeds: List[str] = []
+        if resolved_cwd:
+            seeds.append(resolved_cwd)
+        for sw in session_workdirs or ():
+            if sw:
+                seeds.append(str(sw))
+        seeds.extend(allowed_roots)
+        for raw_seed in seeds:
+            cur_d = os.path.abspath(raw_seed)
+            while _is_covered_by_roots(cur_d, allowed_roots):
+                if cur_d not in ws_targets:
+                    ws_targets.append(cur_d)
+                parent_d = os.path.dirname(cur_d)
+                if parent_d == cur_d:
+                    break
+                cur_d = parent_d
+        for wdir in ws_targets:
+            for rel_inj in WORKSPACE_HOOK_INJECTION_RELPATHS:
+                cur_chk = wdir
+                for part in Path(rel_inj).parts:
+                    cur_chk = os.path.join(cur_chk, part)
+                    if os.path.islink(cur_chk):
+                        raise SandboxStorageError(
+                            f"Symlinked workspace hook/configuration path '{redact_diagnostic_text(cur_chk)}' "
+                            "is forbidden by security policy"
+                        )
+                inj_host = os.path.join(wdir, rel_inj)
+                q_inj_dst = shlex.quote(f"{stage_dir}{inj_host}")
+                if os.path.isdir(inj_host):
+                    out.append(
+                        f"if [ -d {q_inj_dst} ]; then {q_mount} -t tmpfs -o size=4k,mode=0555,ro,nosuid,nodev,noexec tmpfs {q_inj_dst}; fi"
+                    )
+                elif os.path.isfile(inj_host):
+                    out.append(
+                        f"if [ -f {q_inj_dst} ]; then {q_mount} --bind /dev/null {q_inj_dst}; fi"
+                    )
     return out
 
 
@@ -495,9 +1089,15 @@ def build_mount_ns_argv(
     mount_gcloud_adc: bool = True,
     agy_plugins_enabled: bool = False,
     agy_plugin_mounts: Optional[Sequence[Tuple[str, str]]] = None,
+    codex_plugins_enabled: bool = False,
+    codex_plugin_mounts: Optional[Sequence[Tuple[str, str]]] = None,
+    prepared_plugin_runtime: Optional[PreparedAgentPluginRuntime] = None,
+    agent_runtime_home_root: str = "/mnt/dots-agent-home",
     masked_plugin_paths: Optional[Sequence[str]] = None,
     sandbox_lock_timeout_seconds: float = 5.0,
     prevalidated_sandbox_state: Optional[Path] = None,
+    session_workdirs: Optional[Sequence[str]] = None,
+    plugin_state_dir: Optional[str] = None,
 ) -> List[str]:
     """Wrap `target_argv` in an unprivileged user+mount namespace `pivot_root` jail.
 
@@ -513,9 +1113,29 @@ def build_mount_ns_argv(
         )
 
     validated_plugin_mounts: List[Tuple[str, str]] = []
+    validated_codex_mounts: List[Tuple[str, str]] = []
     if is_agy and agy_plugins_enabled:
         validated_plugin_mounts = _validate_plugin_mounts_for_vfs(agy_plugin_mounts)
-    active_plugin_srcs = {src for _, src in validated_plugin_mounts}
+    if is_codex and codex_plugins_enabled:
+        if codex_plugin_mounts:
+            validated_codex_mounts = _validate_plugin_mounts_for_vfs(codex_plugin_mounts)
+        elif prepared_plugin_runtime and prepared_plugin_runtime.bundles:
+            validated_codex_mounts = _validate_plugin_mounts_for_vfs(
+                [(b.name, b.source_dir) for b in prepared_plugin_runtime.bundles]
+            )
+        else:
+            raise SandboxStorageError(
+                "Codex plugins are enabled, but no validated plugin mounts were provided to VFS sandbox"
+            )
+        if prepared_plugin_runtime is None:
+            raise SandboxStorageError(
+                "Codex plugins require a PreparedAgentPluginRuntime for isolated CODEX_HOME staging"
+            )
+
+    active_plugin_srcs = {
+        *(src for _, src in validated_plugin_mounts),
+        *(src for _, src in validated_codex_mounts),
+    }
 
     unshare_bin = _find_sys_bin("unshare") or "/usr/bin/unshare"
     pivot_bin = _find_sys_bin("pivot_root") or "/usr/sbin/pivot_root"
@@ -536,6 +1156,18 @@ def build_mount_ns_argv(
     home_dir = str(Path.home().resolve())
     home_covered = _is_covered_by_roots(home_dir, allowed_roots)
 
+    norm_runtime_root = os.path.abspath(str(agent_runtime_home_root or "/mnt/dots-agent-home").strip())
+    isolated_agy_home = (
+        prepared_plugin_runtime.isolated_home_dir
+        if (is_agy and agy_plugins_enabled and prepared_plugin_runtime is not None)
+        else os.path.join(norm_runtime_root, "agy")
+    )
+    isolated_codex_home = (
+        prepared_plugin_runtime.isolated_home_dir
+        if (is_codex and codex_plugins_enabled and prepared_plugin_runtime is not None)
+        else os.path.join(norm_runtime_root, "codex")
+    )
+
     raw_sb_target = (
         str(sandbox_state_dir).strip()
         if sandbox_state_dir
@@ -545,8 +1177,17 @@ def build_mount_ns_argv(
         *list(protected_paths or ()),
         os.path.join(home_dir, ".gemini"),
         os.path.join(home_dir, ".config"),
-        *(src for _, src in validated_plugin_mounts),
+        *active_plugin_srcs,
         *list(masked_plugin_paths or ()),
+    ]
+    non_home_forbidden_sb_roots = [
+        r
+        for r in forbidden_sb_roots
+        if os.path.abspath(os.path.expanduser(str(r))) != home_dir
+        and (
+            not os.path.exists(os.path.expanduser(str(r)))
+            or os.path.realpath(os.path.expanduser(str(r))) != home_dir
+        )
     ]
     gh_cfg_dir = Path(home_dir) / ".config" / "gh"
     if not home_covered:
@@ -557,7 +1198,7 @@ def build_mount_ns_argv(
                 raw_sb_target,
                 lock_timeout_seconds=sandbox_lock_timeout_seconds,
                 subdirs=SANDBOX_SUBDIRS,
-                forbidden_roots=forbidden_sb_roots,
+                forbidden_roots=non_home_forbidden_sb_roots,
             )
         gh_cfg_dir.mkdir(parents=True, exist_ok=True)
         if is_agy:
@@ -572,16 +1213,38 @@ def build_mount_ns_argv(
             except OSError:
                 pass
     else:
-        sandbox_state = Path(os.path.realpath(os.path.expanduser(raw_sb_target)))
+        if prevalidated_sandbox_state is not None:
+            sandbox_state = prevalidated_sandbox_state
+        elif is_agy or is_codex:
+            sandbox_state = prepare_sandbox_runtime_state(
+                raw_sb_target,
+                lock_timeout_seconds=sandbox_lock_timeout_seconds,
+                subdirs=SANDBOX_SUBDIRS,
+                forbidden_roots=non_home_forbidden_sb_roots,
+            )
+            gh_cfg_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            sandbox_state = Path(os.path.realpath(os.path.expanduser(raw_sb_target)))
         if is_agy and agy_plugins_enabled:
+            (Path(home_dir) / ".config" / "antigravity").mkdir(parents=True, exist_ok=True)
             _ensure_safe_gemini_plugin_mountpoint(home_dir, home_covered=True)
 
     stage_sources: List[str] = [
         *allowed_roots,
         str(sandbox_state),
         home_dir,
-        *(src for _, src in validated_plugin_mounts),
+        norm_runtime_root,
+        *sorted(active_plugin_srcs),
     ]
+    if (is_agy or is_codex) and target_argv and str(target_argv[0]).startswith("/"):
+        try:
+            stage_sources.append(os.path.realpath(str(target_argv[0])))
+        except OSError:
+            pass
+    if prepared_plugin_runtime is not None:
+        stage_sources.append(prepared_plugin_runtime.host_runner_script)
+        for b in prepared_plugin_runtime.bundles:
+            stage_sources.extend([b.host_hook_tmp_dir, b.host_hook_data_dir, b.host_jail_config_dir])
     for dot_rel in (
         os.path.join(".local", "bin"),
         os.path.join(".config", "gh"),
@@ -657,8 +1320,8 @@ def build_mount_ns_argv(
         ]
     )
 
-    # Mask configured AGY plugin directories under system trees (/opt, /usr, /var, /etc) whenever
-    # they are NOT actively mounted for an AGY session (`exec_command`, `run_codex`, disabled/staged plugins).
+    # Mask configured AGY/Codex plugin directories under system trees (/opt, /usr, /var, /etc) whenever
+    # they are NOT actively mounted for the current session.
     if masked_plugin_paths:
         seen_masked: set[str] = set()
         for raw_mp in masked_plugin_paths:
@@ -698,12 +1361,19 @@ def build_mount_ns_argv(
         lines.append(f"mkdir -p {q_dst}")
         lines.append(f"{q_mount} --rbind {q_wdir} {q_dst}")
 
-    # Lock sensitive subpaths inside allowed workspaces (e.g. `.git/hooks` for Codex) read-only
+    # Lock sensitive subpaths inside allowed workspaces (e.g. `.git/hooks`) read-only
     for raw_ro_sub in readonly_subpaths or ():
         try:
             ro_lex = os.path.abspath(os.path.expanduser(str(raw_ro_sub)))
-            if os.path.islink(ro_lex) or not os.path.isdir(ro_lex):
-                continue
+        except OSError:
+            continue
+        if os.path.islink(ro_lex):
+            raise SandboxStorageError(
+                f"Symlinked readonly_subpath '{ro_lex}' is forbidden by security policy"
+            )
+        if not os.path.isdir(ro_lex):
+            continue
+        try:
             ro_res = str(Path(ro_lex).resolve())
         except OSError:
             continue
@@ -720,83 +1390,96 @@ def build_mount_ns_argv(
             ]
         )
 
-    if not home_covered:
-        q_stage_home = shlex.quote(f"{stage_dir}{home_dir}")
-        lines.append(f"mkdir -p {q_stage_home}")
+    use_isolated_agy_home = bool(is_agy and agy_plugins_enabled)
+    use_isolated_codex_home = bool(is_codex and codex_plugins_enabled)
 
-        # Persistent isolated caches so pip/uv/npm/flutter/dart/go don't lose state or hit tmpfs limits
-        for src_sub, dst_rel in (
-            ("cache", ".cache"),
-            ("npm", ".npm"),
-            ("local_share", os.path.join(".local", "share")),
-            ("pub_cache", ".pub-cache"),
-            ("flutter_cfg", os.path.join(".config", "flutter")),
-            ("dart_tool", ".dart-tool"),
-            ("dart_server", ".dartServer"),
-            ("docker_cfg", ".docker"),
-        ):
-            q_src = shlex.quote(str(sandbox_state / src_sub))
-            q_dst = shlex.quote(f"{stage_dir}{os.path.join(home_dir, dst_rel)}")
-            lines.extend(
-                [
-                    f"mkdir -p {q_dst}",
-                    f"{q_mount} --rbind {q_src} {q_dst}",
-                ]
+    plain_agy_sanitized_settings: Optional[str] = None
+    if is_agy and not use_isolated_agy_home:
+        if home_covered and os.path.islink(os.path.join(home_dir, ".gemini")):
+            raise SandboxStorageError(
+                "Symlinked ~/.gemini is forbidden by security policy when HOME is covered by allowed_workdirs"
             )
-
-        # Read-only ~/.local/bin so user-installed developer CLIs & agy can execute safely
-        local_bin = os.path.join(home_dir, ".local", "bin")
-        if os.path.isdir(local_bin):
-            q_lb = shlex.quote(os.path.realpath(local_bin))
-            q_dst_lb = shlex.quote(f"{stage_dir}{local_bin}")
-            lines.extend(
-                [
-                    f"mkdir -p {q_dst_lb}",
-                    f"{q_mount} --bind {q_lb} {q_dst_lb}",
-                    f"{q_mount} -o remount,bind,ro {q_dst_lb} 2>/dev/null || {q_mount} -o bind,remount,ro {q_dst_lb}",
-                ]
-            )
-
-        # Read-only ~/.gitconfig so `git` credential helper & author settings work inside workspaces
-        gitconfig = os.path.join(home_dir, ".gitconfig")
-        if os.path.isfile(gitconfig):
-            q_gc = shlex.quote(os.path.realpath(gitconfig))
-            q_dst_gc = shlex.quote(f"{stage_dir}{gitconfig}")
-            lines.extend(
-                [
-                    f"touch {q_dst_gc}",
-                    f"{q_mount} --bind {q_gc} {q_dst_gc}",
-                    f"{q_mount} -o remount,bind,ro {q_dst_gc} 2>/dev/null || {q_mount} -o bind,remount,ro {q_dst_gc}",
-                ]
-            )
-
-        # Persistent ~/.config/gh so `gh` CLI and `gh auth git-credential` work & persist across commands
-        # while ~/.config/dots-gateway, ~/.config/tunnel-client, and ~/.config/systemd remain invisible
-        q_gh = shlex.quote(os.path.realpath(str(gh_cfg_dir)))
-        q_dst_gh = shlex.quote(f"{stage_dir}{gh_cfg_dir}")
-        lines.extend(
-            [
-                f"mkdir -p {q_dst_gh}",
-                f"{q_mount} --rbind {q_gh} {q_dst_gh}",
-            ]
+        plain_out = (
+            sandbox_state
+            / "plugin_bundles"
+            / "_plain_agy"
+            / "_sanitized_settings.json"
+        )
+        plain_agy_sanitized_settings = sanitize_host_agy_settings_file(
+            None,
+            plain_out,
+            expand_tilde=False,
+            only_if_hooks_present=True,
+            content_addressed=True,
         )
 
-        if is_agy:
-            # Antigravity CLI requires ~/.gemini (for OAuth & trajectory store) and ~/.config/antigravity.
-            # When explicit plugin registration (`agy_plugins_enabled`) is OFF, preserve legacy read-only
-            # remount of `~/.gemini/config/plugins`. When ON, mount an isolated read-only tmpfs view
-            # populated strictly with operator-registered `agy_plugin_mounts` plus canonical read-only mounts.
-            gemini_dir = os.path.join(home_dir, ".gemini")
-            if os.path.isdir(gemini_dir):
-                q_gem = shlex.quote(os.path.realpath(gemini_dir))
-                q_dst_gem = shlex.quote(f"{stage_dir}{gemini_dir}")
+    if is_codex and not use_isolated_codex_home:
+        if home_covered and os.path.islink(os.path.join(home_dir, ".codex")):
+            raise SandboxStorageError(
+                "Symlinked ~/.codex is forbidden by security policy when HOME is covered by allowed_workdirs"
+            )
+        unmanaged_cx_hooks_check = os.path.join(home_dir, ".codex", "hooks.json")
+        if os.path.islink(unmanaged_cx_hooks_check):
+            raise PermissionError(
+                f"Symlinked Codex hooks file '{unmanaged_cx_hooks_check}' is forbidden by security policy"
+            )
+
+    if not home_covered:
+        if use_isolated_agy_home:
+            # Keep read-only ~/.local/bin at host path so `agy_binary` under ~/.local/bin stays executable,
+            # while moving `$HOME` and `.gemini` to `isolated_agy_home` completely outside protected `HOME`.
+            local_bin_host = os.path.join(home_dir, ".local", "bin")
+            if os.path.isdir(local_bin_host):
+                q_lb_h = shlex.quote(os.path.realpath(local_bin_host))
+                q_dst_lb_h = shlex.quote(f"{stage_dir}{local_bin_host}")
                 lines.extend(
                     [
-                        f"mkdir -p {q_dst_gem}",
-                        f"{q_mount} --rbind {q_gem} {q_dst_gem}",
+                        f"mkdir -p {q_dst_lb_h}",
+                        f"{q_mount} --bind {q_lb_h} {q_dst_lb_h}",
+                        _remount_ro_cmd(q_mount, q_dst_lb_h),
                     ]
                 )
-                if not agy_plugins_enabled:
+        elif use_isolated_codex_home:
+            local_bin_host = os.path.join(home_dir, ".local", "bin")
+            if os.path.isdir(local_bin_host):
+                q_lb_h = shlex.quote(os.path.realpath(local_bin_host))
+                q_dst_lb_h = shlex.quote(f"{stage_dir}{local_bin_host}")
+                lines.extend(
+                    [
+                        f"mkdir -p {q_dst_lb_h}",
+                        f"{q_mount} --bind {q_lb_h} {q_dst_lb_h}",
+                        _remount_ro_cmd(q_mount, q_dst_lb_h),
+                    ]
+                )
+        else:
+            lines.extend(
+                _mount_user_home_skeleton_lines(
+                    stage_dir, home_dir, home_dir, sandbox_state, gh_cfg_dir, q_mount
+                )
+            )
+            if is_agy:
+                gemini_dir = os.path.join(home_dir, ".gemini")
+                if os.path.isdir(gemini_dir):
+                    q_gem = shlex.quote(os.path.realpath(gemini_dir))
+                    q_dst_gem = shlex.quote(f"{stage_dir}{gemini_dir}")
+                    lines.extend(
+                        [
+                            f"mkdir -p {q_dst_gem}",
+                            f"{q_mount} --rbind {q_gem} {q_dst_gem}",
+                        ]
+                    )
+                    if plain_agy_sanitized_settings:
+                        q_ps_src = shlex.quote(plain_agy_sanitized_settings)
+                        q_ps_dst = shlex.quote(
+                            f"{stage_dir}{os.path.join(gemini_dir, 'antigravity-cli', 'settings.json')}"
+                        )
+                        lines.extend(
+                            [
+                                f"[ ! -L {q_ps_src} ] && [ -f {q_ps_src} ] && [ -f {q_ps_dst} ]",
+                                f"{q_mount} --bind {q_ps_src} {q_ps_dst}",
+                                _remount_ro_cmd(q_mount, q_ps_dst, noexec=True),
+                            ]
+                        )
                     plugins_dir = os.path.join(gemini_dir, "config", "plugins")
                     if os.path.isdir(plugins_dir):
                         q_plg = shlex.quote(os.path.realpath(plugins_dir))
@@ -807,76 +1490,76 @@ def build_mount_ns_argv(
                                 f"{q_mount} -o remount,bind,ro {q_dst_plg} 2>/dev/null || {q_mount} -o bind,remount,ro {q_dst_plg}",
                             ]
                         )
-
-            if agy_plugins_enabled:
-                lines.extend(
-                    _agy_registered_plugin_mount_lines(
-                        stage_dir, home_dir, q_mount, validated_plugin_mounts
+                agy_cfg_dir = os.path.join(home_dir, ".config", "antigravity")
+                if os.path.isdir(agy_cfg_dir):
+                    q_ac = shlex.quote(os.path.realpath(agy_cfg_dir))
+                    q_dst_ac = shlex.quote(f"{stage_dir}{agy_cfg_dir}")
+                    lines.extend(
+                        [
+                            f"mkdir -p {q_dst_ac}",
+                            f"{q_mount} --rbind {q_ac} {q_dst_ac}",
+                        ]
                     )
-                )
+                gcloud_cfg_dir = os.path.join(home_dir, ".config", "gcloud")
+                if mount_gcloud_adc and os.path.isdir(gcloud_cfg_dir):
+                    q_gc_dir = shlex.quote(os.path.realpath(gcloud_cfg_dir))
+                    q_dst_gc_dir = shlex.quote(f"{stage_dir}{gcloud_cfg_dir}")
+                    lines.extend(
+                        [
+                            f"mkdir -p {q_dst_gc_dir}",
+                            f"{q_mount} --bind {q_gc_dir} {q_dst_gc_dir}",
+                            f"{q_mount} -o remount,bind,ro {q_dst_gc_dir} 2>/dev/null || {q_mount} -o bind,remount,ro {q_dst_gc_dir}",
+                        ]
+                    )
 
-            agy_cfg_dir = os.path.join(home_dir, ".config", "antigravity")
-            if os.path.isdir(agy_cfg_dir):
-                q_ac = shlex.quote(os.path.realpath(agy_cfg_dir))
-                q_dst_ac = shlex.quote(f"{stage_dir}{agy_cfg_dir}")
-                lines.extend(
-                    [
-                        f"mkdir -p {q_dst_ac}",
-                        f"{q_mount} --rbind {q_ac} {q_dst_ac}",
-                    ]
-                )
-
-            # Read-only ~/.config/gcloud only when `AGY_ADC_AUTH=true` needs application_default_credentials.json
-            gcloud_cfg_dir = os.path.join(home_dir, ".config", "gcloud")
-            if mount_gcloud_adc and os.path.isdir(gcloud_cfg_dir):
-                q_gc_dir = shlex.quote(os.path.realpath(gcloud_cfg_dir))
-                q_dst_gc_dir = shlex.quote(f"{stage_dir}{gcloud_cfg_dir}")
-                lines.extend(
-                    [
-                        f"mkdir -p {q_dst_gc_dir}",
-                        f"{q_mount} --bind {q_gc_dir} {q_dst_gc_dir}",
-                        f"{q_mount} -o remount,bind,ro {q_dst_gc_dir} 2>/dev/null || {q_mount} -o bind,remount,ro {q_dst_gc_dir}",
-                    ]
-                )
-
-        if is_codex:
-            # OpenAI Codex CLI requires ~/.codex (for auth.json, config.toml, session history &
-            # codex-linux-sandbox helper) while ~/gateway, ~/.gemini, ~/.ssh, and ~/.config/* stay hidden.
-            codex_dir = os.path.join(home_dir, ".codex")
-            if os.path.isdir(codex_dir):
-                q_cx = shlex.quote(os.path.realpath(codex_dir))
-                q_dst_cx = shlex.quote(f"{stage_dir}{codex_dir}")
-                lines.extend(
-                    [
-                        f"mkdir -p {q_dst_cx}",
-                        f"{q_mount} --rbind {q_cx} {q_dst_cx}",
-                    ]
-                )
+            if is_codex:
+                codex_dir = os.path.join(home_dir, ".codex")
+                if os.path.isdir(codex_dir):
+                    q_cx = shlex.quote(os.path.realpath(codex_dir))
+                    q_dst_cx = shlex.quote(f"{stage_dir}{codex_dir}")
+                    lines.extend(
+                        [
+                            f"mkdir -p {q_dst_cx}",
+                            f"{q_mount} --rbind {q_cx} {q_dst_cx}",
+                        ]
+                    )
+                    unmanaged_cx_hooks = os.path.join(codex_dir, "hooks.json")
+                    if os.path.isfile(unmanaged_cx_hooks):
+                        q_ucxh = shlex.quote(f"{stage_dir}{unmanaged_cx_hooks}")
+                        lines.append(
+                            f"if [ -f {q_ucxh} ]; then {q_mount} --bind /dev/null {q_ucxh}; fi"
+                        )
     else:
-        # Even if an admin explicitly put $HOME in allowed_workdirs, mask protected_paths inside VFS
-        for raw_prot in protected_paths:
-            try:
-                prot = str(Path(raw_prot).expanduser().resolve())
-            except Exception:
-                continue
-            if is_agy and (
-                prot == os.path.join(home_dir, ".local")
-                or prot == os.path.join(home_dir, ".gemini")
-                or prot == os.path.join(home_dir, ".config")
-            ):
-                continue
-            if is_codex and prot == os.path.join(home_dir, ".codex"):
-                continue
-            dst_prot = f"{stage_dir}{prot}"
-            if os.path.isdir(prot):
-                q_dp = shlex.quote(dst_prot)
-                lines.append(
-                    f'[ -d {q_dp} ] && {q_mount} -t tmpfs -o size=4k,mode=0555,ro tmpfs {q_dp} || true'
+        if is_agy and not use_isolated_agy_home:
+            if plain_agy_sanitized_settings:
+                q_ps_src = shlex.quote(plain_agy_sanitized_settings)
+                q_ps_dst = shlex.quote(
+                    f"{stage_dir}{os.path.join(home_dir, '.gemini', 'antigravity-cli', 'settings.json')}"
                 )
-            elif os.path.isfile(prot):
-                q_dp = shlex.quote(dst_prot)
+                lines.extend(
+                    [
+                        f"[ ! -L {q_ps_src} ] && [ -f {q_ps_src} ] && [ -f {q_ps_dst} ]",
+                        f"{q_mount} --bind {q_ps_src} {q_ps_dst}",
+                        _remount_ro_cmd(q_mount, q_ps_dst, noexec=True),
+                    ]
+                )
+            hc_plugins_dir = os.path.join(home_dir, ".gemini", "config", "plugins")
+            if os.path.isdir(hc_plugins_dir):
+                q_hc_plg = shlex.quote(os.path.realpath(hc_plugins_dir))
+                q_dst_hc_plg = shlex.quote(f"{stage_dir}{hc_plugins_dir}")
+                lines.extend(
+                    [
+                        f"[ ! -L {shlex.quote(hc_plugins_dir)} ] && [ -d {q_dst_hc_plg} ]",
+                        f"{q_mount} --bind {q_hc_plg} {q_dst_hc_plg}",
+                        _remount_ro_cmd(q_mount, q_dst_hc_plg),
+                    ]
+                )
+        if is_codex and not use_isolated_codex_home:
+            unmanaged_cx_hooks = os.path.join(home_dir, ".codex", "hooks.json")
+            if os.path.isfile(unmanaged_cx_hooks):
+                q_ucxh = shlex.quote(f"{stage_dir}{unmanaged_cx_hooks}")
                 lines.append(
-                    f'[ -f {q_dp} ] && {q_mount} --bind /dev/null {q_dp} || true'
+                    f"if [ -f {q_ucxh} ]; then {q_mount} --bind /dev/null {q_ucxh}; fi"
                 )
         for raw_mp in masked_plugin_paths or ():
             try:
@@ -893,12 +1576,108 @@ def build_mount_ns_argv(
             lines.append(
                 f'[ -d {q_mp_dst} ] && {q_mount} -t tmpfs -o size=4k,mode=0555,ro tmpfs {q_mp_dst} || true'
             )
-        if is_agy and agy_plugins_enabled:
-            lines.extend(
-                _agy_registered_plugin_mount_lines(
-                    stage_dir, home_dir, q_mount, validated_plugin_mounts
-                )
+
+    # Populate isolated agent runtime home when AGY or Codex plugins are enabled
+    if use_isolated_agy_home:
+        lines.extend(
+            _mount_user_home_skeleton_lines(
+                stage_dir, isolated_agy_home, home_dir, sandbox_state, gh_cfg_dir, q_mount
             )
+        )
+        gemini_dir = os.path.join(home_dir, ".gemini")
+        if os.path.isdir(gemini_dir):
+            q_gem = shlex.quote(os.path.realpath(gemini_dir))
+            q_dst_iso_gem = shlex.quote(f"{stage_dir}{os.path.join(isolated_agy_home, '.gemini')}")
+            lines.extend(
+                [
+                    f"mkdir -p {q_dst_iso_gem}",
+                    f"{q_mount} --rbind {q_gem} {q_dst_iso_gem}",
+                ]
+            )
+            if (
+                prepared_plugin_runtime is not None
+                and prepared_plugin_runtime.host_sanitized_agy_settings
+            ):
+                q_san_src = shlex.quote(prepared_plugin_runtime.host_sanitized_agy_settings)
+                q_san_dst = shlex.quote(
+                    f"{stage_dir}{os.path.join(isolated_agy_home, '.gemini', 'antigravity-cli', 'settings.json')}"
+                )
+                lines.extend(
+                    [
+                        f"[ ! -L {q_san_src} ] && [ -f {q_san_src} ] && [ -f {q_san_dst} ]",
+                        f"{q_mount} --bind {q_san_src} {q_san_dst}",
+                        _remount_ro_cmd(q_mount, q_san_dst, noexec=True),
+                    ]
+                )
+        lines.extend(
+            _agy_registered_plugin_mount_lines(
+                stage_dir,
+                isolated_agy_home,
+                q_mount,
+                validated_plugin_mounts,
+                prepared_plugin_runtime=prepared_plugin_runtime,
+            )
+        )
+        agy_cfg_dir = os.path.join(home_dir, ".config", "antigravity")
+        if os.path.isdir(agy_cfg_dir):
+            q_ac = shlex.quote(os.path.realpath(agy_cfg_dir))
+            q_dst_iso_ac = shlex.quote(
+                f"{stage_dir}{os.path.join(isolated_agy_home, '.config', 'antigravity')}"
+            )
+            lines.extend(
+                [
+                    f"mkdir -p {q_dst_iso_ac}",
+                    f"{q_mount} --rbind {q_ac} {q_dst_iso_ac}",
+                ]
+            )
+        gcloud_cfg_dir = os.path.join(home_dir, ".config", "gcloud")
+        if mount_gcloud_adc and os.path.isdir(gcloud_cfg_dir):
+            q_gc_dir = shlex.quote(os.path.realpath(gcloud_cfg_dir))
+            q_dst_iso_gc = shlex.quote(
+                f"{stage_dir}{os.path.join(isolated_agy_home, '.config', 'gcloud')}"
+            )
+            lines.extend(
+                [
+                    f"mkdir -p {q_dst_iso_gc}",
+                    f"{q_mount} --bind {q_gc_dir} {q_dst_iso_gc}",
+                    _remount_ro_cmd(q_mount, q_dst_iso_gc),
+                ]
+            )
+        if prepared_plugin_runtime is not None:
+            lines.extend(_plugin_runtime_jail_mount_lines(stage_dir, q_mount, prepared_plugin_runtime))
+
+    if use_isolated_codex_home and prepared_plugin_runtime is not None:
+        lines.extend(
+            _mount_user_home_skeleton_lines(
+                stage_dir, isolated_codex_home, home_dir, sandbox_state, gh_cfg_dir, q_mount
+            )
+        )
+        lines.extend(
+            _codex_isolated_runtime_mount_lines(
+                stage_dir, home_dir, q_mount, prepared_plugin_runtime
+            )
+        )
+
+    lines.extend(
+        _mask_protected_and_workspace_hook_lines(
+            stage_dir,
+            q_mount,
+            home_dir=home_dir,
+            allowed_roots=allowed_roots,
+            protected_paths=protected_paths,
+            is_agy=is_agy,
+            is_codex=is_codex,
+            preserve_readonly_exec_file=(str(target_argv[0]) if target_argv else None),
+            resolved_cwd=resolved_cwd,
+            session_workdirs=session_workdirs,
+            sandbox_state=sandbox_state,
+            sandbox_state_dir_raw=raw_sb_target,
+            plugin_state_dir=plugin_state_dir,
+            mount_gcloud_adc=mount_gcloud_adc,
+            use_isolated_agy_home=use_isolated_agy_home,
+            use_isolated_codex_home=use_isolated_codex_home,
+        )
+    )
 
     q_cwd = shlex.quote(resolved_cwd)
     lines.extend(
@@ -912,9 +1691,16 @@ def build_mount_ns_argv(
         ]
     )
 
+    if use_isolated_agy_home:
+        lines.append(f"export HOME={shlex.quote(isolated_agy_home)}")
+    elif use_isolated_codex_home and prepared_plugin_runtime is not None and prepared_plugin_runtime.vfs_codex_home_dir:
+        lines.append(
+            f"export HOME={shlex.quote(isolated_codex_home)} CODEX_HOME={shlex.quote(prepared_plugin_runtime.vfs_codex_home_dir)}"
+        )
+
     if is_agy or is_codex:
         # Clear effective/permitted/ambient caps (CapEff=0 -> cannot unmount), while keeping
-        # unprivileged nested userns capability available for `agy --sandbox` / `codex-linux-sandbox`.
+        # unprivileged nested userns capability available for `agy --sandbox`, `codex-linux-sandbox`, and `dots-hook-jail`.
         lines.append(f'exec {q_setpriv} --inh-caps=-all --ambient-caps=-all -- "$@"')
     else:
         # Drop all capabilities AND empty the capability bounding set for raw exec commands.
@@ -1219,6 +2005,19 @@ def _collect_sandbox_candidates(
                     _add_candidate(Path(entry.path), sub)
         except OSError:
             continue
+
+    sessions_bundle_dir = sandbox_root / "plugin_bundles" / "sessions"
+    if (
+        (cancel_event is None or not cancel_event.is_set())
+        and not sessions_bundle_dir.is_symlink()
+        and sessions_bundle_dir.is_dir()
+    ):
+        try:
+            with os.scandir(sessions_bundle_dir) as sess_it:
+                for sess_entry in sess_it:
+                    _add_candidate(Path(sess_entry.path), "plugin_bundles")
+        except OSError:
+            pass
 
     return candidates
 

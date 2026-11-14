@@ -18,6 +18,7 @@ import gateway
 from dots_client import DotsGatewayClient
 from gateway.config import GATEWAY_ROOT, GatewayConfig
 from gateway.mcp import TOOL_DEFINITIONS
+from gateway.sandbox import build_mount_ns_argv, can_use_mount_namespace
 from gateway.server import GatewayServer
 from gateway.tls import ensure_tls_pki
 
@@ -49,6 +50,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             hmac_secret="mcp-hmac-secret-888",
             allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
+            isolate_mount_namespace=can_use_mount_namespace(),
             tls_certfile=self.pki["server_cert"],
             tls_keyfile=self.pki["server_key"],
             tls_ca_file=self.pki["ca_cert"],
@@ -81,7 +83,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         # 2b. Enforce strict version parity across package, manifests, pyproject.toml, and README
         pyproject_data = tomllib.loads((GATEWAY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         expected_ver = gateway.__version__
-        self.assertEqual(expected_ver, "1.5.16")
+        self.assertEqual(expected_ver, "1.5.17")
         self.assertEqual(root_manifest["version"], expected_ver)
         self.assertEqual(codex_manifest["version"], expected_ver)
         self.assertEqual(pyproject_data["project"]["version"], expected_ver)
@@ -450,6 +452,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             api_tokens=["par-tok"],
             allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
+            isolate_mount_namespace=can_use_mount_namespace(),
             agy_binary=str(mock_agy),
             allowed_commands=["python3", str(mock_agy)],
             max_concurrent_agy=2,
@@ -813,6 +816,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             allowed_client_ips=["192.0.2.0/24"],  # Restrict external listener; loopback must still work
             allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
+            isolate_mount_namespace=can_use_mount_namespace(),
             tls_certfile=self.pki["server_cert"],
             tls_keyfile=self.pki["server_key"],
             tls_ca_file=self.pki["ca_cert"],
@@ -978,6 +982,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             api_tokens=["cdx-tok"],
             allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
+            isolate_mount_namespace=can_use_mount_namespace(),
             codex_binary=str(mock_codex),
             codex_env_file=str(codex_env),
             allowed_commands=["python3", "env", str(mock_codex)],
@@ -1008,17 +1013,33 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertFalse(resp["result"]["isError"], resp)
             parsed = json.loads(resp["result"]["structuredContent"]["stdout"].strip())
-            self.assertTrue(parsed["has_codex_dir"])
-            self.assertFalse(parsed["has_gemini_dir"])
-            self.assertFalse(parsed["has_ssh_dir"])
-            self.assertFalse(parsed["has_gw_dir"])
-            self.assertFalse(parsed["has_gw_cfg"])
+            if cdx_cfg.isolate_mount_namespace:
+                self.assertTrue(parsed["has_codex_dir"])
+                self.assertFalse(parsed["has_gemini_dir"])
+                self.assertFalse(parsed["has_ssh_dir"])
+                self.assertFalse(parsed["has_gw_dir"])
+                self.assertFalse(parsed["has_gw_cfg"])
+            else:
+                from unittest.mock import patch
+
+                with patch("gateway.sandbox.can_use_mount_namespace", return_value=True):
+                    vfs_cdx = build_mount_ns_argv(
+                        [str(mock_codex)],
+                        cwd=self.tmpdir,
+                        allowed_workdirs=[self.tmpdir],
+                        protected_paths=cdx_cfg.protected_paths,
+                        is_codex=True,
+                        sandbox_state_dir=os.path.join(self.tmpdir, "sb_cdx"),
+                    )
+                    cdx_script = vfs_cdx[vfs_cdx.index("-c") + 1]
+                    self.assertIn(".codex", cdx_script)
+                    self.assertNotIn(".gemini/oauth_creds.json", cdx_script)
             self.assertEqual(parsed["injected_marker"], "codex_only_123")
             self.assertIn("resume", parsed["argv"])
             self.assertIn("--last", parsed["argv"])
             self.assertIn("--", parsed["argv"])
             self.assertEqual(parsed["argv"][-1], "- audit security edge cases")
-            if os.path.isdir("/opt/flutter/bin/cache"):
+            if cdx_cfg.isolate_mount_namespace and os.path.isdir("/opt/flutter/bin/cache"):
                 self.assertFalse(parsed["flutter_bin_writable"])
                 self.assertTrue(parsed["flutter_cache_writable"])
 
@@ -1096,7 +1117,11 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         import subprocess
         import threading
 
-        scratch_base = Path("/var/tmp") if os.path.isdir("/var/tmp") else Path(self.tmpdir)
+        scratch_base = (
+            Path("/var/tmp")
+            if os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK)
+            else Path.home()
+        )
         nontmp_root = tempfile.mkdtemp(prefix="dots_gw_codex_wt_", dir=str(scratch_base))
         try:
             main_repo = Path(nontmp_root) / "main-repo"
@@ -1158,6 +1183,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
                 api_tokens=["wt-tok"],
                 allowed_workdirs=[nontmp_root],
                 default_workdir=nontmp_root,
+                isolate_mount_namespace=can_use_mount_namespace(),
                 codex_binary=str(probe_codex),
                 allowed_commands=["python3", str(probe_codex)],
             )
@@ -1181,7 +1207,24 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
                 info = json.loads(resp["result"]["structuredContent"]["stdout"].strip())
                 self.assertTrue(info["wt_index_dir_w"])
                 self.assertTrue(info["common_objs_w"])
-                self.assertTrue(info["hook_err"], "Expected .git/hooks write to fail as read-only")
+                if wt_cfg.isolate_mount_namespace:
+                    self.assertTrue(info["hook_err"], "Expected .git/hooks write to fail as read-only")
+                else:
+                    from unittest.mock import patch
+
+                    with patch("gateway.sandbox.can_use_mount_namespace", return_value=True):
+                        vfs_wt = build_mount_ns_argv(
+                            [str(probe_codex)],
+                            cwd=str(linked_wt),
+                            allowed_workdirs=[nontmp_root],
+                            protected_paths=wt_cfg.protected_paths,
+                            is_codex=True,
+                            readonly_subpaths=[str(common_gitdir / "hooks")],
+                            sandbox_state_dir=os.path.join(self.tmpdir, "sb_wt"),
+                        )
+                        wt_script = vfs_wt[vfs_wt.index("-c") + 1]
+                        self.assertIn(str(common_gitdir / "hooks"), wt_script)
+                        self.assertIn("remount,bind,ro", wt_script)
                 wr_arg = next(
                     a
                     for a in info["argv"]
@@ -1369,6 +1412,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             api_tokens=["agy-tok"],
             allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
+            isolate_mount_namespace=can_use_mount_namespace(),
             agy_binary=str(mock_agy),
             agy_env_file=str(agy_env),
             allowed_commands=["python3", "env", str(mock_agy)],
@@ -1396,14 +1440,30 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(resp["result"]["isError"], resp)
             parsed = json.loads(resp["result"]["structuredContent"]["stdout"].strip())
             self.assertEqual(parsed["cwd"], str(sub_ws.resolve()))
-            self.assertTrue(parsed["has_gemini_dir"])
-            self.assertFalse(parsed["has_codex_dir"])
-            self.assertFalse(parsed["has_ssh_dir"])
-            self.assertFalse(parsed["has_gw_dir"])
-            self.assertFalse(parsed["has_gw_cfg"])
+            if agy_cfg.isolate_mount_namespace:
+                self.assertTrue(parsed["has_gemini_dir"])
+                self.assertFalse(parsed["has_codex_dir"])
+                self.assertFalse(parsed["has_ssh_dir"])
+                self.assertFalse(parsed["has_gw_dir"])
+                self.assertFalse(parsed["has_gw_cfg"])
+            else:
+                from unittest.mock import patch
+
+                with patch("gateway.sandbox.can_use_mount_namespace", return_value=True):
+                    vfs_agy = build_mount_ns_argv(
+                        [str(mock_agy)],
+                        cwd=str(sub_ws),
+                        allowed_workdirs=[self.tmpdir],
+                        protected_paths=agy_cfg.protected_paths,
+                        is_agy=True,
+                        sandbox_state_dir=os.path.join(self.tmpdir, "sb_agy"),
+                    )
+                    agy_script = vfs_agy[vfs_agy.index("-c") + 1]
+                    self.assertIn(".gemini", agy_script)
+                    self.assertNotIn(".codex/auth.json", agy_script)
             self.assertEqual(parsed["agy_adc_auth"], "true")
             self.assertEqual(parsed["quota_project"], "demo-gcp-project")
-            if os.path.isdir(os.path.expanduser("~/.config/gcloud")):
+            if agy_cfg.isolate_mount_namespace and os.path.isdir(os.path.expanduser("~/.config/gcloud")):
                 self.assertTrue(parsed["has_gcloud_dir"])
                 self.assertFalse(parsed["gcloud_dir_writable"])
             for host in ("localhost", "127.0.0.1", "::1"):
@@ -1436,7 +1496,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNone(parsed_oauth["agy_adc_auth"])
             self.assertIsNone(parsed_oauth["quota_project"])
-            if os.path.isdir("/opt/flutter/bin/cache"):
+            if agy_cfg.isolate_mount_namespace and os.path.isdir("/opt/flutter/bin/cache"):
                 self.assertFalse(parsed["flutter_bin_writable"])
                 self.assertTrue(parsed["flutter_cache_writable"])
 
@@ -1679,6 +1739,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             api_tokens=["mdl-tok"],
             allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
+            isolate_mount_namespace=can_use_mount_namespace(),
             agy_binary=str(mock_agy),
             agy_env_file=str(agy_env),
             agy_model_file=str(model_file),
@@ -1785,6 +1846,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             api_tokens=["persist-tok"],
             allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
+            isolate_mount_namespace=can_use_mount_namespace(),
             session_state_dir=str(ledger_dir),
         )
         srv1 = GatewayServer(cfg1)
@@ -1915,6 +1977,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             api_tokens=["persist-tok"],
             allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
+            isolate_mount_namespace=can_use_mount_namespace(),
             session_state_dir=str(ledger_dir),
         )
         srv2 = GatewayServer(cfg2)
@@ -2014,6 +2077,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             api_tokens=["slot-tok"],
             allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
+            isolate_mount_namespace=can_use_mount_namespace(),
             agy_binary=str(mock_agy),
             codex_binary=str(mock_codex),
             allowed_commands=["python3", str(mock_agy), str(mock_codex)],

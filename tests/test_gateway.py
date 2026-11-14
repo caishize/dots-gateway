@@ -20,6 +20,7 @@ from gateway.config import (
     hash_password_pbkdf2,
 )
 from gateway.policy import CommandPolicy
+from gateway.sandbox import build_mount_ns_argv, can_use_mount_namespace
 from gateway.server import GatewayServer
 from gateway.tls import ensure_tls_pki
 
@@ -27,6 +28,23 @@ from gateway.tls import ensure_tls_pki
 class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.tmpdir = tempfile.mkdtemp(prefix="dots_gw_test_")
+        real_mns = can_use_mount_namespace()
+        agy_bin = shutil.which("agy") or "agy"
+        codex_bin = shutil.which("codex") or "codex"
+        extra_allowed_cmds = []
+        if not shutil.which("agy"):
+            stub_agy = Path(self.tmpdir) / "_ci_stub_agy.py"
+            stub_agy.write_text("#!/usr/bin/env python3\nimport sys\nprint('agy stub', sys.argv[1:])\n", encoding="utf-8")
+            stub_agy.chmod(0o755)
+            agy_bin = str(stub_agy)
+            extra_allowed_cmds.append(agy_bin)
+        if not shutil.which("codex"):
+            stub_cdx = Path(self.tmpdir) / "_ci_stub_codex.py"
+            stub_cdx.write_text("#!/usr/bin/env python3\nimport sys\nprint('codex stub', sys.argv[1:])\n", encoding="utf-8")
+            stub_cdx.chmod(0o755)
+            codex_bin = str(stub_cdx)
+            extra_allowed_cmds.append(codex_bin)
+        base_cmds = list(GatewayConfig().allowed_commands) + extra_allowed_cmds
         self.cfg = GatewayConfig(
             host="127.0.0.1",
             port=0,
@@ -37,6 +55,10 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
             rate_limit_window_seconds=60,
             allowed_workdirs=[self.tmpdir],
             default_workdir=self.tmpdir,
+            isolate_mount_namespace=real_mns,
+            agy_binary=agy_bin,
+            codex_binary=codex_bin,
+            allowed_commands=base_cmds,
             docker_proxy_socket=os.path.join(self.tmpdir, "gw-docker-proxy.sock"),
         )
         self.server = GatewayServer(self.cfg)
@@ -753,50 +775,65 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
         # 4. Kernel mount-namespace VFS jail hides ~/gateway, ~/.ssh, ~/.gemini, ~/.config/dots-gateway
         #    while preserving ~/.config/gh and persistent sandbox ~/.cache across separate commands
-        probe_code = (
-            "import json, os\n"
-            "cap_eff = ''\n"
-            "for line in open('/proc/self/status'):\n"
-            "    if line.startswith('CapEff:'):\n"
-            "        cap_eff = line.split()[1]\n"
-            f"gw_exists = os.path.exists({str(GATEWAY_ROOT)!r})\n"
-            "ssh_exists = os.path.exists(os.path.expanduser('~/.ssh'))\n"
-            "gem_exists = os.path.exists(os.path.expanduser('~/.gemini'))\n"
-            "cdx_exists = os.path.exists(os.path.expanduser('~/.codex'))\n"
-            "cfg_exists = os.path.exists(os.path.expanduser('~/.config/dots-gateway'))\n"
-            "gh_exists = os.path.isdir(os.path.expanduser('~/.config/gh'))\n"
-            f"ws_exists = os.path.isdir({self.tmpdir!r})\n"
-            "marker = os.path.expanduser('~/.cache/_unit_persist_probe')\n"
-            "open(marker, 'w').write('ok123')\n"
-            "print(json.dumps({'cap_eff': cap_eff, 'gw': gw_exists, 'ssh': ssh_exists, "
-            "'gem': gem_exists, 'cdx': cdx_exists, 'cfg': cfg_exists, 'gh': gh_exists, 'ws': ws_exists}))\n"
-        )
-        ns_res = await asyncio.to_thread(
-            client.exec_command, ["python3", "-c", probe_code], cwd=self.tmpdir
-        )
-        self.assertEqual(ns_res["returncode"], 0, ns_res["stderr"])
-        info = json.loads(ns_res["stdout"].strip())
-        self.assertEqual(info["cap_eff"], "0000000000000000")
-        self.assertFalse(info["gw"])
-        self.assertFalse(info["ssh"])
-        self.assertFalse(info["gem"])
-        self.assertFalse(info["cdx"])
-        self.assertFalse(info["cfg"])
-        self.assertTrue(info["gh"])
-        self.assertTrue(info["ws"])
+        if self.cfg.isolate_mount_namespace:
+            probe_code = (
+                "import json, os\n"
+                "cap_eff = ''\n"
+                "for line in open('/proc/self/status'):\n"
+                "    if line.startswith('CapEff:'):\n"
+                "        cap_eff = line.split()[1]\n"
+                f"gw_exists = os.path.exists({str(GATEWAY_ROOT)!r})\n"
+                "ssh_exists = os.path.exists(os.path.expanduser('~/.ssh'))\n"
+                "gem_exists = os.path.exists(os.path.expanduser('~/.gemini'))\n"
+                "cdx_exists = os.path.exists(os.path.expanduser('~/.codex'))\n"
+                "cfg_exists = os.path.exists(os.path.expanduser('~/.config/dots-gateway'))\n"
+                "gh_exists = os.path.isdir(os.path.expanduser('~/.config/gh'))\n"
+                f"ws_exists = os.path.isdir({self.tmpdir!r})\n"
+                "marker = os.path.expanduser('~/.cache/_unit_persist_probe')\n"
+                "open(marker, 'w').write('ok123')\n"
+                "print(json.dumps({'cap_eff': cap_eff, 'gw': gw_exists, 'ssh': ssh_exists, "
+                "'gem': gem_exists, 'cdx': cdx_exists, 'cfg': cfg_exists, 'gh': gh_exists, 'ws': ws_exists}))\n"
+            )
+            ns_res = await asyncio.to_thread(
+                client.exec_command, ["python3", "-c", probe_code], cwd=self.tmpdir
+            )
+            self.assertEqual(ns_res["returncode"], 0, ns_res["stderr"])
+            info = json.loads(ns_res["stdout"].strip())
+            self.assertEqual(info["cap_eff"], "0000000000000000")
+            self.assertFalse(info["gw"])
+            self.assertFalse(info["ssh"])
+            self.assertFalse(info["gem"])
+            self.assertFalse(info["cdx"])
+            self.assertFalse(info["cfg"])
+            self.assertTrue(info["gh"])
+            self.assertTrue(info["ws"])
 
-        # Second separate command verifies sandbox ~/.cache persisted across VFS invocations
-        ns_res2 = await asyncio.to_thread(
-            client.exec_command,
-            [
-                "python3",
-                "-c",
-                "import os; m=os.path.expanduser('~/.cache/_unit_persist_probe'); print(open(m).read()); os.remove(m)",
-            ],
-            cwd=self.tmpdir,
-        )
-        self.assertEqual(ns_res2["returncode"], 0, ns_res2["stderr"])
-        self.assertEqual(ns_res2["stdout"].strip(), "ok123")
+            # Second separate command verifies sandbox ~/.cache persisted across VFS invocations
+            ns_res2 = await asyncio.to_thread(
+                client.exec_command,
+                [
+                    "python3",
+                    "-c",
+                    "import os; m=os.path.expanduser('~/.cache/_unit_persist_probe'); print(open(m).read()); os.remove(m)",
+                ],
+                cwd=self.tmpdir,
+            )
+            self.assertEqual(ns_res2["returncode"], 0, ns_res2["stderr"])
+            self.assertEqual(ns_res2["stdout"].strip(), "ok123")
+        else:
+            from unittest.mock import patch
+
+            with patch("gateway.sandbox.can_use_mount_namespace", return_value=True):
+                vfs_argv = build_mount_ns_argv(
+                    ["python3", "-c", "pass"],
+                    cwd=self.tmpdir,
+                    allowed_workdirs=[self.tmpdir],
+                    protected_paths=self.cfg.protected_paths,
+                    sandbox_state_dir=os.path.join(self.tmpdir, "sb_check"),
+                )
+                vfs_script = vfs_argv[vfs_argv.index("-c") + 1]
+                self.assertIn("--bounding-set=-all", vfs_script)
+                self.assertIn(".config/gh", vfs_script)
 
     async def test_fullchain_fingerprint_and_tls_hot_reload(self) -> None:
         import time
@@ -1011,6 +1048,8 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         blocked_set_cfg = GatewayConfig.load(blocked_set_path)
         self.assertNotIn("set", blocked_set_cfg.allowed_commands)
 
+        if not can_use_mount_namespace():
+            loaded_cfg.isolate_mount_namespace = False
         legacy_srv = GatewayServer(loaded_cfg)
         h, p = await legacy_srv.start()
         try:
@@ -1054,7 +1093,8 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         from gateway.sandbox import SANDBOX_SUBDIRS, cleanup_sandbox_state
 
         sb_root = Path(tempfile.mkdtemp(prefix="dots_sb_store_"))
-        ws_dir = Path(tempfile.mkdtemp(prefix="dots_sb_ws_", dir="/var/tmp"))
+        ws_parent = "/var/tmp" if os.access("/var/tmp", os.W_OK) else str(Path.home())
+        ws_dir = Path(tempfile.mkdtemp(prefix="dots_sb_ws_", dir=ws_parent))
         try:
             sb_cfg = GatewayConfig(
                 host="127.0.0.1",
@@ -1062,6 +1102,7 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 api_tokens=["sb-tok"],
                 allowed_workdirs=[str(ws_dir)],
                 default_workdir=str(ws_dir),
+                isolate_mount_namespace=can_use_mount_namespace(),
                 sandbox_state_dir=str(sb_root),
                 sandbox_cleanup_enabled=False,
                 sandbox_max_retention_days=30.0,

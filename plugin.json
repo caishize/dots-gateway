@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "dots-gateway",
-  "version": "1.5.16",
+  "version": "1.5.17",
   "description": "Remote development, Antigravity (agy) & OpenAI Codex (codex) MCP plugin enabling OpenAI dots to inspect/edit local files, execute allowlisted dev commands, and run agy or codex.",
   "author": {
     "name": "caishize",
@@ -19,7 +19,7 @@
       "interface": {
         "displayName": "Dots Remote Dev Gateway",
         "shortDescription": "Run local dev commands, edit workspace files, and invoke agy or codex via MCP",
-        "longDescription": "Bridges OpenAI dots to your remote development machine over a hardened TLS 1.3 + HMAC-SHA256 gateway via the Model Context Protocol (MCP). Provides atomic workspace file operations (fs_read, fs_write, fs_patch, fs_list, fs_stat, fs_delete), allowlisted shell/build/test execution inside a Linux mount-namespace jail (exec_command), multi-turn background sessions (session_*), model discovery (list_agy_models), operator-registered read-only AGY plugin isolation, optional policy-filtered Docker access, and unattended Antigravity (run_agy) & OpenAI Codex (run_codex) delegation.",
+        "longDescription": "Bridges OpenAI dots to your remote development machine over a hardened TLS 1.3 + HMAC-SHA256 gateway via the Model Context Protocol (MCP). Provides atomic workspace file operations (fs_read, fs_write, fs_patch, fs_list, fs_stat, fs_delete), allowlisted shell/build/test execution inside a Linux mount-namespace jail (exec_command), multi-turn background sessions (session_*), model discovery (list_agy_models), isolated read-only AGY & Codex plugin discovery with unified native hook sandboxing, optional policy-filtered Docker access, and unattended Antigravity (run_agy) & OpenAI Codex (run_codex) delegation.",
         "developerName": "caishize",
         "category": "Development",
         "capabilities": ["Read", "Write"],

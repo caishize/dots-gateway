@@ -21,10 +21,14 @@ class FileService:
     def __init__(self, policy: CommandPolicy) -> None:
         self.policy = policy
 
-    def _resolve_safe_path(self, path_str: str, cwd: Optional[str] = None) -> Path:
+    def _resolve_safe_path(
+        self, path_str: str, cwd: Optional[str] = None, *, for_write: bool = False
+    ) -> Path:
         if not path_str or not str(path_str).strip():
             raise ValueError("Missing required 'path'")
-        ok, err, resolved = self.policy.validate_path(str(path_str), base_cwd=cwd)
+        ok, err, resolved = self.policy.validate_path(
+            str(path_str), base_cwd=cwd, for_write=for_write
+        )
         if not ok:
             raise PermissionError(err)
         return Path(resolved)
@@ -93,19 +97,29 @@ class FileService:
 
         def _is_hidden_entry(p: Path) -> bool:
             lex = os.path.abspath(str(p))
-            if self.policy.is_protected_path(lex) or self.policy.is_agy_plugin_path(lex):
+            if (
+                self.policy.is_protected_path(lex)
+                or self.policy.is_agy_plugin_path(lex)
+                or self.policy.is_codex_plugin_path(lex)
+                or self.policy.is_plugin_state_path(lex)
+            ):
                 return True
             try:
                 res = str(p.resolve())
             except OSError:
                 return True
-            return self.policy.is_protected_path(res) or self.policy.is_agy_plugin_path(res)
+            return (
+                self.policy.is_protected_path(res)
+                or self.policy.is_agy_plugin_path(res)
+                or self.policy.is_codex_plugin_path(res)
+                or self.policy.is_plugin_state_path(res)
+            )
 
         if recursive:
             for root, dirs, files in os.walk(target):
                 dirs.sort()
                 files.sort()
-                # Skip protected and AGY-only plugin directories
+                # Skip protected, plugin-resource, and plugin-state directories
                 dirs[:] = [
                     d
                     for d in dirs
@@ -208,10 +222,10 @@ class FileService:
         mkdir_parents: bool = True,
         mode: Optional[str] = None,
     ) -> Dict[str, Any]:
-        target = self._resolve_safe_path(path_str, cwd=cwd)
+        target = self._resolve_safe_path(path_str, cwd=cwd, for_write=True)
         parent = target.parent
         # Re-verify parent after resolving any symlinks
-        ok_parent, err_parent, _ = self.policy.validate_path(str(parent))
+        ok_parent, err_parent, _ = self.policy.validate_path(str(parent), for_write=True)
         if not ok_parent:
             raise PermissionError(err_parent)
 
@@ -261,7 +275,7 @@ class FileService:
         edits: List[Dict[str, str]],
         cwd: Optional[str] = None,
     ) -> Dict[str, Any]:
-        target = self._resolve_safe_path(path_str, cwd=cwd)
+        target = self._resolve_safe_path(path_str, cwd=cwd, for_write=True)
         if not target.exists() or not target.is_file():
             raise FileNotFoundError(f"File not found: {target}")
         if not edits or not isinstance(edits, list):
@@ -299,7 +313,7 @@ class FileService:
         path_str: str,
         cwd: Optional[str] = None,
     ) -> Dict[str, Any]:
-        target = self._resolve_safe_path(path_str, cwd=cwd)
+        target = self._resolve_safe_path(path_str, cwd=cwd, for_write=True)
         # Never allow deleting workspace roots themselves
         for root in self.policy._allowed_roots:
             if str(target) == root:
