@@ -49,6 +49,7 @@ SANDBOX_SUBDIRS: Tuple[str, ...] = (
     "docker_cfg",
     "plugin_bundles",
     "plugin_state",
+    "codex_home",
 )
 SANDBOX_MANAGED_SUBDIRS: Tuple[str, ...] = (
     "tmp",
@@ -659,11 +660,86 @@ def _agy_registered_plugin_mount_lines(
     return out
 
 
+def _prepare_isolated_codex_home_backing_dir(sandbox_state: Path) -> Path:
+    """Prepare and sanitize `<sandbox_state>/codex_home` as disk backing for isolated `$CODEX_HOME`.
+
+    Prevents `64m`/`128m` root `tmpfs` exhaustion (`ENOSPC` / `SQLITE_FULL`) when Codex indexes
+    rollout history (`state_5.sqlite`, `thread_history_1.sqlite`, `logs_2.sqlite`) and stages
+    `.tmp/` / `shell_snapshots/` / `hook_outputs/`, while rejecting symlinked mountpoints and
+    ensuring unmanaged config/hook files cannot persist on the backing directory.
+    """
+    backing = sandbox_state / "codex_home"
+    if os.path.islink(backing):
+        raise SandboxStorageError(
+            f"Isolated Codex backing directory '{redact_diagnostic_text(str(backing))}' must not be a symlink"
+        )
+    newly_created = not os.path.lexists(backing)
+    backing.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if newly_created:
+        os.chmod(backing, 0o700)
+    st_b = os.lstat(backing)
+    if stat.S_ISLNK(st_b.st_mode) or not stat.S_ISDIR(st_b.st_mode):
+        raise SandboxStorageError(
+            f"Isolated Codex backing path '{redact_diagnostic_text(str(backing))}' is not a regular directory"
+        )
+    if st_b.st_mode & 0o002:
+        raise SandboxStorageError(
+            f"Isolated Codex backing directory '{redact_diagnostic_text(str(backing))}' must not be world-writable"
+        )
+
+    for forbidden_cfg in ("managed_config.toml", "requirements.toml"):
+        forb_p = backing / forbidden_cfg
+        if os.path.islink(forb_p) or forb_p.is_dir():
+            raise SandboxStorageError(
+                f"Forbidden entry '{redact_diagnostic_text(str(forb_p))}' in isolated Codex backing directory"
+            )
+        if os.path.lexists(forb_p):
+            forb_p.unlink(missing_ok=True)
+
+    open_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    for file_mp in ("auth.json", "config.toml", "hooks.json"):
+        mp_f = backing / file_mp
+        if os.path.islink(mp_f):
+            raise SandboxStorageError(
+                f"Symlinked mountpoint '{redact_diagnostic_text(str(mp_f))}' in isolated Codex backing directory is forbidden"
+            )
+        if os.path.lexists(mp_f):
+            st_f = os.lstat(mp_f)
+            if stat.S_ISLNK(st_f.st_mode) or not stat.S_ISREG(st_f.st_mode):
+                raise SandboxStorageError(
+                    f"Non-regular mountpoint '{redact_diagnostic_text(str(mp_f))}' in isolated Codex backing directory is forbidden"
+                )
+            if st_f.st_size > 0:
+                fd_trunc = os.open(str(mp_f), os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                os.close(fd_trunc)
+        else:
+            fd_new = os.open(str(mp_f), open_flags, 0o600)
+            os.close(fd_new)
+
+    for dir_mp in ("sessions", "archived_sessions", "bin", "plugins"):
+        mp_d = backing / dir_mp
+        if os.path.islink(mp_d):
+            raise SandboxStorageError(
+                f"Symlinked directory mountpoint '{redact_diagnostic_text(str(mp_d))}' in isolated Codex backing directory is forbidden"
+            )
+        if os.path.lexists(mp_d):
+            st_d = os.lstat(mp_d)
+            if stat.S_ISLNK(st_d.st_mode) or not stat.S_ISDIR(st_d.st_mode):
+                raise SandboxStorageError(
+                    f"Non-directory mountpoint '{redact_diagnostic_text(str(mp_d))}' in isolated Codex backing directory is forbidden"
+                )
+        else:
+            mp_d.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    return backing
+
+
 def _codex_isolated_runtime_mount_lines(
     stage_dir: str,
     host_home_dir: str,
     q_mount: str,
     runtime: PreparedAgentPluginRuntime,
+    sandbox_state: Optional[Path] = None,
 ) -> List[str]:
     """Build fail-closed shell lines populating isolated `$CODEX_HOME` and read-only plugin bundles."""
     if not runtime.vfs_codex_home_dir or not runtime.host_codex_config_toml:
@@ -673,17 +749,46 @@ def _codex_isolated_runtime_mount_lines(
     q_vcx = shlex.quote(f"{stage_dir}{vfs_codex_home}")
     out: List[str] = [f"mkdir -p {q_vcx}"]
 
+    if sandbox_state is not None:
+        codex_backing = _prepare_isolated_codex_home_backing_dir(sandbox_state)
+        q_backing = shlex.quote(str(codex_backing))
+        out.extend(
+            [
+                f"[ ! -L {q_backing} ] && [ -d {q_backing} ]",
+                f"{q_mount} --rbind {q_backing} {q_vcx}",
+            ]
+        )
+
+    # Permanently mask `$CODEX_HOME/hooks.json` with `/dev/null` so unmanaged global hooks can never run or be created.
+    q_hooks_null_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_codex_home, 'hooks.json')}")
+    out.extend(
+        [
+            f"[ ! -L {q_hooks_null_dst} ]",
+            f"[ -e {q_hooks_null_dst} ] || touch {q_hooks_null_dst}",
+            f"{q_mount} --bind /dev/null {q_hooks_null_dst}",
+        ]
+    )
+
     # Mount auth.json read-only into outer VFS so Codex CLI can authenticate without mutating auth,
     # while `dots-hook-jail.py` never mounts `vfs_codex_home`, keeping auth.json 100% invisible to hooks.
+    q_auth_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_codex_home, 'auth.json')}")
     host_auth = os.path.join(host_codex_dir, "auth.json")
     if os.path.isfile(host_auth) and not os.path.islink(host_auth):
         q_auth_src = shlex.quote(os.path.realpath(host_auth))
-        q_auth_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_codex_home, 'auth.json')}")
         out.extend(
             [
-                f"touch {q_auth_dst}",
+                f"[ ! -L {q_auth_dst} ]",
+                f"[ -e {q_auth_dst} ] || touch {q_auth_dst}",
                 f"{q_mount} --bind {q_auth_src} {q_auth_dst}",
                 _remount_ro_cmd(q_mount, q_auth_dst, noexec=True),
+            ]
+        )
+    elif sandbox_state is not None:
+        out.extend(
+            [
+                f"[ ! -L {q_auth_dst} ]",
+                f"[ -e {q_auth_dst} ] || touch {q_auth_dst}",
+                f"{q_mount} --bind /dev/null {q_auth_dst}",
             ]
         )
 
@@ -702,20 +807,30 @@ def _codex_isolated_runtime_mount_lines(
             q_s_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_codex_home, rw_sub)}")
             out.extend(
                 [
+                    f"[ ! -L {q_s_dst} ]",
                     f"mkdir -p {q_s_dst}",
                     f"{q_mount} --rbind {q_s_src} {q_s_dst}",
                 ]
             )
 
+    q_cb_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_codex_home, 'bin')}")
     host_cx_bin = Path(host_codex_dir) / "bin"
     if host_cx_bin.is_dir() and not host_cx_bin.is_symlink():
         q_cb_src = shlex.quote(str(host_cx_bin.resolve()))
-        q_cb_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_codex_home, 'bin')}")
         out.extend(
             [
+                f"[ ! -L {q_cb_dst} ]",
                 f"mkdir -p {q_cb_dst}",
                 f"{q_mount} --bind {q_cb_src} {q_cb_dst}",
                 _remount_ro_cmd(q_mount, q_cb_dst),
+            ]
+        )
+    elif sandbox_state is not None:
+        out.extend(
+            [
+                f"[ ! -L {q_cb_dst} ]",
+                f"mkdir -p {q_cb_dst}",
+                f"{q_mount} -t tmpfs -o size=4k,mode=0555,ro,nosuid,nodev,noexec tmpfs {q_cb_dst}",
             ]
         )
 
@@ -723,17 +838,22 @@ def _codex_isolated_runtime_mount_lines(
     q_toml_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_codex_home, 'config.toml')}")
     out.extend(
         [
-            f"[ ! -L {q_toml_src} ] && [ -f {q_toml_src} ]",
-            f"touch {q_toml_dst}",
+            f"[ ! -L {q_toml_src} ] && [ -f {q_toml_src} ] && [ ! -L {q_toml_dst} ]",
+            f"[ -e {q_toml_dst} ] || touch {q_toml_dst}",
             f"{q_mount} --bind {q_toml_src} {q_toml_dst}",
             _remount_ro_cmd(q_mount, q_toml_dst, noexec=True),
         ]
     )
 
-    cache_root = os.path.join(vfs_codex_home, "plugins", "cache")
+    plugins_root = os.path.join(vfs_codex_home, "plugins")
+    q_plugins_root = shlex.quote(f"{stage_dir}{plugins_root}")
+    cache_root = os.path.join(plugins_root, "cache")
     q_cache_root = shlex.quote(f"{stage_dir}{cache_root}")
     out.extend(
         [
+            f"[ ! -L {q_plugins_root} ]",
+            f"mkdir -p {q_plugins_root}",
+            f"{q_mount} -t tmpfs -o size=16m,mode=0755,nosuid,nodev tmpfs {q_plugins_root}",
             f"mkdir -p {q_cache_root}",
             f"{q_mount} -t tmpfs -o size=8m,mode=0755,nosuid,nodev tmpfs {q_cache_root}",
         ]
@@ -1150,11 +1270,13 @@ def _mask_protected_and_workspace_hook_lines(
     if sandbox_state is not None:
         internal_host_dirs.append(os.path.abspath(str(sandbox_state / "plugin_bundles")))
         internal_host_dirs.append(os.path.abspath(str(sandbox_state / "plugin_state")))
+        internal_host_dirs.append(os.path.abspath(str(sandbox_state / "codex_home")))
     if sandbox_state_dir_raw:
         try:
             sb_lex = os.path.abspath(os.path.expanduser(str(sandbox_state_dir_raw).strip()))
             internal_host_dirs.append(os.path.join(sb_lex, "plugin_bundles"))
             internal_host_dirs.append(os.path.join(sb_lex, "plugin_state"))
+            internal_host_dirs.append(os.path.join(sb_lex, "codex_home"))
         except OSError:
             pass
     if plugin_state_dir:
@@ -1457,7 +1579,7 @@ def build_mount_ns_argv(
 
     lines: List[str] = [
         "set -euo pipefail",
-        f"{q_mount} -t tmpfs -o size=64m,mode=0755 tmpfs {q_stage}",
+        f"{q_mount} -t tmpfs -o size=128m,mode=0755 tmpfs {q_stage}",
     ]
     if stage_dir == "/dev/shm":
         lines.extend(
@@ -1887,7 +2009,11 @@ def build_mount_ns_argv(
         )
         lines.extend(
             _codex_isolated_runtime_mount_lines(
-                stage_dir, home_dir, q_mount, prepared_plugin_runtime
+                stage_dir,
+                home_dir,
+                q_mount,
+                prepared_plugin_runtime,
+                sandbox_state=sandbox_state,
             )
         )
 
@@ -2251,6 +2377,21 @@ def _collect_sandbox_candidates(
                     _add_candidate(Path(sess_entry.path), "plugin_bundles")
         except OSError:
             pass
+
+    for cx_ephemeral in ("shell_snapshots", "hook_outputs", "log"):
+        cx_sub_dir = sandbox_root / "codex_home" / cx_ephemeral
+        if (
+            (cancel_event is None or not cancel_event.is_set())
+            and not (sandbox_root / "codex_home").is_symlink()
+            and not cx_sub_dir.is_symlink()
+            and cx_sub_dir.is_dir()
+        ):
+            try:
+                with os.scandir(cx_sub_dir) as cx_it:
+                    for cx_entry in cx_it:
+                        _add_candidate(Path(cx_entry.path), "codex_home")
+            except OSError:
+                pass
 
     return candidates
 

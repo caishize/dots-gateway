@@ -2461,6 +2461,236 @@ class TestPluginIsolationAndHooksV1517(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(res["fl_dt_rw"], res)
                 self.assertTrue(res["fl_pubspec_ro"], res)
 
+    def test_v1521_hook_jail_ready_sentinel_fail_closed_and_empty_dotgit(self) -> None:
+        """Verify v1.5.21 hardenings:
+        1. Empty `.git/` directories are ignored for `writable_git_dirs` and do not shadow parent repos,
+           while symlinked `.git/hooks` inside an empty `.git/` still fails closed.
+        2. `dots-hook-jail.py` removes the redundant `/bin/true` probe `unshare`, uses a `READY` pipe
+           sentinel to fail closed (`exit 2` + deny JSON) on pre-exec jail setup errors and unexpected
+           `PreToolUse` hook crashes (`rc=1`), and writes redacted `O_NOFOLLOW` diagnostics.
+        """
+        from gateway.hook_jail import render_hook_jail_runner_source
+        from gateway.sandbox import can_use_mount_namespace
+
+        # 1a. Standalone empty `.git/` directory is NOT added to writable git metadata dirs
+        empty_git_ws = self.workspace_root / "empty-dotgit-ws"
+        (empty_git_ws / ".git").mkdir(parents=True, exist_ok=True)
+        rw_empty, ro_empty = self.server.policy.resolve_codex_git_metadata_dirs(cwd=str(empty_git_ws))
+        self.assertEqual(rw_empty, [])
+        self.assertEqual(ro_empty, [])
+        self.assertNotIn(
+            str((empty_git_ws / ".git").resolve()),
+            self.server.policy.get_codex_writable_roots(cwd=str(empty_git_ws)),
+        )
+
+        # 1b. Empty `.git/` inside a subdirectory of a real Git repo does not block upward discovery
+        nested_sub = self.project_dir / "nested-bogus-dotgit"
+        (nested_sub / ".git").mkdir(parents=True, exist_ok=True)
+        rw_nested, _ = self.server.policy.resolve_codex_git_metadata_dirs(cwd=str(nested_sub))
+        self.assertIn(str((self.project_dir / ".git").resolve()), rw_nested)
+        self.assertNotIn(str((nested_sub / ".git").resolve()), rw_nested)
+        shutil.rmtree(nested_sub, ignore_errors=True)
+
+        # 2a. Verify runner source eliminated double-unshare `/bin/true` probe & has READY sentinel
+        runner_src = render_hook_jail_runner_source()
+        self.assertNotIn('"--mount", "/bin/true"', runner_src)
+        self.assertIn("printf 'READY'", runner_src)
+        self.assertIn(".dots-hook-jail-diag.log", runner_src)
+
+        runner_file = self.test_root / "dots-hook-jail-v1521.py"
+        runner_file.write_text(runner_src, encoding="utf-8")
+        os.chmod(runner_file, 0o755)
+
+        htmp = self.test_root / "v1521-htmp"
+        hdata = self.test_root / "v1521-hdata"
+        htmp.mkdir(parents=True, exist_ok=True)
+        hdata.mkdir(parents=True, exist_ok=True)
+
+        sample_stdin = json.dumps(
+            {
+                "cwd": str(self.project_dir),
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo ok"},
+            }
+        )
+
+        if can_use_mount_namespace():
+            # 2b. Pre-exec nested mount failure (missing plugin_vfs_dir & plugin_source_dir -> `[ -d ... ]`
+            # fails inside `unshare /bin/bash -c "set -euo pipefail ..."` before `READY`!) MUST exit 2 + deny JSON!
+            broken_jail_cfg = {
+                "schema_version": 1,
+                "agent": "codex",
+                "plugin_name": "oh-my-agents",
+                "event_name": "PreToolUse",
+                "resolved_argv": ["/bin/true"],
+                "plugin_vfs_dir": str(self.test_root / "nonexistent-plg-vfs"),
+                "plugin_source_dir": str(self.test_root / "nonexistent-plg-src"),
+                "hook_tmp_dir": str(htmp),
+                "hook_data_dir": str(hdata),
+                "allowed_workspaces": [str(self.workspace_root)],
+                "masked_paths": [str(self.secrets_dir)],
+                "readonly_subpaths": [],
+                "require_mount_ns": True,
+            }
+            broken_cfg_p = self.test_root / "broken-jail-cfg.json"
+            broken_cfg_p.write_text(json.dumps(broken_jail_cfg), encoding="utf-8")
+            broken_res = subprocess.run(
+                [sys.executable, "-I", str(runner_file), "--config", str(broken_cfg_p)],
+                input=sample_stdin,
+                text=True,
+                capture_output=True,
+                cwd=str(self.project_dir),
+                timeout=10,
+            )
+            self.assertEqual(broken_res.returncode, 2, broken_res.stderr)
+            self.assertEqual(json.loads(broken_res.stdout)["decision"], "deny")
+            self.assertIn("mount-namespace hook isolation is required", broken_res.stderr)
+            diag_log = htmp / ".dots-hook-jail-diag.log"
+            self.assertTrue(diag_log.is_file())
+            self.assertIn("stage=jail_setup", diag_log.read_text(encoding="utf-8"))
+
+        # 2c. Unexpected `rc=1` crash inside `PreToolUse` hook script fails closed (`exit 2` + deny JSON)
+        #     and `O_NOFOLLOW` refuses symlinked `.dots-hook-jail-diag.log`
+        crash_cfg = {
+            "schema_version": 1,
+            "agent": "codex",
+            "plugin_name": "oh-my-agents",
+            "event_name": "PreToolUse",
+            "resolved_argv": ["/bin/false"],
+            "plugin_vfs_dir": str(self.oma_codex_dir),
+            "plugin_source_dir": str(self.oma_codex_dir),
+            "hook_tmp_dir": str(htmp),
+            "hook_data_dir": str(hdata),
+            "allowed_workspaces": [str(self.workspace_root)],
+            "masked_paths": [str(self.secrets_dir)],
+            "readonly_subpaths": [],
+            "require_mount_ns": can_use_mount_namespace(),
+        }
+        crash_cfg_p = self.test_root / "crash-hook-cfg.json"
+        crash_cfg_p.write_text(json.dumps(crash_cfg), encoding="utf-8")
+
+        victim_file = self.test_root / "victim-diag-target.txt"
+        victim_file.write_text("SAFE\n", encoding="utf-8")
+        diag_log_p = htmp / ".dots-hook-jail-diag.log"
+        diag_log_p.unlink(missing_ok=True)
+        os.symlink(victim_file, diag_log_p)
+
+        crash_res = subprocess.run(
+            [sys.executable, "-I", str(runner_file), "--config", str(crash_cfg_p)],
+            input=sample_stdin,
+            text=True,
+            capture_output=True,
+            cwd=str(self.project_dir),
+            timeout=10,
+        )
+        self.assertEqual(crash_res.returncode, 2, crash_res.stderr)
+        self.assertEqual(json.loads(crash_res.stdout)["decision"], "deny")
+        self.assertEqual(victim_file.read_text(encoding="utf-8"), "SAFE\n")
+        diag_log_p.unlink(missing_ok=True)
+
+        # 3. Disk-backed isolated `$CODEX_HOME` (`<sandbox_state>/codex_home`) prevents root `tmpfs`
+        #    `ENOSPC` / `SQLITE_FULL` while preserving strict masking, `/dev/null` `hooks.json`, and
+        #    symlink fail-closed invariants.
+        from gateway.sandbox import (
+            SANDBOX_SUBDIRS,
+            _codex_isolated_runtime_mount_lines,
+            _prepare_isolated_codex_home_backing_dir,
+        )
+
+        self.assertIn("codex_home", SANDBOX_SUBDIRS)
+
+        cx_sb = self.test_root / "v1521-codex-sb"
+        cx_sb.mkdir(parents=True, exist_ok=True)
+        os.chmod(cx_sb, 0o700)
+
+        # 3a. Symlinked `<sandbox_state>/codex_home` fails closed
+        os.symlink(self.test_root, cx_sb / "codex_home")
+        with self.assertRaises(SandboxStorageError):
+            _prepare_isolated_codex_home_backing_dir(cx_sb)
+        (cx_sb / "codex_home").unlink()
+
+        # 3b. Valid preparation creates 0700 backing dir + 0-byte mountpoints & strips forbidden configs
+        backing = _prepare_isolated_codex_home_backing_dir(cx_sb)
+        self.assertEqual(backing, cx_sb / "codex_home")
+        (backing / "managed_config.toml").write_text("bad = true\n", encoding="utf-8")
+        (backing / "config.toml").write_text("stale = true\n", encoding="utf-8")
+        _prepare_isolated_codex_home_backing_dir(cx_sb)
+        self.assertFalse((backing / "managed_config.toml").exists())
+        self.assertEqual((backing / "config.toml").stat().st_size, 0)
+        self.assertEqual((backing / "hooks.json").stat().st_size, 0)
+
+        # 3c. Symlinked mountpoint file inside `codex_home` fails closed
+        (backing / "hooks.json").unlink()
+        os.symlink(victim_file, backing / "hooks.json")
+        with self.assertRaises(SandboxStorageError):
+            _prepare_isolated_codex_home_backing_dir(cx_sb)
+        (backing / "hooks.json").unlink()
+
+        # 3d. Isolated Codex runtime mount lines bind `<sandbox_state>/codex_home`, mask `hooks.json`
+        #     with `/dev/null`, and mount `tmpfs` over `plugins`
+        self._set_codex_registry(True, [str(self.oma_codex_dir)])
+        validated_plgs = self.server.policy.validate_codex_plugins()
+        cx_rt = prepare_codex_plugin_runtime(
+            self.cfg,
+            validated_plugins=validated_plgs,
+            sandbox_state_root=self.sandbox_dir,
+            allowed_workspaces=[str(self.workspace_root)],
+            masked_paths=[str(self.secrets_dir)],
+            readonly_subpaths=[],
+            session_tag="sess_v1521_cx_backing",
+        )
+        try:
+            mount_lines = "\n".join(
+                _codex_isolated_runtime_mount_lines(
+                    stage_dir="/tmp/stage",
+                    host_home_dir=str(self.user_home),
+                    q_mount="/usr/bin/mount",
+                    runtime=cx_rt,
+                    sandbox_state=cx_sb,
+                )
+            )
+            self.assertIn(f"--rbind {str(backing)} /tmp/stage/mnt/dots-agent-home/codex/.codex", mount_lines)
+            self.assertIn("--bind /dev/null /tmp/stage/mnt/dots-agent-home/codex/.codex/hooks.json", mount_lines)
+            self.assertIn("tmpfs /tmp/stage/mnt/dots-agent-home/codex/.codex/plugins", mount_lines)
+
+            # 3e. Policy & hook-jail mask host `<sandbox_state_dir>/codex_home` from File API, Docker, and hooks
+            host_codex_backing = self.sandbox_dir / "codex_home"
+            host_codex_backing.mkdir(parents=True, exist_ok=True)
+            self.assertTrue(self.server.policy.is_plugin_state_path(str(host_codex_backing / "state_5.sqlite")))
+            self.assertIn(
+                str(host_codex_backing.resolve()),
+                self.server.sessions._hook_jail_masked_paths(),
+            )
+            if can_use_mount_namespace():
+                # Outer VFS masks host `<sandbox_state_dir>/codex_home` with 4k ro tmpfs while
+                # `/mnt/dots-agent-home/codex/.codex` inside VFS stays writable on disk!
+                probe_argv = build_mount_ns_argv(
+                    [
+                        "/bin/sh",
+                        "-c",
+                        (
+                            f"test -z \"$(ls -A {str(host_codex_backing)})\" && "
+                            "echo ok > /mnt/dots-agent-home/codex/.codex/sqlite_probe.tmp && "
+                            "echo x > /mnt/dots-agent-home/codex/.codex/hooks.json && "
+                            "test ! -s /mnt/dots-agent-home/codex/.codex/hooks.json"
+                        ),
+                    ],
+                    cwd=str(self.project_dir),
+                    allowed_workdirs=[str(self.workspace_root)],
+                    protected_paths=self.cfg.protected_paths,
+                    is_codex=True,
+                    codex_plugins_enabled=True,
+                    codex_plugin_mounts=[(p.name, p.source_dir) for p in validated_plgs],
+                    prepared_plugin_runtime=cx_rt,
+                    sandbox_state_dir=str(self.sandbox_dir),
+                    plugin_state_dir=str(self.plugin_state_dir),
+                )
+                p_res = subprocess.run(probe_argv, capture_output=True, text=True, timeout=15)
+                self.assertEqual(p_res.returncode, 0, p_res.stderr)
+                self.assertTrue((host_codex_backing / "sqlite_probe.tmp").is_file())
+        finally:
+            cleanup_prepared_plugin_runtime(cx_rt)
+
 
 if __name__ == "__main__":
     unittest.main()

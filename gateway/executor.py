@@ -1517,6 +1517,9 @@ class SessionManager:
             extra_mandatory.append(
                 os.path.join(str(self.config.sandbox_state_dir), "plugin_bundles")
             )
+            extra_mandatory.append(
+                os.path.join(str(self.config.sandbox_state_dir), "codex_home")
+            )
         for raw_p in extra_mandatory:
             if not raw_p:
                 continue

@@ -964,12 +964,13 @@ class CommandPolicy:
             try:
                 exp_sb = os.path.expanduser(str(raw_sb).strip())
                 if exp_sb.startswith("/") and exp_sb != "/":
-                    bundles_lex = os.path.join(os.path.abspath(exp_sb), "plugin_bundles")
-                    guards.append(bundles_lex)
-                    if os.path.exists(exp_sb):
-                        guards.append(os.path.join(os.path.realpath(exp_sb), "plugin_bundles"))
-                    if os.path.exists(bundles_lex):
-                        guards.append(os.path.realpath(bundles_lex))
+                    for int_sub in ("plugin_bundles", "codex_home"):
+                        sub_lex = os.path.join(os.path.abspath(exp_sb), int_sub)
+                        guards.append(sub_lex)
+                        if os.path.exists(exp_sb):
+                            guards.append(os.path.join(os.path.realpath(exp_sb), int_sub))
+                        if os.path.exists(sub_lex):
+                            guards.append(os.path.realpath(sub_lex))
             except OSError:
                 pass
         raw_rt = getattr(self.config, "agent_runtime_home_root", "/mnt/dots-agent-home")
@@ -2493,6 +2494,11 @@ class CommandPolicy:
                 os.path.join(str(self.config.sandbox_state_dir), "plugin_bundles"),
                 "sandbox plugin_bundles staging",
             )
+            _register_boundary(
+                protected_boundaries,
+                os.path.join(str(self.config.sandbox_state_dir), "codex_home"),
+                "sandbox isolated codex_home backing",
+            )
 
         writable_boundaries: List[Tuple[str, str]] = []
         for ws_p in self.config.allowed_workdirs:
@@ -2520,6 +2526,11 @@ class CommandPolicy:
                 writable_boundaries,
                 os.path.join(str(self.config.sandbox_state_dir), "plugin_bundles"),
                 "sandbox plugin_bundles staging",
+            )
+            _register_boundary(
+                writable_boundaries,
+                os.path.join(str(self.config.sandbox_state_dir), "codex_home"),
+                "sandbox isolated codex_home backing",
             )
         _register_boundary(
             writable_boundaries,
@@ -4174,14 +4185,16 @@ class CommandPolicy:
         readonly_hook_dirs: List[str] = []
         seen_hook_dirs: set[str] = set()
 
-        def _record_git_dir(raw_cand: Path) -> Optional[str]:
-            ok_gd, _, resolved_gd = self.validate_workdir(str(raw_cand))
-            if not ok_gd:
-                return None
-            if resolved_gd not in seen_git_dirs:
-                seen_git_dirs.add(resolved_gd)
-                writable_git_dirs.append(resolved_gd)
-            hooks_cand = os.path.join(resolved_gd, "hooks")
+        def _has_git_metadata_markers(validated_gd: str) -> bool:
+            gd_path = Path(validated_gd)
+            for marker in ("HEAD", "commondir", "config", "objects"):
+                cand_m = gd_path / marker
+                if cand_m.exists() or cand_m.is_symlink():
+                    return True
+            return False
+
+        def _inspect_git_hooks(validated_gd: str) -> None:
+            hooks_cand = os.path.join(validated_gd, "hooks")
             if os.path.islink(hooks_cand):
                 self._raise_plugin_policy_error(
                     f"Symlinked git hooks path '{hooks_cand}' is forbidden by security policy"
@@ -4191,6 +4204,17 @@ class CommandPolicy:
                 if ok_hk and resolved_hk not in seen_hook_dirs:
                     seen_hook_dirs.add(resolved_hk)
                     readonly_hook_dirs.append(resolved_hk)
+
+        def _record_git_dir(raw_cand: Path) -> Optional[str]:
+            ok_gd, _, resolved_gd = self.validate_workdir(str(raw_cand))
+            if not ok_gd:
+                return None
+            _inspect_git_hooks(resolved_gd)
+            if not _has_git_metadata_markers(resolved_gd):
+                return None
+            if resolved_gd not in seen_git_dirs:
+                seen_git_dirs.add(resolved_gd)
+                writable_git_dirs.append(resolved_gd)
             return resolved_gd
 
         def _record_commondir_if_present(validated_git_dir: str) -> Optional[str]:
@@ -4243,8 +4267,11 @@ class CommandPolicy:
                             ok_dg, _, prelim_gd = self.validate_workdir(str(dot_git))
                             if ok_dg:
                                 _record_commondir_if_present(prelim_gd)
-                                _record_git_dir(Path(prelim_gd))
-                            break
+                                recorded_gd = _record_git_dir(Path(prelim_gd))
+                                if recorded_gd is not None:
+                                    break
+                            else:
+                                break
                         if (
                             dot_git.is_file()
                             and dot_git.stat().st_size <= 8192

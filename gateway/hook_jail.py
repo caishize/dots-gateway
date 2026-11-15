@@ -1070,11 +1070,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 WORKSPACE_HOOK_INJECTION_RELPATHS = tuple({ws_relpaths_json})
@@ -1118,6 +1120,50 @@ def _within(child: str, parent: str) -> bool:
     if p == "/":
         return True
     return c == p or c.startswith(p.rstrip("/") + "/")
+
+
+_DIAG_SECRET_RE = re.compile(
+    r"(?i)(bearer\\s+\\S+|sk-[A-Za-z0-9_-]{{8,}}|gh[pousr]_[A-Za-z0-9_]{{8,}}|AIza[0-9A-Za-z_-]{{12,}}|(?:token|secret|password|apikey|api_key)\\s*[=:]\\s*\\S+)"
+)
+
+
+def _redact_diag_msg(raw: str, masked_paths: list[str] | None = None) -> str:
+    text = _DIAG_SECRET_RE.sub("[REDACTED]", str(raw or ""))
+    for mp in masked_paths or ():
+        if mp and mp not in ("/", "/home", "/etc", "/var", "/opt", "/usr"):
+            text = text.replace(mp, "<protected>")
+    return " ".join(text.splitlines())[:400]
+
+
+def _append_jail_diag_log(
+    hook_tmp_dir: str,
+    event_name: str,
+    detail: str,
+    masked_paths: list[str] | None = None,
+) -> None:
+    if not hook_tmp_dir or os.path.islink(hook_tmp_dir) or not os.path.isdir(hook_tmp_dir):
+        return
+    log_path = os.path.join(hook_tmp_dir, ".dots-hook-jail-diag.log")
+    try:
+        try:
+            st = os.lstat(log_path)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                return
+            if st.st_size > 65536:
+                os.unlink(log_path)
+        except FileNotFoundError:
+            pass
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(log_path, flags, 0o600)
+        try:
+            ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            redacted = _redact_diag_msg(detail, masked_paths)
+            line = f"{{ts}} event={{event_name}} {{redacted}}\\n".encode("utf-8", errors="replace")
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 def _emit_fail_closed(event_name: str, reason: str) -> "None":
@@ -1773,6 +1819,7 @@ def _build_nested_jail_argv(
     hook_tmp_dir: str,
     hook_data_dir: str,
     allowed_artifact_roots: list[str],
+    ready_fd: int | None = None,
 ) -> tuple[list[str], str]:
     unshare_bin = _find_sys_bin("unshare")
     mount_bin = _find_sys_bin("mount")
@@ -2025,8 +2072,17 @@ def _build_nested_jail_argv(
             f"{{q_umount}} -l /.oldroot",
             "rmdir /.oldroot",
             f"cd {{shlex.quote(active_cwd)}}",
-            f'exec {{q_setpriv}} --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- "$@"',
         ]
+    )
+    if ready_fd is not None:
+        lines.extend(
+            [
+                f"printf 'READY' >&{{int(ready_fd)}}",
+                f"exec {{int(ready_fd)}}>&-",
+            ]
+        )
+    lines.append(
+        f'exec {{q_setpriv}} --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- "$@"'
     )
     script = "\\n".join(lines)
     return [
@@ -2148,44 +2204,81 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if require_mount_ns:
-        jail_argv, err_msg = _build_nested_jail_argv(
-            cfg,
-            cwd_real=cwd_real,
-            resolved_argv=resolved_argv,
-            hook_tmp_dir=hook_tmp_dir,
-            hook_data_dir=hook_data_dir,
-            allowed_artifact_roots=allowed_artifact_roots,
-        )
-        if not jail_argv:
-            _emit_fail_closed(event_name, err_msg)
-        probe = subprocess.run(
-            [jail_argv[0], "--user", "--map-current-user", "--mount", "/bin/true"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=5.0,
-        )
-        if probe.returncode != 0:
-            detail = probe.stderr.decode("utf-8", errors="replace").strip() or f"rc={{probe.returncode}}"
-            _emit_fail_closed(
-                event_name,
-                f"Kernel mount-namespace hook isolation is required but unavailable ({{detail}})",
-            )
         sanitized_env = _build_sanitized_env(
             plugin_vfs_dir=plugin_vfs_dir,
             hook_tmp_inside="/tmp",
             hook_home_inside="/tmp/dots-hook-home",
             hook_data_inside="/tmp/plugin-data",
         )
-        proc = subprocess.run(
-            jail_argv,
-            input=stdin_bytes,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=sanitized_env,
-            cwd=cwd_real,
-        )
+
+        def _run_nested_attempt() -> tuple[subprocess.CompletedProcess[bytes], bool, str]:
+            r_fd, w_fd = os.pipe()
+            try:
+                j_argv, j_err = _build_nested_jail_argv(
+                    cfg,
+                    cwd_real=cwd_real,
+                    resolved_argv=resolved_argv,
+                    hook_tmp_dir=hook_tmp_dir,
+                    hook_data_dir=hook_data_dir,
+                    allowed_artifact_roots=allowed_artifact_roots,
+                    ready_fd=w_fd,
+                )
+                if not j_argv:
+                    return subprocess.CompletedProcess([], 2, b"", b""), False, j_err
+                try:
+                    cp = subprocess.run(
+                        j_argv,
+                        input=stdin_bytes,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=sanitized_env,
+                        cwd=cwd_real,
+                        pass_fds=(w_fd,),
+                    )
+                finally:
+                    try:
+                        os.close(w_fd)
+                    except OSError:
+                        pass
+                    w_fd = -1
+                marker = os.read(r_fd, 16)
+                return cp, (marker == b"READY"), ""
+            finally:
+                if w_fd >= 0:
+                    try:
+                        os.close(w_fd)
+                    except OSError:
+                        pass
+                try:
+                    os.close(r_fd)
+                except OSError:
+                    pass
+
+        proc, jail_ready, err_msg = _run_nested_attempt()
+        if err_msg:
+            _append_jail_diag_log(hook_tmp_dir, event_name, f"stage=build_argv err={{err_msg}}", masked_paths)
+            _emit_fail_closed(event_name, err_msg)
+        if proc.returncode != 0 and not jail_ready:
+            time.sleep(0.05)
+            proc, jail_ready, err_msg = _run_nested_attempt()
+            if err_msg:
+                _append_jail_diag_log(hook_tmp_dir, event_name, f"stage=build_argv_retry err={{err_msg}}", masked_paths)
+                _emit_fail_closed(event_name, err_msg)
+        if proc.returncode != 0 and (not jail_ready or proc.returncode in (126, 127)):
+            raw_err = proc.stderr.decode("utf-8", errors="replace").strip() or f"rc={{proc.returncode}}"
+            detail = _redact_diag_msg(raw_err, masked_paths)
+            _append_jail_diag_log(
+                hook_tmp_dir,
+                event_name,
+                f"stage=jail_setup rc={{proc.returncode}} ready={{jail_ready}} err={{detail}}",
+                masked_paths,
+            )
+            _emit_fail_closed(
+                event_name,
+                f"Kernel mount-namespace hook isolation is required but unavailable ({{detail}})",
+            )
     else:
+        jail_ready = True
         hook_home_host = os.path.join(hook_tmp_dir, "dots-hook-home")
         os.makedirs(hook_home_host, mode=0o700, exist_ok=True)
         active_root = plugin_vfs_dir if os.path.isdir(plugin_vfs_dir) else plugin_source_dir
@@ -2211,6 +2304,21 @@ def main(argv: list[str] | None = None) -> int:
             env=sanitized_env,
             cwd=cwd_real,
         )
+
+    if proc.returncode not in (0, 2):
+        raw_err = proc.stderr.decode("utf-8", errors="replace").strip() or f"rc={{proc.returncode}}"
+        detail = _redact_diag_msg(raw_err, masked_paths)
+        _append_jail_diag_log(
+            hook_tmp_dir,
+            event_name,
+            f"stage=hook_exec rc={{proc.returncode}} err={{detail}}",
+            masked_paths,
+        )
+        if event_name in ("PreToolUse", "PermissionRequest", "PreInvocation", "UserPromptSubmit"):
+            _emit_fail_closed(
+                event_name,
+                f"Hook script exited unexpectedly with status {{proc.returncode}} ({{detail}})",
+            )
 
     if proc.stdout:
         sys.stdout.buffer.write(proc.stdout)

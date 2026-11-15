@@ -1,6 +1,6 @@
 [project]
 name = "dots-gateway"
-version = "1.5.20"
+version = "1.5.21"
 description = "Zero-dependency remote development, Antigravity (agy) & OpenAI Codex MCP plugin and hardened gateway"
 readme = "README.md"
 requires-python = ">=3.11"
