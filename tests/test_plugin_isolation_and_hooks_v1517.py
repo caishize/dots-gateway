@@ -2279,6 +2279,188 @@ class TestPluginIsolationAndHooksV1517(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(out["agy_sec"], out)
                     self.assertFalse(out["rclone_sec"], out)
 
+    async def test_flutter_dart_tool_shared_pub_cache_and_git_tracked_claude_readonly_merge(
+        self,
+    ) -> None:
+        """Regression test for:
+        1) `/opt/flutter/packages/flutter_tools/.dart_tool` + `/mnt/dots-pub-cache` writable across
+           outer VFS and inner AGY/Codex sandboxes while the rest of `/opt/flutter` stays read-only,
+           plus `PUB_CACHE=/mnt/dots-pub-cache` in `SessionManager._prepare_env`;
+        2) Git-tracked `.claude/settings.json` and `.claude/hooks/*` preserved read-only + `noexec`
+           (clean `git status` and `git merge --no-commit` even with dirty tracked files triggering
+           Git's internal `stash create`), while writes/exec remain blocked and `.codex/hooks.json`,
+           `.gemini/settings.json`, and `.git/hooks` remain masked.
+        """
+        from gateway.sandbox import SHARED_SANDBOX_PUB_CACHE_VFS
+
+        # --- Policy & environment checks ---
+        env_prepared = self.server.sessions._prepare_env()
+        if self.cfg.isolate_mount_namespace:
+            self.assertEqual(env_prepared.get("PUB_CACHE"), SHARED_SANDBOX_PUB_CACHE_VFS)
+
+        settings = self.server.policy.build_agy_sandbox_settings(cwd=str(self.project_dir))
+        allow_rules = settings["permissions"]["allow"]
+        deny_rules = settings["permissions"]["deny"]
+        codex_wr = self.server.policy.get_codex_writable_roots(cwd=str(self.project_dir))
+
+        if self.cfg.isolate_mount_namespace:
+            self.assertIn(SHARED_SANDBOX_PUB_CACHE_VFS, codex_wr)
+            self.assertIn(f"write_file({SHARED_SANDBOX_PUB_CACHE_VFS})", allow_rules)
+
+        fl_dt = "/opt/flutter/packages/flutter_tools/.dart_tool"
+        if os.path.isdir("/opt/flutter") and os.path.isdir(fl_dt):
+            self.assertIn(fl_dt, codex_wr)
+            self.assertIn(f"write_file({fl_dt})", allow_rules)
+            self.assertLess(
+                allow_rules.index("read_file(/opt/flutter)"),
+                allow_rules.index(f"write_file({fl_dt})"),
+            )
+
+        proj_res = str(self.project_dir.resolve())
+        for ro_rel in (".claude/settings.json", ".claude/settings.local.json", ".claude/hooks"):
+            self.assertIn(f"write_file({os.path.join(proj_res, ro_rel)})", deny_rules)
+            self.assertNotIn(f"read_file({os.path.join(proj_res, ro_rel)})", deny_rules)
+        for masked_rel in (
+            ".git/hooks",
+            ".codex/hooks.json",
+            ".codex/config.toml",
+            ".gemini/settings.json",
+            ".agents/plugins",
+        ):
+            self.assertIn(f"read_file({os.path.join(proj_res, masked_rel)})", deny_rules)
+
+        # --- Build a Git repo tracking `.claude/settings.json` and `.claude/hooks/guard.sh` ---
+        merge_repo = self.workspace_root / "claude-git-merge-repo"
+        merge_repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-b", "main"], cwd=merge_repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=merge_repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=merge_repo, check=True)
+
+        (merge_repo / ".claude" / "hooks").mkdir(parents=True, exist_ok=True)
+        tracked_settings = merge_repo / ".claude" / "settings.json"
+        tracked_settings.write_text('{"hooks":{"Stop":[]}}\n', encoding="utf-8")
+        tracked_hook = merge_repo / ".claude" / "hooks" / "guard.sh"
+        tracked_hook.write_text("#!/bin/sh\necho should_not_exec\n", encoding="utf-8")
+        os.chmod(tracked_hook, 0o755)
+        app_file = merge_repo / "app.txt"
+        app_file.write_text("base\n", encoding="utf-8")
+        other_file = merge_repo / "notes.txt"
+        other_file.write_text("v1\n", encoding="utf-8")
+
+        subprocess.run(["git", "add", "."], cwd=merge_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=merge_repo, check=True, capture_output=True)
+
+        subprocess.run(["git", "checkout", "-b", "feature"], cwd=merge_repo, check=True, capture_output=True)
+        (merge_repo / "feature.txt").write_text("new feature\n", encoding="utf-8")
+        subprocess.run(["git", "add", "feature.txt"], cwd=merge_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "add feature"], cwd=merge_repo, check=True, capture_output=True)
+        feat_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=merge_repo, text=True).strip()
+
+        subprocess.run(["git", "checkout", "main"], cwd=merge_repo, check=True, capture_output=True)
+        app_file.write_text("main change\n", encoding="utf-8")
+        subprocess.run(["git", "add", "app.txt"], cwd=merge_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "main change"], cwd=merge_repo, check=True, capture_output=True)
+
+        # Plant untracked native discovery files (NOT committed) to verify they remain masked
+        (merge_repo / ".codex").mkdir(parents=True, exist_ok=True)
+        (merge_repo / ".codex" / "hooks.json").write_text('{"hooks":{}}\n', encoding="utf-8")
+        (merge_repo / ".gemini").mkdir(parents=True, exist_ok=True)
+        (merge_repo / ".gemini" / "settings.json").write_text('{"evil":true}\n', encoding="utf-8")
+
+        # File API allows reading `.claude/settings.json` and blocks writing it
+        read_bytes = await asyncio.to_thread(self.client.read_bytes, str(tracked_settings))
+        self.assertEqual(read_bytes.decode("utf-8"), '{"hooks":{"Stop":[]}}\n')
+        with self.assertRaises(RuntimeError):
+            await asyncio.to_thread(
+                self.client._request_json,
+                "POST",
+                "/v1/files/write",
+                {"path": str(tracked_settings), "content": "{}"},
+            )
+
+        if not can_use_mount_namespace():
+            return
+
+        # Dirty another tracked file so `git merge --no-commit` MUST execute Git's internal `save_state()`!
+        other_file.write_text("v1 dirty local edit\n", encoding="utf-8")
+
+        vfs_probe = (
+            "import json, os, subprocess\n"
+            f"repo = {str(merge_repo.resolve())!r}\n"
+            f"feat = {feat_sha!r}\n"
+            "st_before = subprocess.check_output(['git', '-C', repo, 'status', '--porcelain', '--untracked-files=no'], text=True)\n"
+            "cs_txt = open(os.path.join(repo, '.claude', 'settings.json')).read()\n"
+            "ch_txt = open(os.path.join(repo, '.claude', 'hooks', 'guard.sh')).read()\n"
+            "cx_txt = open(os.path.join(repo, '.codex', 'hooks.json')).read()\n"
+            "gm_txt = open(os.path.join(repo, '.gemini', 'settings.json')).read()\n"
+            "cs_ro = False\n"
+            "try:\n"
+            "    open(os.path.join(repo, '.claude', 'settings.json'), 'w').write('x')\n"
+            "except OSError:\n"
+            "    cs_ro = True\n"
+            "ch_ro = False\n"
+            "try:\n"
+            "    open(os.path.join(repo, '.claude', 'hooks', 'evil.sh'), 'w').write('x')\n"
+            "except OSError:\n"
+            "    ch_ro = True\n"
+            "ch_noexec = False\n"
+            "try:\n"
+            "    subprocess.run([os.path.join(repo, '.claude', 'hooks', 'guard.sh')], check=True)\n"
+            "except OSError:\n"
+            "    ch_noexec = True\n"
+            "m_res = subprocess.run(['git', '-C', repo, 'merge', '--no-commit', feat], capture_output=True, text=True)\n"
+            "subprocess.run(['git', '-C', repo, 'merge', '--abort'], capture_output=True)\n"
+            "pub_ok = os.path.isdir('/mnt/dots-pub-cache') and os.access('/mnt/dots-pub-cache', os.W_OK)\n"
+            "fl_dt_p = '/opt/flutter/packages/flutter_tools/.dart_tool'\n"
+            "fl_dt_rw = os.access(fl_dt_p, os.W_OK) if os.path.isdir(fl_dt_p) else None\n"
+            "fl_pubspec_p = '/opt/flutter/packages/flutter_tools/pubspec.yaml'\n"
+            "fl_pubspec_ro = (not os.access(fl_pubspec_p, os.W_OK)) if os.path.isfile(fl_pubspec_p) else None\n"
+            "print(json.dumps({\n"
+            "    'st_before': st_before.strip(),\n"
+            "    'cs_ok': 'Stop' in cs_txt,\n"
+            "    'ch_ok': 'should_not_exec' in ch_txt,\n"
+            "    'cx_masked': cx_txt == '',\n"
+            "    'gm_masked': gm_txt == '',\n"
+            "    'cs_ro': cs_ro,\n"
+            "    'ch_ro': ch_ro,\n"
+            "    'ch_noexec': ch_noexec,\n"
+            "    'merge_rc': m_res.returncode,\n"
+            "    'merge_err': m_res.stderr,\n"
+            "    'pub_ok': pub_ok,\n"
+            "    'fl_dt_rw': fl_dt_rw,\n"
+            "    'fl_pubspec_ro': fl_pubspec_ro,\n"
+            "}))\n"
+        )
+
+        for is_agy_flag, is_codex_flag in ((True, False), (False, True)):
+            ns_argv = build_mount_ns_argv(
+                [sys.executable, "-c", vfs_probe],
+                cwd=str(merge_repo),
+                allowed_workdirs=[str(self.workspace_root)],
+                protected_paths=self.cfg.protected_paths,
+                is_agy=is_agy_flag,
+                is_codex=is_codex_flag,
+                sandbox_state_dir=str(self.sandbox_dir),
+                session_workdirs=[str(merge_repo)],
+            )
+            proc = subprocess.run(ns_argv, capture_output=True, text=True, timeout=15)
+            self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+            res = json.loads(proc.stdout.strip())
+            # Only `notes.txt` is dirty — `.claude/settings.json` & `.claude/hooks/guard.sh` are clean!
+            self.assertEqual(res["st_before"], "M notes.txt", res)
+            self.assertTrue(res["cs_ok"], res)
+            self.assertTrue(res["ch_ok"], res)
+            self.assertTrue(res["cx_masked"], res)
+            self.assertTrue(res["gm_masked"], res)
+            self.assertTrue(res["cs_ro"], res)
+            self.assertTrue(res["ch_ro"], res)
+            self.assertTrue(res["ch_noexec"], res)
+            self.assertEqual(res["merge_rc"], 0, res)
+            self.assertTrue(res["pub_ok"], res)
+            if os.path.isdir(fl_dt):
+                self.assertTrue(res["fl_dt_rw"], res)
+                self.assertTrue(res["fl_pubspec_ro"], res)
+
 
 if __name__ == "__main__":
     unittest.main()

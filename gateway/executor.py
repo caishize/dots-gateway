@@ -50,6 +50,7 @@ from .hook_jail import (
 )
 from .policy import CommandPolicy
 from .sandbox import (
+    SHARED_SANDBOX_PUB_CACHE_VFS,
     build_mount_ns_argv,
     cleanup_sandbox_state,
     get_sandbox_disk_status,
@@ -1614,6 +1615,7 @@ class SessionManager:
                         forbidden_roots=self._sandbox_forbidden_roots(),
                     )
             env["TMPDIR"] = "/tmp"
+            env["PUB_CACHE"] = SHARED_SANDBOX_PUB_CACHE_VFS
         elif check_sandbox_storage:
             sb_state = prevalidated_sandbox_state or prepare_sandbox_runtime_state(
                 self.config.sandbox_state_dir,

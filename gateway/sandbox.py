@@ -29,10 +29,13 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from .config import redact_diagnostic_text
 from .hook_jail import (
     WORKSPACE_HOOK_INJECTION_RELPATHS,
+    WORKSPACE_READONLY_PROTECTED_RELPATHS,
     PreparedAgentPluginRuntime,
     StagedPluginHookBundle,
     sanitize_host_agy_settings_file,
 )
+
+SHARED_SANDBOX_PUB_CACHE_VFS = "/mnt/dots-pub-cache"
 
 SANDBOX_SUBDIRS: Tuple[str, ...] = (
     "tmp",
@@ -1199,6 +1202,7 @@ def _mask_protected_and_workspace_hook_lines(
                 if parent_d == cur_d:
                     break
                 cur_d = parent_d
+        ro_prot_rel_set = frozenset(WORKSPACE_READONLY_PROTECTED_RELPATHS)
         for wdir in ws_targets:
             for rel_inj in WORKSPACE_HOOK_INJECTION_RELPATHS:
                 cur_chk = wdir
@@ -1211,7 +1215,27 @@ def _mask_protected_and_workspace_hook_lines(
                         )
                 inj_host = os.path.join(wdir, rel_inj)
                 q_inj_dst = shlex.quote(f"{stage_dir}{inj_host}")
-                if os.path.isdir(inj_host):
+                if rel_inj in ro_prot_rel_set:
+                    q_inj_src = shlex.quote(os.path.realpath(inj_host))
+                    if os.path.isdir(inj_host):
+                        out.extend(
+                            [
+                                f"if [ ! -L {q_inj_src} ] && [ -d {q_inj_src} ] && [ -d {q_inj_dst} ]; then",
+                                f"  {q_mount} --bind {q_inj_src} {q_inj_dst}",
+                                f"  {_remount_ro_cmd(q_mount, q_inj_dst, noexec=True)}",
+                                "fi",
+                            ]
+                        )
+                    elif os.path.isfile(inj_host):
+                        out.extend(
+                            [
+                                f"if [ ! -L {q_inj_src} ] && [ -f {q_inj_src} ] && [ -f {q_inj_dst} ]; then",
+                                f"  {q_mount} --bind {q_inj_src} {q_inj_dst}",
+                                f"  {_remount_ro_cmd(q_mount, q_inj_dst, noexec=True)}",
+                                "fi",
+                            ]
+                        )
+                elif os.path.isdir(inj_host):
                     out.append(
                         f"if [ -d {q_inj_dst} ]; then {q_mount} -t tmpfs -o size=4k,mode=0555,ro,nosuid,nodev,noexec tmpfs {q_inj_dst}; fi"
                     )
@@ -1396,6 +1420,7 @@ def build_mount_ns_argv(
         str(sandbox_state),
         home_dir,
         norm_runtime_root,
+        SHARED_SANDBOX_PUB_CACHE_VFS,
         *sorted(active_plugin_srcs),
     ]
     if (is_agy or is_codex) and target_argv and str(target_argv[0]).startswith("/"):
@@ -1466,8 +1491,11 @@ def build_mount_ns_argv(
             f'    {q_mount} -o remount,bind,ro "{stage_dir}$ro_opt" 2>/dev/null || {q_mount} -o bind,remount,ro "{stage_dir}$ro_opt"',
             "  fi",
             "done",
-            f'if [ -d "/opt/flutter/bin/cache" ] && [ -d "{stage_dir}/opt/flutter/bin/cache" ]; then',
+            f'if [ ! -L "/opt/flutter/bin" ] && [ ! -L "/opt/flutter/bin/cache" ] && [ -d "/opt/flutter/bin/cache" ] && [ -d "{stage_dir}/opt/flutter/bin/cache" ]; then',
             f'  {q_mount} --rbind "/opt/flutter/bin/cache" "{stage_dir}/opt/flutter/bin/cache"',
+            "fi",
+            f'if [ ! -L "/opt/flutter/packages" ] && [ ! -L "/opt/flutter/packages/flutter_tools" ] && [ ! -L "/opt/flutter/packages/flutter_tools/.dart_tool" ] && [ -d "/opt/flutter/packages/flutter_tools/.dart_tool" ] && [ -d "{stage_dir}/opt/flutter/packages/flutter_tools/.dart_tool" ]; then',
+            f'  {q_mount} --rbind "/opt/flutter/packages/flutter_tools/.dart_tool" "{stage_dir}/opt/flutter/packages/flutter_tools/.dart_tool"',
             "fi",
             # Mask host per-user runtime sockets (/run/user/$UID/systemd, /run/user/$UID/gnupg)
             # while preserving /run/systemd/resolve DNS and a private XDG_RUNTIME_DIR
@@ -1516,6 +1544,20 @@ def build_mount_ns_argv(
         q_dst_tmp = shlex.quote(f"{stage_dir}/tmp")
         lines.append(f"{q_mount} --rbind {q_sb_tmp} {q_dst_tmp}")
         lines.append(f"chmod 1777 {q_dst_tmp} 2>/dev/null || true")
+
+    # Mount a session-independent canonical `PUB_CACHE` view (`/mnt/dots-pub-cache`) alongside
+    # `$HOME/.pub-cache` so `exec_command`, `run_agy`, and `run_codex` share identical package URIs
+    # in `/opt/flutter/packages/flutter_tools/.dart_tool/package_config.json` and project `.dart_tool`.
+    q_dst_pub_vfs = shlex.quote(f"{stage_dir}{SHARED_SANDBOX_PUB_CACHE_VFS}")
+    lines.append(f"mkdir -p {q_dst_pub_vfs}")
+    sb_pub_dir = sandbox_state / "pub_cache"
+    host_pub_dir = Path(home_dir) / ".pub-cache"
+    if not home_covered or (not os.path.islink(str(sb_pub_dir)) and sb_pub_dir.is_dir()):
+        lines.append(f"{q_mount} --rbind {shlex.quote(str(sb_pub_dir))} {q_dst_pub_vfs}")
+    elif not os.path.islink(str(host_pub_dir)) and host_pub_dir.is_dir():
+        lines.append(
+            f"{q_mount} --rbind {shlex.quote(os.path.realpath(str(host_pub_dir)))} {q_dst_pub_vfs}"
+        )
 
     # Bind-mount each explicitly allowed workspace directory read-write
     for wdir in allowed_roots:

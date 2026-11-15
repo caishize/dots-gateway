@@ -68,6 +68,20 @@ class _FakeDaemon:
             payload = {"Name": "hostvol", "Driver": "local", "Options": {"type": "none", "o": "bind", "device": "/"}, "Labels": {}}
         elif path == "/volumes/newvol":
             status, payload = 404, {"message": "no such volume"}
+        elif path.endswith("/events"):
+            w.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                b"f\r\n{\"status\":\"ok\"}\r\n"
+            )
+            await w.drain()
+            try:
+                await asyncio.sleep(5.0)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                w.close()
+            return
         data = json.dumps(payload).encode()
         w.write(
             f"HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n"
@@ -304,8 +318,28 @@ class DockerProxyTests(unittest.IsolatedAsyncioTestCase):
         await w_idle.drain()
         idle_resp = await asyncio.wait_for(r_idle.read(), timeout=3.0)
         w_idle.close()
-        await w_idle.wait_closed()
+        await w.wait_closed() if False else await w_idle.wait_closed()
         self.assertIn(b"408", idle_resp.splitlines()[0])
+
+    async def test_streaming_client_task_survives_gc_and_cleans_up_on_stop(self) -> None:
+        import gc
+
+        r_ev, w_ev = await asyncio.open_unix_connection(self.sock)
+        w_ev.write(b"GET /v1.47/events HTTP/1.1\r\nHost: docker\r\n\r\n")
+        await w_ev.drain()
+        first_chunk = await asyncio.wait_for(r_ev.readuntil(b"{\"status\":\"ok\"}"), timeout=3.0)
+        self.assertIn(b"200 OK", first_chunk)
+        self.assertEqual(len(self.proxy._client_tasks), 1)
+        # Drop local references and run cyclic GC while stream is still open upstream
+        w_ev.close()
+        await w_ev.wait_closed()
+        del r_ev, w_ev
+        gc.collect()
+        await asyncio.sleep(0.05)
+        gc.collect()
+        self.assertEqual(self.proxy.stats["errors"], 0)
+        await self.proxy.stop()
+        self.assertEqual(len(self.proxy._client_tasks), 0)
 
 
 if __name__ == "__main__":

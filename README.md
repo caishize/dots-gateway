@@ -1,4 +1,4 @@
-# Dots <-> Local Dev, Antigravity (`agy`) & Codex MCP Plugin & Hardened Gateway (`v1.5.19`)
+# Dots <-> Local Dev, Antigravity (`agy`) & Codex MCP Plugin & Hardened Gateway (`v1.5.20`)
 
 A zero-dependency Python 3.11+ **OpenAI `dots` / Codex / Agent Plugins 1.0** package and remote development gateway. It enables **dots** (running on OpenAI cloud machines) to securely inspect/edit workspace files, execute allowlisted development commands inside a Linux User + Mount Namespace VFS jail, and delegate tasks to **`agy` (`--sandbox`, with optional isolated read-only plugins & native hook sandboxing)** and **`codex` (`codex exec`, with optional isolated read-only plugins & native hook sandboxing)** via the **Model Context Protocol (MCP)**.
 
@@ -21,8 +21,8 @@ OpenAI Cloud Machine (`dots`)                            Local Dev Machine (`~/g
 
 ## Plugin & Repository Layout
 
-- `plugin.json` & `.codex-plugin/plugin.json` — Portable **Agent Plugins 1.0** + OpenAI `extensions.com.openai` & Codex plugin manifests (`v1.5.19`)
-- `pyproject.toml` — Zero-dependency Python 3.11+ package metadata (`v1.5.19`), `pytest`, and `ruff` configuration
+- `plugin.json` & `.codex-plugin/plugin.json` — Portable **Agent Plugins 1.0** + OpenAI `extensions.com.openai` & Codex plugin manifests (`v1.5.20`)
+- `pyproject.toml` — Zero-dependency Python 3.11+ package metadata (`v1.5.20`), `pytest`, and `ruff` configuration
 - `mcp.json` — Bundled `stdio` MCP server definition (`./dots_mcp.py`) supporting self-signed TLS SHA-256 pinning & HMAC-SHA256
 - `mcp.remote.example.json` — Example `streamable-http` MCP configuration for direct `/mcp` connectors
 - `config.example.json` — Reference host gateway configuration including isolated plugin runtime (`agent_runtime_home_root`, `plugin_state_dir`), `agy` & `codex` plugins, and Docker proxy settings
@@ -120,7 +120,7 @@ By default, both `agy` and `codex` plugin mounting are **disabled (`agy_plugins_
   - masks agent credentials (`oauth_creds.json`, `application_default_credentials.json`, `$CODEX_HOME/auth.json`, `~/.config/gh`, `~/.ssh`, `protected_paths`) and scrubs secret environment variables (`OPENAI_API_KEY`, `CODEX_API_KEY`, `GOOGLE_*`, `ANTHROPIC_*`, `GH_TOKEN`, etc.);
   - mounts `allowed_workdirs` with **`rw,nosuid,nodev,noexec`** (W^X: hooks can inspect files and append project metrics ledgers such as `.claude/metrics/*` / `.codex/metrics/*`, while kernel `noexec` + command path validation block executing untrusted binaries/scripts in the project tree);
   - forces `python3 -I` + `PYTHONSAFEPATH=1` + `PYTHONDONTWRITEBYTECODE=1` (defeating `<cwd>/json.py` import hijacking) and injects `GIT_CONFIG_COUNT` overrides neutralizing repo `.git/config` `core.fsmonitor` / `core.sshCommand` / `core.hooksPath` / `diff.external` execution;
-  - masks workspace hook/config injection paths (`.claude/settings.json`, `.claude/settings.local.json`, `.claude/hooks`, `.gemini/settings.json`, `.gemini/antigravity-cli`, `.gemini/config/plugins`, `.codex/hooks.json`, `.codex/config.toml`, `.agents/plugins`, `.git/hooks`) in both outer and inner VFS and enforces symlink-escape checks in `PreToolUse` (`write`/`edit`/file tools and Codex `apply_patch`);
+  - masks active workspace hook/config injection paths (`.gemini/settings.json`, `.gemini/antigravity-cli`, `.gemini/config/plugins`, `.codex/hooks.json`, `.codex/config.toml`, `.agents/plugins`, `.git/hooks`) and locks passive Git-tracked Claude config/hook paths (`.claude/settings.json`, `.claude/settings.local.json`, `.claude/hooks`) read-only + `noexec` in both outer and inner VFS (preserving clean `git status` / `git merge` while blocking writes and enforcing symlink-escape checks in `PreToolUse`);
   - **fails closed** (never silently degrades) if Linux user + mount namespaces (`unshare`) are disabled or blocked by host kernel/seccomp policy.
 
 | Directory Category | Recommended Host Layout | Access Contract |

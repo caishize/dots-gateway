@@ -25,10 +25,11 @@ from .config import (
 )
 from .hook_jail import (
     WORKSPACE_HOOK_INJECTION_RELPATHS,
+    WORKSPACE_READONLY_PROTECTED_RELPATHS,
     _expand_host_tilde_in_agy_rule,
     validate_plugin_hooks_manifest,
 )
-from .sandbox import can_use_mount_namespace
+from .sandbox import SHARED_SANDBOX_PUB_CACHE_VFS, can_use_mount_namespace
 
 
 @dataclass
@@ -2528,6 +2529,16 @@ class CommandPolicy:
         _register_boundary(
             writable_boundaries, "/opt/flutter/bin/cache", "writable SDK cache"
         )
+        _register_boundary(
+            writable_boundaries,
+            "/opt/flutter/packages/flutter_tools/.dart_tool",
+            "writable Flutter tools package_config",
+        )
+        _register_boundary(
+            writable_boundaries,
+            SHARED_SANDBOX_PUB_CACHE_VFS,
+            "shared sandbox pub cache",
+        )
         if cwd:
             _register_boundary(writable_boundaries, str(cwd), "session cwd")
         if add_dirs:
@@ -4102,11 +4113,15 @@ class CommandPolicy:
                 if parent_r == cur_r:
                     break
                 cur_r = parent_r
+        ro_prot_rel_set = frozenset(WORKSPACE_READONLY_PROTECTED_RELPATHS)
         for ws_r in session_ws_roots:
             for inj_rel in WORKSPACE_HOOK_INJECTION_RELPATHS:
                 inj_abs = os.path.join(ws_r, inj_rel)
                 if ")" not in inj_abs:
-                    _emit_deny(f"read_file({inj_abs})")
+                    if inj_rel in ro_prot_rel_set:
+                        _emit_deny(f"write_file({inj_abs})")
+                    else:
+                        _emit_deny(f"read_file({inj_abs})")
 
         perms["deny"] = deny_list
 
@@ -4337,17 +4352,30 @@ class CommandPolicy:
                     if ok_sub:
                         _add(resolved_sub)
 
-        flutter_cache_candidates: List[str] = ["/opt/flutter/bin/cache"]
+        flutter_cache_candidates: List[str] = [
+            "/opt/flutter/bin/cache",
+            "/opt/flutter/packages/flutter_tools/.dart_tool",
+        ]
         flutter_bin = shutil.which("flutter")
         if flutter_bin:
             try:
                 fl_root = Path(flutter_bin).resolve().parent.parent
                 flutter_cache_candidates.append(str(fl_root / "bin" / "cache"))
+                flutter_cache_candidates.append(
+                    str(fl_root / "packages" / "flutter_tools" / ".dart_tool")
+                )
             except OSError:
                 pass
         for fc in flutter_cache_candidates:
-            if os.path.isdir(fc) and not self.is_protected_path(os.path.abspath(fc)):
+            if (
+                not os.path.islink(fc)
+                and os.path.isdir(fc)
+                and not self.is_protected_path(os.path.abspath(fc))
+            ):
                 _add(fc)
+        if self.config.isolate_mount_namespace or os.path.isdir(SHARED_SANDBOX_PUB_CACHE_VFS):
+            if not self.is_protected_path(SHARED_SANDBOX_PUB_CACHE_VFS):
+                _add(SHARED_SANDBOX_PUB_CACHE_VFS)
 
         home_dir = str(Path.home().resolve())
         home_already_covered = any(

@@ -421,6 +421,7 @@ class DockerProxy:
         self.client_body_timeout = client_body_timeout
         self._server: Optional[asyncio.AbstractServer] = None
         self._conn_sem = asyncio.Semaphore(64)
+        self._client_tasks: set[asyncio.Task[Any]] = set()
         self.stats: Dict[str, int] = {"requests": 0, "denied": 0, "errors": 0}
 
     @property
@@ -452,7 +453,7 @@ class DockerProxy:
         old_umask = os.umask(0o177)
         try:
             self._server = await asyncio.start_unix_server(
-                self._handle_client, path=self.socket_path, limit=_MAX_HEAD_BYTES * 2
+                self._on_client_connected, path=self.socket_path, limit=_MAX_HEAD_BYTES * 2
             )
         except OSError as exc:
             logger.warning("Docker proxy failed to listen on %s: %s", self.socket_path, exc)
@@ -483,7 +484,7 @@ class DockerProxy:
         return True
 
     async def stop(self) -> None:
-        if self._server is None:
+        if self._server is None and not self._client_tasks:
             return
         if self._server is not None:
             self._server.close()
@@ -492,6 +493,12 @@ class DockerProxy:
             except Exception:
                 pass
             self._server = None
+        if self._client_tasks:
+            pending = list(self._client_tasks)
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            self._client_tasks.clear()
         try:
             if stat.S_ISSOCK(os.lstat(self.socket_path).st_mode):
                 os.unlink(self.socket_path)
@@ -499,10 +506,23 @@ class DockerProxy:
             pass
 
     # ---- connection handling -------------------------------------------------------------
+    def _on_client_connected(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        task = asyncio.create_task(self._handle_client(reader, writer))
+        self._client_tasks.add(task)
+        task.add_done_callback(self._client_tasks.discard)
+
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        gen_exit = False
         async with self._conn_sem:
             try:
                 await self._serve_one(reader, writer)
+            except GeneratorExit:
+                gen_exit = True
+                raise
+            except asyncio.CancelledError:
+                raise
             except DockerPolicyError as exc:
                 if exc.status == 403:
                     self.stats["denied"] += 1
@@ -517,7 +537,8 @@ class DockerProxy:
             finally:
                 try:
                     writer.close()
-                    await writer.wait_closed()
+                    if not gen_exit:
+                        await writer.wait_closed()
                 except Exception:
                     pass
 
@@ -952,6 +973,8 @@ class DockerProxy:
         ) + "\r\n"
 
         up_r, up_w = await self._open_upstream()
+        gen_exit = False
+        response_task: Optional[asyncio.Task[None]] = None
         try:
             up_w.write(head.encode("latin-1"))
             if body:
@@ -962,12 +985,16 @@ class DockerProxy:
                 upload_task = asyncio.create_task(self._pipe(reader, up_w, half_close=True))
                 try:
                     await response_task
+                except GeneratorExit:
+                    gen_exit = True
+                    raise
                 finally:
                     upload_task.cancel()
-                    try:
-                        await upload_task
-                    except asyncio.CancelledError:
-                        pass
+                    if not gen_exit:
+                        try:
+                            await upload_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
             else:
                 if body is None and mode != "none":
                     try:
@@ -976,9 +1003,20 @@ class DockerProxy:
                         response_task.cancel()
                         raise
                 await response_task
+        except GeneratorExit:
+            gen_exit = True
+            raise
         finally:
+            if response_task is not None and not response_task.done():
+                response_task.cancel()
             try:
                 up_w.close()
-                await up_w.wait_closed()
+                if not gen_exit:
+                    if response_task is not None:
+                        try:
+                            await response_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    await up_w.wait_closed()
             except Exception:
                 pass
