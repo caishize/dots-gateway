@@ -83,7 +83,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         # 2b. Enforce strict version parity across package, manifests, pyproject.toml, and README
         pyproject_data = tomllib.loads((GATEWAY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         expected_ver = gateway.__version__
-        self.assertEqual(expected_ver, "1.5.21")
+        self.assertEqual(expected_ver, "1.5.22")
         self.assertEqual(root_manifest["version"], expected_ver)
         self.assertEqual(codex_manifest["version"], expected_ver)
         self.assertEqual(pyproject_data["project"]["version"], expected_ver)
@@ -2144,6 +2144,198 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             await srv.stop()
+
+    async def test_v1522_mcp_diagnostics_structured_error_pagination_and_session_filters(
+        self,
+    ) -> None:
+        client = DotsGatewayClient(
+            base_url=self.https_url,
+            token="mcp-bearer-token-999",
+            tls_fingerprint=self.pki["server_fingerprint_sha256"],
+        )
+        tools_by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
+
+        # 1. Verify updated schemas (and gateway_status remains empty strict object)
+        self.assertEqual(tools_by_name["gateway_status"]["inputSchema"]["properties"], {})
+        self.assertIn("stdin", tools_by_name["session_start"]["inputSchema"]["properties"])
+        poll_props = tools_by_name["session_poll"]["inputSchema"]["properties"]
+        for p in ("include_events", "offset", "limit"):
+            self.assertIn(p, poll_props)
+        list_props = tools_by_name["session_list"]["inputSchema"]["properties"]
+        for p in ("limit", "cwd", "status", "session_kind"):
+            self.assertIn(p, list_props)
+
+        # 2. Failing exec_command (rc != 0) preserves structuredContent alongside isError=True
+        err_resp, _ = await asyncio.to_thread(
+            client.mcp_request,
+            {
+                "jsonrpc": "2.0",
+                "id": "v1522-err",
+                "method": "tools/call",
+                "params": {
+                    "name": "exec_command",
+                    "arguments": {
+                        "command": "python3 -c \"import sys; print('fail_diag_line'); sys.exit(2)\"",
+                        "cwd": self.tmpdir,
+                    },
+                },
+            },
+        )
+        assert err_resp is not None
+        err_res = err_resp["result"]
+        self.assertTrue(err_res["isError"])
+        self.assertIn("structuredContent", err_res)
+        self.assertEqual(err_res["structuredContent"]["returncode"], 2)
+        self.assertEqual(err_res["structuredContent"]["status"], "failed")
+        self.assertIn("fail_diag_line", err_res["structuredContent"]["stdout"])
+        failed_sid = err_res["structuredContent"]["session_id"]
+
+        # 3. session_start(type='exec', stdin=..., close_stdin=True) delivers stdin
+        sub_cwd = Path(self.tmpdir) / "filter_sub"
+        sub_cwd.mkdir(exist_ok=True)
+        start_resp, _ = await asyncio.to_thread(
+            client.mcp_request,
+            {
+                "jsonrpc": "2.0",
+                "id": "v1522-start-stdin",
+                "method": "tools/call",
+                "params": {
+                    "name": "session_start",
+                    "arguments": {
+                        "type": "exec",
+                        "command": "python3 -c \"import sys; data=sys.stdin.read(); print('GOT:' + data.strip()); print('PACK:' + ('X' * 400))\"",
+                        "stdin": "hello_from_mcp_stdin\n",
+                        "close_stdin": True,
+                        "cwd": str(sub_cwd),
+                    },
+                },
+            },
+        )
+        assert start_resp is not None
+        ok_sid = start_resp["result"]["structuredContent"]["session_id"]
+
+        # 4. Wait & verify session_poll paging + include_events=False
+        full_poll, _ = await asyncio.to_thread(
+            client.mcp_request,
+            {
+                "jsonrpc": "2.0",
+                "id": "v1522-poll-full",
+                "method": "tools/call",
+                "params": {
+                    "name": "session_poll",
+                    "arguments": {
+                        "session_id": ok_sid,
+                        "wait_seconds": 10.0,
+                        "wait_for_exit": True,
+                    },
+                },
+            },
+        )
+        full_sc = full_poll["result"]["structuredContent"]
+        self.assertEqual(full_sc["status"], "completed")
+        self.assertIn("GOT:hello_from_mcp_stdin", full_sc["stdout"])
+        self.assertIn("events", full_sc)
+        full_len = len(full_sc["stdout"])
+        self.assertGreater(full_len, 400)
+
+        p1, _ = await asyncio.to_thread(
+            client.mcp_request,
+            {
+                "jsonrpc": "2.0",
+                "id": "v1522-poll-p1",
+                "method": "tools/call",
+                "params": {
+                    "name": "session_poll",
+                    "arguments": {
+                        "session_id": ok_sid,
+                        "include_events": False,
+                        "offset": 0,
+                        "limit": 120,
+                    },
+                },
+            },
+        )
+        p1_sc = p1["result"]["structuredContent"]
+        self.assertNotIn("events", p1_sc)
+        self.assertEqual(len(p1_sc["stdout"]), 120)
+        self.assertEqual(p1_sc["output_offset"], 0)
+        self.assertEqual(p1_sc["output_limit"], 120)
+        self.assertEqual(p1_sc["stdout_total_chars"], full_len)
+        self.assertTrue(p1_sc["stdout_has_more"])
+
+        p2, _ = await asyncio.to_thread(
+            client.mcp_request,
+            {
+                "jsonrpc": "2.0",
+                "id": "v1522-poll-p2",
+                "method": "tools/call",
+                "params": {
+                    "name": "session_poll",
+                    "arguments": {
+                        "session_id": ok_sid,
+                        "include_events": False,
+                        "offset": 120,
+                        "limit": 1000,
+                    },
+                },
+            },
+        )
+        p2_sc = p2["result"]["structuredContent"]
+        self.assertFalse(p2_sc["stdout_has_more"])
+        self.assertEqual(p1_sc["stdout"] + p2_sc["stdout"], full_sc["stdout"])
+
+        p0, _ = await asyncio.to_thread(
+            client.mcp_request,
+            {
+                "jsonrpc": "2.0",
+                "id": "v1522-poll-p0",
+                "method": "tools/call",
+                "params": {
+                    "name": "session_poll",
+                    "arguments": {
+                        "session_id": ok_sid,
+                        "include_events": False,
+                        "limit": 0,
+                    },
+                },
+            },
+        )
+        p0_sc = p0["result"]["structuredContent"]
+        self.assertEqual(p0_sc["stdout"], "")
+        self.assertEqual(p0_sc["stdout_total_chars"], full_len)
+
+        # 5. session_list filtering by status, cwd, session_kind, and limit
+        ls_failed, _ = await asyncio.to_thread(
+            client.mcp_request,
+            {
+                "jsonrpc": "2.0",
+                "id": "v1522-list-failed",
+                "method": "tools/call",
+                "params": {
+                    "name": "session_list",
+                    "arguments": {"status": "failed", "session_kind": "exec"},
+                },
+            },
+        )
+        failed_ids = [s["session_id"] for s in ls_failed["result"]["structuredContent"]["sessions"]]
+        self.assertIn(failed_sid, failed_ids)
+        self.assertNotIn(ok_sid, failed_ids)
+
+        ls_sub, _ = await asyncio.to_thread(
+            client.mcp_request,
+            {
+                "jsonrpc": "2.0",
+                "id": "v1522-list-cwd",
+                "method": "tools/call",
+                "params": {
+                    "name": "session_list",
+                    "arguments": {"cwd": str(sub_cwd), "limit": 1},
+                },
+            },
+        )
+        sub_sessions = ls_sub["result"]["structuredContent"]["sessions"]
+        self.assertEqual(len(sub_sessions), 1)
+        self.assertEqual(sub_sessions[0]["session_id"], ok_sid)
 
 
 if __name__ == "__main__":

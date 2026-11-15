@@ -46,6 +46,12 @@ DEFAULT_ALLOWED_COMMANDS: List[str] = [
     "[",
     "source",
     ".",
+    "exit",
+    "return",
+    ":",
+    "trap",
+    "command",
+    "type",
     "sleep",
     "time",
     "timeout",
@@ -790,6 +796,12 @@ class GatewayConfig:
                 "[",
                 "source",
                 ".",
+                "exit",
+                "return",
+                ":",
+                "trap",
+                "command",
+                "type",
             ):
                 if (
                     sh_builtin not in cfg.allowed_commands

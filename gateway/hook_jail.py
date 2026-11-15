@@ -1232,7 +1232,7 @@ def _extract_patch_paths(patch_text: str) -> list[str]:
     return paths
 
 
-def _is_workspace_hook_injection_target(target_abs: str, allowed_roots: list[str]) -> bool:
+def _matches_workspace_relpaths(target_abs: str, allowed_roots: list[str], relpaths) -> bool:
     norm_t = os.path.abspath(target_abs)
     for ws_r in allowed_roots:
         if not _within(norm_t, ws_r):
@@ -1240,16 +1240,30 @@ def _is_workspace_hook_injection_target(target_abs: str, allowed_roots: list[str
         rel_posix = os.path.relpath(norm_t, ws_r).replace(os.sep, "/")
         if rel_posix in ("", "."):
             continue
-        for rel_inj in WORKSPACE_HOOK_INJECTION_RELPATHS:
-            inj_posix = rel_inj.replace(os.sep, "/").strip("/")
+        for rel_p in relpaths:
+            p_posix = rel_p.replace(os.sep, "/").strip("/")
             if (
-                rel_posix == inj_posix
-                or rel_posix.startswith(f"{{inj_posix}}/")
-                or rel_posix.endswith(f"/{{inj_posix}}")
-                or f"/{{inj_posix}}/" in rel_posix
+                rel_posix == p_posix
+                or rel_posix.startswith(f"{{p_posix}}/")
+                or rel_posix.endswith(f"/{{p_posix}}")
+                or f"/{{p_posix}}/" in rel_posix
             ):
                 return True
     return False
+
+
+def _is_workspace_hook_injection_target(target_abs: str, allowed_roots: list[str]) -> bool:
+    return _matches_workspace_relpaths(target_abs, allowed_roots, WORKSPACE_HOOK_INJECTION_RELPATHS)
+
+
+def _is_workspace_readonly_protected_target(target_abs: str, allowed_roots: list[str]) -> bool:
+    return _matches_workspace_relpaths(target_abs, allowed_roots, WORKSPACE_READONLY_PROTECTED_RELPATHS)
+
+
+def _is_workspace_active_hook_injection_target(target_abs: str, allowed_roots: list[str]) -> bool:
+    return _is_workspace_hook_injection_target(
+        target_abs, allowed_roots
+    ) and not _is_workspace_readonly_protected_target(target_abs, allowed_roots)
 
 
 def _check_workspace_no_symlinked_hook_paths(
@@ -1339,6 +1353,227 @@ _SHELL_REDIR_OPS = ("1>>", "2>>", "&>>", ">>", ">|", "1>", "2>", "&>", "<>", ">"
 _SHELL_MUTATING_BINS = frozenset(
     {{"rm", "mv", "cp", "chmod", "chown", "truncate", "tee", "ln", "touch", "install", "dd"}}
 )
+_SHELL_READONLY_INSPECT_BINS = frozenset(
+    {{
+        "ls",
+        "dir",
+        "vdir",
+        "stat",
+        "file",
+        "readlink",
+        "realpath",
+        "basename",
+        "dirname",
+        "pwd",
+        "cat",
+        "head",
+        "tail",
+        "nl",
+        "wc",
+        "cksum",
+        "sha256sum",
+        "sha1sum",
+        "md5sum",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "ag",
+        "tree",
+        "du",
+        "df",
+        "diff",
+        "cmp",
+        "comm",
+        "uniq",
+        "cut",
+        "tr",
+        "jq",
+        "yq",
+        "test",
+        "[",
+        "echo",
+        "printf",
+    }}
+)
+_SHELL_READONLY_GIT_SUBCMDS = frozenset(
+    {{
+        "status",
+        "diff",
+        "log",
+        "show",
+        "ls-files",
+        "ls-tree",
+        "cat-file",
+        "rev-parse",
+        "check-ignore",
+        "blame",
+        "grep",
+        "branch",
+        "tag",
+    }}
+)
+_FIND_UNSAFE_FLAGS = frozenset(
+    {{
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+        "-delete",
+        "-fls",
+        "-fprint",
+        "-fprint0",
+        "-fprintf",
+    }}
+)
+
+
+def _split_shell_segments_simple(cmd_text: str):
+    segments = []
+    cur = []
+    in_sq = False
+    in_dq = False
+    escaped = False
+    n = len(cmd_text)
+    i = 0
+    while i < n:
+        ch = cmd_text[i]
+        nxt = cmd_text[i + 1] if i + 1 < n else ""
+        if in_sq:
+            if ch == "'":
+                in_sq = False
+            cur.append(ch)
+            i += 1
+            continue
+        if escaped:
+            cur.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if ch == chr(92):
+            escaped = True
+            cur.append(ch)
+            i += 1
+            continue
+        if in_dq:
+            if ch == "`" or (ch == "$" and nxt == "(") or ch in (chr(10), chr(13)):
+                return None
+            if ch == '"':
+                in_dq = False
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == "'":
+            in_sq = True
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_dq = True
+            cur.append(ch)
+            i += 1
+            continue
+        if ch in (chr(10), chr(13), "`", "<", ">", "(", ")", "{{", "}}"):
+            return None
+        if ch == "$" and nxt == "(":
+            return None
+        if ch == ";":
+            seg = "".join(cur).strip()
+            if seg:
+                segments.append(seg)
+            cur = []
+            i += 1
+            continue
+        if ch == "|":
+            seg = "".join(cur).strip()
+            if seg:
+                segments.append(seg)
+            cur = []
+            i += 2 if nxt == "|" else 1
+            continue
+        if ch == "&":
+            if nxt != "&":
+                return None
+            seg = "".join(cur).strip()
+            if seg:
+                segments.append(seg)
+            cur = []
+            i += 2
+            continue
+        cur.append(ch)
+        i += 1
+    if in_sq or in_dq or escaped:
+        return None
+    tail = "".join(cur).strip()
+    if tail:
+        segments.append(tail)
+    return segments or None
+
+
+def _is_pure_readonly_segment(seg_text: str) -> bool:
+    try:
+        toks = shlex.split(seg_text)
+    except ValueError:
+        return False
+    idx = 0
+    while idx < len(toks):
+        tok = toks[idx]
+        if "=" in tok and not tok.startswith("-"):
+            var_name = tok.split("=", 1)[0]
+            if var_name.isidentifier():
+                idx += 1
+                continue
+        break
+    if idx >= len(toks):
+        return False
+    cmd_bin = os.path.basename(toks[idx]).lower()
+    args = toks[idx + 1 :]
+    if cmd_bin == "cd":
+        return True
+    if cmd_bin == "find":
+        for a in args:
+            if a.split("=", 1)[0] in _FIND_UNSAFE_FLAGS:
+                return False
+        return True
+    if cmd_bin == "git":
+        j = 0
+        while j < len(args):
+            a = args[j]
+            if a in ("--no-pager", "-p", "--paginate", "--bare"):
+                j += 1
+                continue
+            if a in ("-C", "--git-dir", "--work-tree"):
+                j += 2
+                continue
+            if a.startswith("--git-dir=") or a.startswith("--work-tree="):
+                j += 1
+                continue
+            if a.startswith("-"):
+                return False
+            break
+        if j >= len(args):
+            return False
+        subcmd = args[j]
+        if subcmd not in _SHELL_READONLY_GIT_SUBCMDS:
+            return False
+        for rem in args[j + 1 :]:
+            if rem == "--ext-diff" or rem == "-o" or rem == "--output" or rem.startswith("--output="):
+                return False
+        return True
+    if cmd_bin not in _SHELL_READONLY_INSPECT_BINS:
+        return False
+    if cmd_bin == "rg":
+        for a in args:
+            if a == "--pre" or a.startswith("--pre="):
+                return False
+    return True
+
+
+def _is_pure_readonly_command(cmd_text: str) -> bool:
+    segs = _split_shell_segments_simple(cmd_text)
+    if not segs:
+        return False
+    return all(_is_pure_readonly_segment(seg) for seg in segs)
 
 
 def _inspect_shell_command_paths(
@@ -1360,10 +1595,37 @@ def _inspect_shell_command_paths(
     is_mutating_cmd = first_bin in _SHELL_MUTATING_BINS or (
         first_bin == "sed" and any(t == "-i" or t.startswith("-i") for t in sh_tokens[1:])
     )
+    is_pure_readonly_cmd = _is_pure_readonly_command(cmd_text)
+    if _is_workspace_active_hook_injection_target(
+        effective_base_cwd, allowed_roots
+    ) or _is_workspace_active_hook_injection_target(
+        os.path.realpath(effective_base_cwd), allowed_roots
+    ):
+        _emit_fail_closed(
+            event_name,
+            f"Command working directory references protected workspace hook/agent configuration path '{{effective_base_cwd}}'",
+        )
+    if (
+        _is_workspace_readonly_protected_target(effective_base_cwd, allowed_roots)
+        or _is_workspace_readonly_protected_target(
+            os.path.realpath(effective_base_cwd), allowed_roots
+        )
+    ) and not (is_pure_readonly_cmd and not is_mutating_cmd):
+        _emit_fail_closed(
+            event_name,
+            f"Command working directory references protected workspace hook/agent configuration path '{{effective_base_cwd}}'",
+        )
     prev_was_out_redir = False
+    prev_was_cd = False
+    scan_cwd = effective_base_cwd
     for raw_tok in sh_tokens:
+        if raw_tok in (";", "&&", "||", "|"):
+            prev_was_out_redir = False
+            prev_was_cd = False
+            continue
         if raw_tok in _SHELL_REDIR_OPS:
             prev_was_out_redir = ">" in raw_tok
+            prev_was_cd = False
             continue
         tok = raw_tok
         is_out_redir = prev_was_out_redir
@@ -1374,8 +1636,13 @@ def _inspect_shell_command_paths(
                     is_out_redir = True
                 tok = tok[len(rop) :]
                 break
-        if not tok or "://" in tok or tok.startswith(("s/", "y/", "-")):
+        if prev_was_cd and tok == "--":
             continue
+        if not tok or "://" in tok or tok.startswith(("s/", "y/", "-")):
+            prev_was_cd = raw_tok == "cd"
+            continue
+        was_cd_target = prev_was_cd
+        prev_was_cd = raw_tok == "cd"
         if tok.startswith(("/dev/", "/proc/", "/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/etc/", "/opt/", "/tmp/")):
             abs_sys = os.path.abspath(tok)
             if any(_within(abs_sys, mp) for mp in effective_masked):
@@ -1391,52 +1658,77 @@ def _inspect_shell_command_paths(
                     event_name,
                     f"Modifying read-only plugin directory via '{{tok}}' is forbidden",
                 )
+            if was_cd_target:
+                scan_cwd = abs_sys
             continue
         if tok == "/tmp":
+            if was_cd_target:
+                scan_cwd = "/tmp"
             continue
+        rel_base_c = (
+            os.path.abspath(tok)
+            if os.path.isabs(tok)
+            else os.path.abspath(os.path.join(effective_base_cwd, tok))
+        )
+        rel_scan_c = (
+            rel_base_c
+            if os.path.isabs(tok)
+            else os.path.abspath(os.path.join(scan_cwd, tok))
+        )
         if (
             is_out_redir
+            or was_cd_target
             or tok.startswith(("/", "./", "../"))
             or "/" in tok
             or os.path.islink(os.path.join(effective_base_cwd, tok))
+            or os.path.islink(os.path.join(scan_cwd, tok))
+            or _is_workspace_hook_injection_target(rel_base_c, allowed_roots)
+            or _is_workspace_hook_injection_target(rel_scan_c, allowed_roots)
         ):
-            abs_c = (
-                os.path.abspath(tok)
-                if os.path.isabs(tok)
-                else os.path.abspath(os.path.join(effective_base_cwd, tok))
-            )
-            if any(_within(abs_c, mp) for mp in effective_masked):
-                _emit_fail_closed(
-                    event_name,
-                    f"Command references protected gateway path '{{tok}}'",
-                )
-            cur = Path("/")
-            for part in Path(abs_c).parts[1:]:
-                cur = cur / part
-                if os.path.islink(str(cur)):
-                    resolved_cur = os.path.realpath(str(cur))
-                    if not any(_within(resolved_cur, r) for r in safe_sys_roots) or any(
-                        _within(resolved_cur, mp) for mp in effective_masked
-                    ):
-                        _emit_fail_closed(
-                            event_name,
-                            f"Symlink escape blocked in command path '{{tok}}' ('{{cur}}' -> '{{resolved_cur}}')",
-                        )
-            resolved_c = os.path.realpath(abs_c)
-            if _is_workspace_hook_injection_target(abs_c, allowed_roots) or _is_workspace_hook_injection_target(
-                resolved_c, allowed_roots
-            ):
-                _emit_fail_closed(
-                    event_name,
-                    f"Command references protected workspace hook/agent configuration path '{{tok}}'",
-                )
-            if (is_out_redir or is_mutating_cmd) and any(
-                _within(abs_c, pr) or _within(resolved_c, pr) for pr in readonly_plugin_roots
-            ):
-                _emit_fail_closed(
-                    event_name,
-                    f"Modifying read-only plugin directory via '{{tok}}' is forbidden",
-                )
+            check_abs_list = [rel_base_c] if rel_scan_c == rel_base_c else [rel_base_c, rel_scan_c]
+            for abs_c in check_abs_list:
+                if any(_within(abs_c, mp) for mp in effective_masked):
+                    _emit_fail_closed(
+                        event_name,
+                        f"Command references protected gateway path '{{tok}}'",
+                    )
+                cur = Path("/")
+                for part in Path(abs_c).parts[1:]:
+                    cur = cur / part
+                    if os.path.islink(str(cur)):
+                        resolved_cur = os.path.realpath(str(cur))
+                        if not any(_within(resolved_cur, r) for r in safe_sys_roots) or any(
+                            _within(resolved_cur, mp) for mp in effective_masked
+                        ):
+                            _emit_fail_closed(
+                                event_name,
+                                f"Symlink escape blocked in command path '{{tok}}' ('{{cur}}' -> '{{resolved_cur}}')",
+                            )
+                resolved_c = os.path.realpath(abs_c)
+                if _is_workspace_active_hook_injection_target(
+                    abs_c, allowed_roots
+                ) or _is_workspace_active_hook_injection_target(resolved_c, allowed_roots):
+                    _emit_fail_closed(
+                        event_name,
+                        f"Command references protected workspace hook/agent configuration path '{{tok}}'",
+                    )
+                if (
+                    _is_workspace_readonly_protected_target(abs_c, allowed_roots)
+                    or _is_workspace_readonly_protected_target(resolved_c, allowed_roots)
+                ) and not (is_pure_readonly_cmd and not is_out_redir and not is_mutating_cmd):
+                    _emit_fail_closed(
+                        event_name,
+                        f"Command references protected workspace hook/agent configuration path '{{tok}}'",
+                    )
+                if (is_out_redir or is_mutating_cmd) and any(
+                    _within(abs_c, pr) or _within(resolved_c, pr) for pr in readonly_plugin_roots
+                ):
+                    _emit_fail_closed(
+                        event_name,
+                        f"Modifying read-only plugin directory via '{{tok}}' is forbidden",
+                    )
+            if was_cd_target:
+                scan_cwd = rel_scan_c
 
 
 def _check_symlink_escape_in_payload(
@@ -1505,7 +1797,7 @@ def _check_symlink_escape_in_payload(
         if "patch" in tool_name.lower() or "*** " in tool_input:
             candidate_paths.extend(_extract_patch_paths(tool_input))
     elif isinstance(tool_input, dict):
-        for wd_key in ("workdir", "cwd", "directory"):
+        for wd_key in ("workdir", "cwd", "directory", "Cwd", "DirectoryPath"):
             raw_wd = tool_input.get(wd_key)
             if isinstance(raw_wd, str) and raw_wd.strip():
                 _, resolved_wd = _validate_path_no_symlink_escape(
@@ -1554,7 +1846,12 @@ def _check_symlink_escape_in_payload(
                             candidate_paths.extend(_extract_patch_paths(elem))
 
         if tool_name in ("Bash", "run_command", "exec_command", "shell_command", "shell"):
-            raw_sh = tool_input.get("command") or tool_input.get("cmd")
+            raw_sh = (
+                tool_input.get("command")
+                or tool_input.get("cmd")
+                or tool_input.get("CommandLine")
+                or tool_input.get("command_line")
+            )
             if isinstance(raw_sh, str) and raw_sh.strip():
                 shell_commands.append(raw_sh)
             elif isinstance(raw_sh, list):

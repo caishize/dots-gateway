@@ -1017,6 +1017,8 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         )
         loaded_cfg = GatewayConfig.load(legacy_cfg_path)
         self.assertIn("set", loaded_cfg.allowed_commands)
+        for sh_b in ("exit", "return", ":", "trap", "command", "type"):
+            self.assertIn(sh_b, loaded_cfg.allowed_commands)
         self.assertIn("systemd-run", loaded_cfg.blocked_commands)
 
         # Minimal non-shell custom allowlist must NOT be bloated with shell builtins
@@ -1032,6 +1034,9 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         )
         minimal_cfg = GatewayConfig.load(minimal_cfg_path)
         self.assertNotIn("set", minimal_cfg.allowed_commands)
+        self.assertNotIn("exit", minimal_cfg.allowed_commands)
+        self.assertNotIn("trap", minimal_cfg.allowed_commands)
+        self.assertNotIn("command", minimal_cfg.allowed_commands)
         self.assertIn("systemd-run", minimal_cfg.blocked_commands)
 
         # Operator explicit block of 'set' must be respected
@@ -1467,6 +1472,75 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         writer.close()
         await writer.wait_closed()
         self.assertIn(b"400", smuggle_status)
+
+    async def test_v1522_shell_builtins_exit_trap_command_and_subshell_redirs(self) -> None:
+        cfg = GatewayConfig(
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+        )
+        pol = CommandPolicy(cfg)
+
+        allowed_cmds = [
+            f"(cd {self.tmpdir} && python3 --version) > {self.tmpdir}/wrap.log 2>&1; rc=$?; exit \"$rc\"",
+            f"python3 --version 2>&1 | tee {self.tmpdir}/pipe.log; exit \"${{PIPESTATUS[0]}}\"",
+            "command -v python3",
+            "type python3",
+            "return 0",
+            f": > {self.tmpdir}/empty.log",
+            f"trap 'rm -f {self.tmpdir}/cid.tmp' EXIT",
+            "trap 'rc=$?; echo RC=$rc' EXIT TERM",
+            "trap - EXIT",
+            "trap -p EXIT",
+            f"(echo hello) > {self.tmpdir}/sub.log 2>&1",
+        ]
+        for cmd in allowed_cmds:
+            dec = pol.validate_command(cmd, cwd=self.tmpdir)
+            self.assertTrue(dec.allowed, f"Expected allowed for {cmd!r}, got {dec.reason}")
+            self.assertTrue(dec.requires_shell, f"Expected requires_shell=True for {cmd!r}")
+
+        home_bashrc = str(Path.home() / ".bashrc")
+        home_ssh_auth = str(Path.home() / ".ssh" / "authorized_keys")
+        home_ssh = str(Path.home() / ".ssh")
+        blocked_cmds = [
+            "command -p ls",
+            "command -pv ls",
+            "command sudo id",
+            "command -- sudo id",
+            "command env rm -rf /",
+            "trap -x EXIT",
+            "trap 'sudo id' EXIT",
+            f"trap 'rm -rf {home_ssh}' EXIT",
+            f"(sudo id) > {self.tmpdir}/sub.log",
+            f"(echo pwn) > {home_ssh_auth}",
+            f": > {home_bashrc}",
+            "(ls) sudo id",
+        ]
+        for bcmd in blocked_cmds:
+            bdec = pol.validate_command(bcmd, cwd=self.tmpdir)
+            self.assertFalse(bdec.allowed, f"Expected blocked for {bcmd!r}")
+
+        # Live execution: wrapper preserves both raw log output and real non-zero exit code
+        client = DotsGatewayClient(base_url=self.base_url, token="test-secret-token-12345")
+        wrap_log = Path(self.tmpdir) / "live_wrapper_out.log"
+        wrap_cmd = (
+            f"(python3 -c \"import sys; print('WRAP_OUT_OK'); print('WRAP_ERR_OK', file=sys.stderr); sys.exit(7)\") "
+            f"> {wrap_log} 2>&1; rc=$?; cat {wrap_log}; exit \"$rc\""
+        )
+        sess_res = await asyncio.to_thread(
+            client._request_json,
+            "POST",
+            "/v1/sessions",
+            {"type": "exec", "command": wrap_cmd, "cwd": self.tmpdir},
+        )
+        wrap_sid = sess_res["session_id"]
+        wrap_sess = self.server.sessions.get_session(wrap_sid)
+        assert wrap_sess is not None
+        await asyncio.wait_for(wrap_sess.wait(), timeout=10.0)
+        self.assertEqual(wrap_sess.returncode, 7)
+        log_txt = wrap_log.read_text(encoding="utf-8")
+        self.assertIn("WRAP_OUT_OK", log_txt)
+        self.assertIn("WRAP_ERR_OK", log_txt)
+        self.assertIn("WRAP_OUT_OK", wrap_sess.to_summary(include_output=True)["stdout"])
 
 
 if __name__ == "__main__":

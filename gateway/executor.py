@@ -2688,7 +2688,14 @@ class SessionManager:
             return live
         return self._persisted.get(session_id)
 
-    def list_sessions(self) -> List[Dict[str, Any]]:
+    def list_sessions(
+        self,
+        *,
+        limit: Optional[int] = None,
+        cwd: Optional[str] = None,
+        status: Optional[str] = None,
+        session_kind: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         combined: List[Union[ExecutionSession, PersistedSession]] = list(
             self._sessions.values()
         )
@@ -2696,4 +2703,21 @@ class SessionManager:
             if sid not in self._sessions:
                 combined.append(ps)
         combined.sort(key=lambda x: x.started_at, reverse=True)
-        return [s.to_summary(include_output=False) for s in combined]
+        if limit is not None and int(limit) <= 0:
+            return []
+        norm_cwd = os.path.normpath(cwd) if cwd else None
+        results: List[Dict[str, Any]] = []
+        for s in combined:
+            summary = s.to_summary(include_output=False)
+            if status and summary.get("status") != status:
+                continue
+            if session_kind and summary.get("session_kind") != session_kind:
+                continue
+            if norm_cwd:
+                s_cwd = os.path.normpath(str(summary.get("cwd") or ""))
+                if s_cwd != norm_cwd and not s_cwd.startswith(norm_cwd + os.sep):
+                    continue
+            results.append(summary)
+            if limit is not None and len(results) >= int(limit):
+                break
+        return results

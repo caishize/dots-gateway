@@ -439,6 +439,10 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "items": {"type": "string"},
                     "description": "Optional validated CLI flags passed to `agy` or `codex`.",
                 },
+                "stdin": {
+                    "type": "string",
+                    "description": "Optional standard input text to feed when `type='exec'`.",
+                },
                 "timeout": {
                     "type": "number",
                     "minimum": 0.1,
@@ -483,6 +487,22 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "type": "boolean",
                     "default": False,
                     "description": "If true, wait up to `wait_seconds` for the session to finish completely.",
+                },
+                "include_events": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Include event stream items in the response (set false when paging raw stdout/stderr).",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Character offset into `stdout` and `stderr` when slicing large session outputs.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional maximum characters per stream (`stdout`/`stderr`) starting at `offset`.",
                 },
             },
             "required": ["session_id"],
@@ -563,7 +583,26 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum number of sessions to return (most recent first).",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Filter sessions whose `cwd` matches or sits under this directory path.",
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Filter by session status (e.g. `running`, `completed`, `failed`, `timeout`).",
+                },
+                "session_kind": {
+                    "type": "string",
+                    "enum": ["exec", "agy", "codex"],
+                    "description": "Filter by session kind (`exec`, `agy`, or `codex`).",
+                },
+            },
             "additionalProperties": False,
         },
         "annotations": {
@@ -803,10 +842,13 @@ def _tool_success(data: Dict[str, Any], summary_text: Optional[str] = None) -> D
 
 def _tool_error(message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     payload = {"error": message, **(details or {})}
-    return {
+    res: Dict[str, Any] = {
         "isError": True,
         "content": [{"type": "text", "text": json.dumps(payload, indent=2, ensure_ascii=False)}],
     }
+    if details is not None:
+        res["structuredContent"] = payload
+    return res
 
 
 class MCPHandler:
@@ -1367,6 +1409,7 @@ class MCPHandler:
                         env=args.get("env"),
                         use_pty=bool(args.get("use_pty", False)),
                         timeout=args.get("timeout"),
+                        initial_stdin=args.get("stdin"),
                         close_stdin=bool(args.get("close_stdin", False)),
                     )
                 return _jsonrpc_result(req_id, _tool_success(session.to_summary(include_output=False)))
@@ -1379,6 +1422,11 @@ class MCPHandler:
                 after_seq = int(args.get("after_seq") or 0)
                 wait_seconds = min(max(0.0, float(args.get("wait_seconds") or 0.0)), 60.0)
                 wait_for_exit = bool(args.get("wait_for_exit", False))
+                include_events = bool(args.get("include_events", True))
+                offset_raw = args.get("offset")
+                limit_raw = args.get("limit")
+                offset = max(0, int(offset_raw)) if offset_raw is not None else 0
+                limit = max(0, int(limit_raw)) if limit_raw is not None else None
 
                 if wait_seconds > 0 and session.status in (
                     "queued",
@@ -1401,9 +1449,25 @@ class MCPHandler:
                         if time.monotonic() >= deadline:
                             break
 
-                return _jsonrpc_result(
-                    req_id, _tool_success(session.to_summary(include_output=True, after_seq=after_seq))
-                )
+                summary = session.to_summary(include_output=True, after_seq=after_seq)
+                if not include_events:
+                    summary.pop("events", None)
+                if offset > 0 or limit is not None:
+                    full_stdout = str(summary.get("stdout") or "")
+                    full_stderr = str(summary.get("stderr") or "")
+                    total_out = len(full_stdout)
+                    total_err = len(full_stderr)
+                    end_out = offset + limit if limit is not None else total_out
+                    end_err = offset + limit if limit is not None else total_err
+                    summary["stdout"] = full_stdout[offset:end_out]
+                    summary["stderr"] = full_stderr[offset:end_err]
+                    summary["output_offset"] = offset
+                    summary["output_limit"] = limit
+                    summary["stdout_total_chars"] = total_out
+                    summary["stderr_total_chars"] = total_err
+                    summary["stdout_has_more"] = end_out < total_out
+                    summary["stderr_has_more"] = end_err < total_err
+                return _jsonrpc_result(req_id, _tool_success(summary))
 
             if tool_name == "session_input":
                 sid = str(args.get("session_id", ""))
@@ -1439,9 +1503,15 @@ class MCPHandler:
                 )
 
             if tool_name == "session_list":
-                return _jsonrpc_result(
-                    req_id, _tool_success({"sessions": self.sessions.list_sessions()})
+                limit_arg = args.get("limit")
+                limit_val = max(1, int(limit_arg)) if limit_arg is not None else None
+                sessions_out = self.sessions.list_sessions(
+                    limit=limit_val,
+                    cwd=args.get("cwd"),
+                    status=args.get("status"),
+                    session_kind=args.get("session_kind"),
                 )
+                return _jsonrpc_result(req_id, _tool_success({"sessions": sessions_out}))
 
             if tool_name == "fs_stat":
                 res = await asyncio.to_thread(self.files.stat, str(args["path"]), args.get("cwd"))

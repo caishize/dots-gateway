@@ -2691,6 +2691,132 @@ class TestPluginIsolationAndHooksV1517(unittest.IsolatedAsyncioTestCase):
         finally:
             cleanup_prepared_plugin_runtime(cx_rt)
 
+    def test_v1522_readonly_claude_hook_inspection_and_active_jail(self) -> None:
+        from gateway.hook_jail import render_hook_jail_runner_source
+
+        repo = self.workspace_root / "v1522-hook-probe"
+        (repo / ".claude" / "hooks").mkdir(parents=True, exist_ok=True)
+        (repo / ".claude" / "hooks" / "block-git-checkout.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (repo / ".claude" / "settings.json").write_text('{"hooks":{}}\n', encoding="utf-8")
+        (repo / ".git" / "hooks").mkdir(parents=True, exist_ok=True)
+        (repo / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (repo / ".gemini").mkdir(parents=True, exist_ok=True)
+        (repo / ".gemini" / "settings.json").write_text("{}\n", encoding="utf-8")
+        (repo / ".codex").mkdir(parents=True, exist_ok=True)
+        (repo / ".codex" / "hooks.json").write_text("{}\n", encoding="utf-8")
+        (repo / ".agents" / "plugins").mkdir(parents=True, exist_ok=True)
+        (repo / ".agents" / "plugins" / "p.txt").write_text("x\n", encoding="utf-8")
+
+        htmp = self.test_root / "v1522-htmp"
+        hdata = self.test_root / "v1522-hdata"
+        pdir = self.test_root / "v1522-plugin"
+        htmp.mkdir(parents=True, exist_ok=True)
+        hdata.mkdir(parents=True, exist_ok=True)
+        pdir.mkdir(parents=True, exist_ok=True)
+        runner_file = self.test_root / "dots-hook-jail-v1522.py"
+        runner_file.write_text(render_hook_jail_runner_source(), encoding="utf-8")
+
+        pass_script = pdir / "v1522-allow-hook.py"
+        pass_script.write_text(
+            "import json, sys\n_ = sys.stdin.read()\nprint(json.dumps({'decision': 'allow'}))\n",
+            encoding="utf-8",
+        )
+        cfg_p = self.test_root / "v1522-hook-cfg.json"
+        cfg_p.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "agent": "agy",
+                    "plugin_name": "oh-my-agents",
+                    "event_name": "PreToolUse",
+                    "resolved_argv": [sys.executable, str(pass_script)],
+                    "plugin_vfs_dir": str(pdir),
+                    "plugin_source_dir": str(pdir),
+                    "hook_tmp_dir": str(htmp),
+                    "hook_data_dir": str(hdata),
+                    "allowed_workspaces": [str(self.workspace_root)],
+                    "masked_paths": [str(self.secrets_dir)],
+                    "readonly_subpaths": [],
+                    "require_mount_ns": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def _run_hook(
+            tool_name: str,
+            cmd_text: str,
+            *,
+            use_tool_call: bool = False,
+        ) -> subprocess.CompletedProcess[str]:
+            if use_tool_call:
+                payload = {
+                    "cwd": str(repo),
+                    "toolCall": {"name": tool_name, "args": {"CommandLine": cmd_text}},
+                }
+            else:
+                key = "CommandLine" if tool_name == "run_command" else "command"
+                payload = {
+                    "cwd": str(repo),
+                    "tool_name": tool_name,
+                    "tool_input": {key: cmd_text},
+                }
+            return subprocess.run(
+                [sys.executable, "-I", str(runner_file), "--config", str(cfg_p)],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                cwd=str(repo),
+                timeout=10,
+            )
+
+        # Pure read-only inspection of .claude/hooks and .claude/settings.json MUST be allowed
+        for tool_name, ro_cmd, use_tc in (
+            ("run_command", f"ls -la {repo}/.claude/hooks", False),
+            ("run_command", f"ls -la {repo}/.claude/hooks", True),
+            ("Bash", f"ls -la {repo}/.claude/hooks", False),
+            ("run_command", f"cat {repo}/.claude/hooks/block-git-checkout.sh", False),
+            ("run_command", f"cd {repo} && ls -la .claude/hooks && head -n 5 .claude/settings.json", False),
+            ("Bash", f"cat {repo}/.claude/hooks/block-git-checkout.sh | wc -l", False),
+            ("run_command", f"git -C {repo} status -- .claude/hooks", False),
+            ("run_command", f"find {repo}/.claude/hooks -maxdepth 2 -type f", False),
+        ):
+            res = _run_hook(tool_name, ro_cmd, use_tool_call=use_tc)
+            self.assertEqual(res.returncode, 0, f"Expected allow for {ro_cmd!r}: {res.stderr}")
+            self.assertEqual(json.loads(res.stdout)["decision"], "allow")
+
+        # Mutations, redirections, command substitution, chained writes on .claude/hooks -> MUST fail closed
+        for bad_cmd in (
+            f"touch {repo}/.claude/hooks/evil.sh",
+            f"rm -f {repo}/.claude/hooks/block-git-checkout.sh",
+            f"cat {repo}/.claude/hooks/block-git-checkout.sh > /tmp/leak.sh",
+            f"echo x > {repo}/.claude/settings.json",
+            f"ls -la {repo}/.claude/hooks && touch {repo}/.claude/hooks/evil.sh",
+            f"cd {repo}/.claude && touch settings.json",
+            f"find {repo}/.claude/hooks -exec rm {{}} +",
+            f'echo "$(cat {repo}/.claude/hooks/block-git-checkout.sh)"',
+            f"git -C {repo} -c diff.external=/tmp/x diff .claude/hooks/block-git-checkout.sh",
+        ):
+            for use_tc in (False, True):
+                res = _run_hook("run_command", bad_cmd, use_tool_call=use_tc)
+                self.assertEqual(
+                    res.returncode,
+                    2,
+                    f"Expected deny for {bad_cmd!r} (toolCall={use_tc}), got rc={res.returncode}",
+                )
+                self.assertEqual(json.loads(res.stdout)["decision"], "deny")
+
+        # Active hook injection targets (.git/hooks, .gemini, .codex/hooks.json, .agents/plugins) ALWAYS fail closed
+        for active_cmd in (
+            f"ls -la {repo}/.git/hooks",
+            f"cat {repo}/.gemini/settings.json",
+            f"cat {repo}/.codex/hooks.json",
+            f"ls -la {repo}/.agents/plugins",
+        ):
+            res = _run_hook("run_command", active_cmd)
+            self.assertEqual(res.returncode, 2, f"Expected deny for active path {active_cmd!r}")
+            self.assertEqual(json.loads(res.stdout)["decision"], "deny")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -102,7 +102,94 @@ _SHELL_BUILTINS = {
     "test",
     "[",
     "set",
+    "exit",
+    "return",
+    ":",
+    "trap",
+    "command",
+    "type",
 }
+_SUBSHELL_STANDALONE_REDIR_RE = re.compile(r"^(?:\d+|&)?(?:>>|>\||<>|>&|<&|>|<)$")
+_SUBSHELL_COMBINED_REDIR_RE = re.compile(r"^(?:\d+|&)?(?:>>|>\||<>|>&|<&|>|<).+$")
+_SUBSHELL_PREFIX_KEYWORDS = ("!", "if", "elif", "else", "then", "do", "while", "until")
+
+
+def _is_valid_subshell_redir_tail(trailing: str) -> bool:
+    if not trailing:
+        return True
+    try:
+        toks = shlex.split(trailing)
+    except ValueError:
+        return False
+    i = 0
+    while i < len(toks):
+        tok = toks[i]
+        if _SUBSHELL_STANDALONE_REDIR_RE.match(tok):
+            if i + 1 >= len(toks):
+                return False
+            i += 2
+            continue
+        if _SUBSHELL_COMBINED_REDIR_RE.match(tok):
+            i += 1
+            continue
+        return False
+    return True
+
+
+def _unwrap_subshell_with_redirs(seg: str) -> Optional[Tuple[str, str]]:
+    """Unwrap `[prefix_kw...] ( inner ) [redirs...]` into `(inner, trailing_redirs)` if valid."""
+    work = seg.strip()
+    while work:
+        matched_kw = False
+        for kw in _SUBSHELL_PREFIX_KEYWORDS:
+            if work == kw:
+                return None
+            if work.startswith(kw) and len(work) > len(kw) and work[len(kw)].isspace():
+                work = work[len(kw) :].lstrip()
+                matched_kw = True
+                break
+        if not matched_kw:
+            break
+    if not work.startswith("("):
+        return None
+    depth = 0
+    in_sq = False
+    in_dq = False
+    escaped = False
+    close_idx = -1
+    for idx, ch in enumerate(work):
+        if in_sq:
+            if ch == "'":
+                in_sq = False
+            continue
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if in_dq:
+            if ch == '"':
+                in_dq = False
+            continue
+        if ch == "'":
+            in_sq = True
+        elif ch == '"':
+            in_dq = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                close_idx = idx
+                break
+    if close_idx <= 0:
+        return None
+    inner = work[1:close_idx]
+    trailing = work[close_idx + 1 :].strip()
+    if not _is_valid_subshell_redir_tail(trailing):
+        return None
+    return inner, trailing
 _SHELL_PREFIX_KEYWORDS = {
     "if",
     "elif",
@@ -1676,13 +1763,21 @@ class CommandPolicy:
             if not seg:
                 continue
 
-            # Unwrap outer subshell parentheses `(cd dir && make)`
-            if seg.startswith("(") and seg.endswith(")"):
-                inner_grp = seg[1:-1]
+            # Unwrap subshell groups `[prefix_kw...] (cd dir && make) [> log 2>&1]`
+            unwrapped_subshell = _unwrap_subshell_with_redirs(seg)
+            if unwrapped_subshell is not None:
+                requires_shell = True
+                inner_grp, trailing_redirs = unwrapped_subshell
                 if inner_grp.strip():
                     grp_dec = self.validate_command(inner_grp, cwd=resolved_cwd, _depth=_depth + 1)
                     if not grp_dec.allowed:
                         return grp_dec
+                if trailing_redirs:
+                    redir_dec = self.validate_command(
+                        f": {trailing_redirs}", cwd=resolved_cwd, _depth=_depth + 1
+                    )
+                    if not redir_dec.allowed:
+                        return redir_dec
                 continue
 
             try:
@@ -1761,6 +1856,38 @@ class CommandPolicy:
                             reason=f"Modifying protected environment variable '{exp_key}' via '{exe}' is forbidden",
                             resolved_cwd=resolved_cwd,
                         )
+            if exe == "trap":
+                trap_args = list(seg_tokens[idx + 1 :])
+                t_i = 0
+                is_print_or_list = False
+                while t_i < len(trap_args):
+                    targ = trap_args[t_i]
+                    if targ == "--":
+                        t_i += 1
+                        break
+                    if targ == "-":
+                        break
+                    if targ in ("-p", "-l"):
+                        is_print_or_list = True
+                        t_i += 1
+                        continue
+                    if targ.startswith("-"):
+                        return PolicyDecision(
+                            False,
+                            reason=f"Unsupported option '{targ}' for 'trap'",
+                            resolved_cwd=resolved_cwd,
+                        )
+                    break
+                rem_trap = trap_args[t_i:]
+                if not is_print_or_list and rem_trap:
+                    trap_action = rem_trap[0]
+                    is_numeric_reset = len(rem_trap) == 1 and trap_action.isdigit()
+                    if trap_action not in ("", "-") and not is_numeric_reset:
+                        trap_dec = self.validate_command(
+                            trap_action, cwd=resolved_cwd, _depth=_depth + 1
+                        )
+                        if not trap_dec.allowed:
+                            return trap_dec
 
             ok_exe, exe_err = self._check_single_executable(exe, resolved_cwd)
             if not ok_exe:
@@ -1939,6 +2066,27 @@ class CommandPolicy:
                         break
                     if x_idx < len(seg_tokens):
                         next_idx = x_idx
+                elif w_base == "command" and effective_idx + 1 < len(seg_tokens):
+                    c_idx = effective_idx + 1
+                    is_lookup = False
+                    while c_idx < len(seg_tokens):
+                        ctok = seg_tokens[c_idx]
+                        if ctok == "--":
+                            c_idx += 1
+                            break
+                        if ctok in ("-v", "-V"):
+                            is_lookup = True
+                            c_idx += 1
+                            continue
+                        if ctok.startswith("-"):
+                            return PolicyDecision(
+                                False,
+                                reason=f"Flag '{ctok}' on 'command' is forbidden by security policy",
+                                resolved_cwd=resolved_cwd,
+                            )
+                        break
+                    if not is_lookup and c_idx < len(seg_tokens):
+                        next_idx = c_idx
 
                 if next_idx is None or next_idx <= effective_idx or next_idx >= len(seg_tokens):
                     break
