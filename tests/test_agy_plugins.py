@@ -902,7 +902,7 @@ class AgyPluginsSecurityAndWorkflowTests(unittest.IsolatedAsyncioTestCase):
             out_data = json.loads(resp["stdout"].strip())
 
             # Plugin discovered & spec-to-task/SKILL.md read without 'Matches user-configured deny rule'!
-            self.assertTrue(out_data["sandbox_flag"])
+            self.assertFalse(out_data["sandbox_flag"])
             self.assertEqual(out_data["plugin_root_env"], str(self.plugin_dir))
             self.assertEqual(out_data["dont_write_bytecode"], "1")
             self.assertIsNone(out_data["caller_spoof_check"])

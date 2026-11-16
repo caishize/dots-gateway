@@ -381,6 +381,7 @@ class GatewayConfig:
     agy_binary: str = DEFAULT_AGY_BIN
     agy_default_skip_permissions: bool = True
     agy_default_sandbox: bool = True
+    agy_sandbox_network_access: bool = True
     agy_sandbox_tool_permission: str = "proceed-in-sandbox"
     agy_include_allowed_workdirs: bool = True
     agy_extra_workspace_dirs: List[str] = field(default_factory=list)
@@ -567,6 +568,11 @@ class GatewayConfig:
                 "1",
                 "true",
                 "yes",
+            )
+        if os.environ.get("GATEWAY_AGY_SANDBOX_NETWORK_ACCESS"):
+            cfg.agy_sandbox_network_access = (
+                os.environ["GATEWAY_AGY_SANDBOX_NETWORK_ACCESS"].strip().lower()
+                in ("1", "true", "yes")
             )
         if os.environ.get("GATEWAY_AGY_SANDBOX_TOOL_PERMISSION"):
             cfg.agy_sandbox_tool_permission = os.environ[

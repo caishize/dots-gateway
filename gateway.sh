@@ -99,6 +99,9 @@ if not d.get("codex_default_sandbox"):
 if "codex_sandbox_network_access" not in d:
     d["codex_sandbox_network_access"] = True
     changed = True
+if "agy_sandbox_network_access" not in d:
+    d["agy_sandbox_network_access"] = True
+    changed = True
 if "codex_extra_writable_roots" not in d:
     d["codex_extra_writable_roots"] = []
     changed = True
@@ -472,7 +475,15 @@ cmd_status() {
   echo "  Dots Gateway & Tunnel Service Status"
   echo "============================================================================"
   echo "  Gateway Service  : ${SERVICE_NAME} (${state}) | PID=${pid} (${mem_mib})"
-  echo "  Workspace Jail   : ${wdir} (mount_ns=${mns}, agy_sandbox=${sbx})"
+  local agy_net
+  agy_net="$(python3 - "${CONFIG_FILE}" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+d = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+print(bool(d.get("agy_sandbox_network_access", True)))
+PY
+)"
+  echo "  Workspace Jail   : ${wdir} (mount_ns=${mns}, agy_sandbox=${sbx}, agy_net=${agy_net})"
   local sb_info
   sb_info="$(python3 - "${CONFIG_FILE}" <<'PY'
 import json, os, pathlib, sys

@@ -83,7 +83,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         # 2b. Enforce strict version parity across package, manifests, pyproject.toml, and README
         pyproject_data = tomllib.loads((GATEWAY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         expected_ver = gateway.__version__
-        self.assertEqual(expected_ver, "1.5.22")
+        self.assertEqual(expected_ver, "1.5.23")
         self.assertEqual(root_manifest["version"], expected_ver)
         self.assertEqual(codex_manifest["version"], expected_ver)
         self.assertEqual(pyproject_data["project"]["version"], expected_ver)
@@ -1585,7 +1585,10 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("outside approved workspacePaths", oma_deny_obj["reason"])
 
             settings_obj = json.loads(settings_arg.split("=", 1)[1])
-            self.assertEqual(settings_obj.get("toolPermission"), "proceed-in-sandbox")
+            expected_tool_perm = (
+                "always-proceed" if agy_cfg.isolate_mount_namespace else "proceed-in-sandbox"
+            )
+            self.assertEqual(settings_obj.get("toolPermission"), expected_tool_perm)
             allow_rules = settings_obj["permissions"]["allow"]
             deny_rules = settings_obj["permissions"]["deny"]
             self.assertIn(f"write_file({sub_ws.resolve()})", allow_rules)
@@ -1643,12 +1646,15 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
                 resp_noskip["result"]["structuredContent"]["stdout"].strip()
             )
             self.assertNotIn("--dangerously-skip-permissions", parsed_noskip["argv"])
-            self.assertIn("--sandbox", parsed_noskip["argv"])
+            if agy_cfg.isolate_mount_namespace:
+                self.assertNotIn("--sandbox", parsed_noskip["argv"])
+            else:
+                self.assertIn("--sandbox", parsed_noskip["argv"])
             noskip_settings_arg = next(
                 a for a in parsed_noskip["argv"] if a.startswith("--settings=")
             )
             noskip_settings = json.loads(noskip_settings_arg.split("=", 1)[1])
-            self.assertEqual(noskip_settings.get("toolPermission"), "proceed-in-sandbox")
+            self.assertEqual(noskip_settings.get("toolPermission"), expected_tool_perm)
 
             # Verify MCP session_start(type="agy") accepts add_dirs / continue_last and rejects outside paths
             sibling_ev_dir = Path(self.tmpdir) / "stripe-topup-session-evidence"

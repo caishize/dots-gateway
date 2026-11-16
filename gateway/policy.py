@@ -2290,6 +2290,26 @@ class CommandPolicy:
 
         return PolicyDecision(True, reason="ok", resolved_cwd=resolved_cwd)
 
+    def _use_agy_host_network_vfs_mode(self, use_sandbox: bool = True) -> bool:
+        """Return True when AGY uses outer kernel VFS isolation with host-consistent network.
+
+        Linux `agy --sandbox` unconditionally enters an isolated network namespace
+        (`CLONE_NEWNET`) that cuts off host NIC routing and `/etc/resolv.conf` DNS. When
+        `agy_sandbox_network_access=True` AND outer kernel user+mount namespace isolation
+        (`isolate_mount_namespace=True` + `can_use_mount_namespace()`) is active, Gateway
+        enforces VFS/hook/credential containment at the kernel mount layer + `--settings`
+        permission rules while omitting inner `--sandbox` so AGY shares host network & DNS
+        (matching `exec_command` and `codex_sandbox_network_access=True`).
+        If outer mount-namespace isolation is disabled or unavailable, Gateway fails safe by
+        keeping inner `agy --sandbox` enabled.
+        """
+        return bool(
+            use_sandbox
+            and self.config.agy_sandbox_network_access
+            and self.config.isolate_mount_namespace
+            and can_use_mount_namespace()
+        )
+
     def build_agy_argv(
         self,
         prompt: Optional[str] = None,
@@ -2457,10 +2477,14 @@ class CommandPolicy:
         if use_skip and "--dangerously-skip-permissions" not in extra:
             argv.append("--dangerously-skip-permissions")
         if use_sandbox:
-            if "--sandbox" not in extra:
+            host_net_vfs = self._use_agy_host_network_vfs_mode(use_sandbox=True)
+            if not host_net_vfs and "--sandbox" not in extra:
                 argv.append("--sandbox")
             agy_settings = self.build_agy_sandbox_settings(
-                cwd=cwd, add_dirs=add_dirs, _validated_plugins=active_validated_plugins
+                cwd=cwd,
+                add_dirs=add_dirs,
+                _validated_plugins=active_validated_plugins,
+                _inner_sandbox_active=not host_net_vfs,
             )
             argv.append(f"--settings={json.dumps(agy_settings, separators=(',', ':'))}")
 
@@ -4063,11 +4087,14 @@ class CommandPolicy:
         cwd: Optional[str] = None,
         add_dirs: Optional[Sequence[str]] = None,
         _validated_plugins: Optional[Sequence[ValidatedAgyPlugin]] = None,
+        _inner_sandbox_active: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """Build per-session `--settings` JSON for `agy --sandbox`.
+        """Build per-session `--settings` JSON for `agy`.
 
-        Configures `toolPermission` (default: `"proceed-in-sandbox"`, enabling headless
-        command execution inside `agy --sandbox` even when `skip_permissions=False`),
+        Configures `toolPermission` (default: `"proceed-in-sandbox"` when inner `agy --sandbox`
+        is active, or `"always-proceed"` when outer kernel VFS isolation runs with host-consistent
+        network `agy_sandbox_network_access=True` so headless commands run without TUI prompts
+        even when `skip_permissions=False`),
         grants `read_file(...)` mounts for read-only `/opt` SDK toolchains (ordered before
         `write_file(...)` so writable child caches such as `/opt/flutter/bin/cache` stay
         writable), grants `write_file(...)` mounts for validated workspace/cache roots,
@@ -4080,6 +4107,18 @@ class CommandPolicy:
                 f"Invalid or forbidden agy_sandbox_tool_permission '{tool_perm}'; "
                 "allowed: 'proceed-in-sandbox', 'request-review', 'strict'"
             )
+        inner_sbx = (
+            not self._use_agy_host_network_vfs_mode(
+                use_sandbox=self.config.agy_default_sandbox
+            )
+            if _inner_sandbox_active is None
+            else bool(_inner_sandbox_active)
+        )
+        eff_tool_perm = (
+            "always-proceed"
+            if (not inner_sbx and tool_perm == "proceed-in-sandbox")
+            else tool_perm
+        )
 
         plugins_state = agy_plugins_config_state(self.config)
         validated_plugins: List[ValidatedAgyPlugin] = []
@@ -4285,7 +4324,7 @@ class CommandPolicy:
         perms["deny"] = deny_list
 
         return {
-            "toolPermission": tool_perm,
+            "toolPermission": eff_tool_perm,
             "permissions": perms,
         }
 

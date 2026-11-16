@@ -494,7 +494,11 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(agy_res["returncode"], 0)
         self.assertIn("--dangerously-skip-permissions", agy_res["argv"])
-        self.assertIn("--sandbox", agy_res["argv"])
+        self.assertTrue(any(a.startswith("--settings=") for a in agy_res["argv"]))
+        if self.cfg.isolate_mount_namespace:
+            self.assertNotIn("--sandbox", agy_res["argv"])
+        else:
+            self.assertIn("--sandbox", agy_res["argv"])
 
         codex_res = await asyncio.to_thread(
             client.run_codex, prompt=None, args=["--help"], skip_permissions=True
@@ -575,6 +579,7 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(default_cfg.allowed_workdirs, [DEFAULT_WORKSPACE_DIR])
         self.assertTrue(default_cfg.isolate_mount_namespace)
         self.assertTrue(default_cfg.agy_default_sandbox)
+        self.assertTrue(default_cfg.agy_sandbox_network_access)
         self.assertTrue(default_cfg.agy_include_allowed_workdirs)
         self.assertEqual(default_cfg.agy_sandbox_tool_permission, "proceed-in-sandbox")
         self.assertIn(str(GATEWAY_ROOT), default_cfg.protected_paths)
@@ -1541,6 +1546,64 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("WRAP_OUT_OK", log_txt)
         self.assertIn("WRAP_ERR_OK", log_txt)
         self.assertIn("WRAP_OUT_OK", wrap_sess.to_summary(include_output=True)["stdout"])
+
+    async def test_v1523_agy_host_network_parity_and_fallback_safety(self) -> None:
+        from unittest.mock import patch
+
+        # 1. Default host-consistent network mode with outer mount_ns omits inner --sandbox
+        # while still injecting --settings (toolPermission="always-proceed" + deny rules).
+        host_net_cfg = GatewayConfig(
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            isolate_mount_namespace=True,
+            agy_default_sandbox=True,
+            agy_sandbox_network_access=True,
+            agy_binary=self.cfg.agy_binary,
+        )
+        host_net_pol = CommandPolicy(host_net_cfg)
+        with patch("gateway.policy.can_use_mount_namespace", return_value=True):
+            argv_host_net = host_net_pol.build_agy_argv(
+                prompt="git fetch", cwd=self.tmpdir, skip_permissions=False
+            )
+        self.assertNotIn("--dangerously-skip-permissions", argv_host_net)
+        self.assertNotIn("--sandbox", argv_host_net)
+        st_host = json.loads(
+            next(a for a in argv_host_net if a.startswith("--settings=")).split("=", 1)[1]
+        )
+        self.assertEqual(st_host["toolPermission"], "always-proceed")
+        self.assertIn("command(sudo)", st_host["permissions"]["deny"])
+        self.assertIn(f"write_file({Path(self.tmpdir).resolve()})", st_host["permissions"]["allow"])
+
+        # 2. Explicit agy_sandbox_network_access=False keeps inner --sandbox + proceed-in-sandbox
+        offline_cfg = GatewayConfig(
+            allowed_workdirs=[self.tmpdir],
+            default_workdir=self.tmpdir,
+            isolate_mount_namespace=True,
+            agy_default_sandbox=True,
+            agy_sandbox_network_access=False,
+            agy_binary=self.cfg.agy_binary,
+        )
+        offline_pol = CommandPolicy(offline_cfg)
+        with patch("gateway.policy.can_use_mount_namespace", return_value=True):
+            argv_offline = offline_pol.build_agy_argv(
+                prompt="git fetch", cwd=self.tmpdir, skip_permissions=False
+            )
+        self.assertIn("--sandbox", argv_offline)
+        st_offline = json.loads(
+            next(a for a in argv_offline if a.startswith("--settings=")).split("=", 1)[1]
+        )
+        self.assertEqual(st_offline["toolPermission"], "proceed-in-sandbox")
+
+        # 3. Fail-safe fallback: if outer mount_ns is disabled or unavailable, inner --sandbox stays ON
+        with patch("gateway.policy.can_use_mount_namespace", return_value=False):
+            argv_no_mns = host_net_pol.build_agy_argv(
+                prompt="git fetch", cwd=self.tmpdir, skip_permissions=False
+            )
+        self.assertIn("--sandbox", argv_no_mns)
+        st_no_mns = json.loads(
+            next(a for a in argv_no_mns if a.startswith("--settings=")).split("=", 1)[1]
+        )
+        self.assertEqual(st_no_mns["toolPermission"], "proceed-in-sandbox")
 
 
 if __name__ == "__main__":
