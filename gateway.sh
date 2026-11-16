@@ -405,7 +405,7 @@ read_cfg_info() {
 import json, pathlib, sys
 p = pathlib.Path(sys.argv[1])
 if not p.exists():
-    print("8765||/home/<your-user>/workspaces||True|True|18765")
+    print(f"8765||{pathlib.Path.home() / 'workspaces'}||True|True|18765")
     raise SystemExit(0)
 d = json.loads(p.read_text(encoding="utf-8"))
 port = d.get("port", 8765)
@@ -531,7 +531,7 @@ else:
     print("auth=oauth")
 PY
 )"
-  codex_ver="$(/usr/local/bin/codex --version 2>/dev/null || echo 'not installed')"
+  codex_ver="$(command -v codex >/dev/null 2>&1 && codex --version 2>/dev/null || /usr/local/bin/codex --version 2>/dev/null || echo 'not installed')"
   if is_codex_auth_configured; then
     codex_auth_state="auth=configured"
   else
@@ -863,7 +863,9 @@ cmd_tunnel_setup() {
   # shellcheck disable=SC1090
   source "${TUNNEL_ENV_FILE}"
   set +a
-  /usr/local/bin/tunnel-client doctor --profile dots-gateway --explain
+  local tunnel_bin
+  tunnel_bin="$(command -v tunnel-client || echo /usr/local/bin/tunnel-client)"
+  "${tunnel_bin}" doctor --profile dots-gateway --explain
 
   echo "==> Enabling and starting ${TUNNEL_SERVICE_NAME} ..."
   systemctl --user enable --now "${TUNNEL_SERVICE_NAME}"
@@ -1149,7 +1151,9 @@ fetch_agy_models() {
       # shellcheck disable=SC1090
       . "${AGY_ENV_FILE}"
     fi
-    timeout 60 "${HOME}/.local/bin/agy" models 2>/dev/null | grep $'\t' || true
+    local agy_bin
+    agy_bin="$(command -v agy || echo "${HOME}/.local/bin/agy")"
+    timeout 60 "${agy_bin}" models 2>/dev/null | grep $'\t' || true
   )
 }
 
@@ -1247,7 +1251,7 @@ cmd_agy_model() {
 
   target="$(printf "%s" "${target}" | tr -d '[:space:]')"
   if [[ -z "${target}" ]]; then
-    echo "ERROR: 请指定模型 ID，例如: ${PROG_NAME} agy-model set claude-sonnet-4-5" >&2
+    echo "ERROR: 请指定模型 ID，例如: ${PROG_NAME} agy-model set gemini-2.5-pro" >&2
     exit 1
   fi
   if [[ ! "${target}" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then

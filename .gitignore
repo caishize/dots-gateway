@@ -7,7 +7,18 @@ certs_letsencrypt/
 *.pem
 *.csr
 *.srl
+*.p12
+*.pfx
 .env
+.env.*
+
+# Local agent & runtime state directories (keep .codex-plugin/ tracked)
+.claude/
+.codex/
+.gemini/
+*.db
+*.sqlite
+*.sqlite3
 
 # Python caches & build artifacts
 __pycache__/
@@ -29,4 +40,3 @@ venv/
 *.log
 *.tmp
 .DS_Store
-.claude/

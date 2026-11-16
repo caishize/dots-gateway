@@ -21,7 +21,11 @@ DEFAULT_CODEX_BIN: str = shutil.which("codex") or "/usr/local/bin/codex"
 DEFAULT_BWRAP_BIN: str = shutil.which("bwrap") or (
     "/usr/local/bin/bwrap"
     if os.path.exists("/usr/local/bin/bwrap")
-    else str(Path.home() / ".local" / "bin" / "bwrap")
+    else (
+        "/usr/bin/bwrap"
+        if os.path.exists("/usr/bin/bwrap")
+        else str(Path.home() / ".local" / "bin" / "bwrap")
+    )
 )
 
 
@@ -285,6 +289,18 @@ DEFAULT_AGY_READONLY_ROOTS: List[str] = [
     "/opt/flutter",
 ]
 
+DEFAULT_OAUTH_ALLOWED_REDIRECT_HOSTS: List[str] = [
+    "chatgpt.com",
+    "*.chatgpt.com",
+    "openai.com",
+    "*.openai.com",
+    "claude.ai",
+    "*.claude.ai",
+    "localhost",
+    "127.0.0.1",
+    "::1",
+]
+
 
 def detect_default_sandbox_state_dir() -> str:
     """Prefer env override, then persistent large data disk `/mnt/data/dots-sandbox` when writable; else `~/.cache/dots-sandbox`."""
@@ -368,6 +384,9 @@ class GatewayConfig:
     trusted_proxies: List[str] = field(default_factory=list)  # empty for public IP direct-connect
     rate_limit_max_failures: int = 10
     rate_limit_window_seconds: int = 60
+    oauth_allowed_redirect_hosts: List[str] = field(
+        default_factory=lambda: list(DEFAULT_OAUTH_ALLOWED_REDIRECT_HOSTS)
+    )
     # Command & workspace policy settings
     enforce_allowlist: bool = True
     allowed_commands: List[str] = field(default_factory=lambda: list(DEFAULT_ALLOWED_COMMANDS))
@@ -548,6 +567,12 @@ class GatewayConfig:
         if os.environ.get("GATEWAY_ALLOWED_IPS"):
             cfg.allowed_client_ips = [
                 x.strip() for x in os.environ["GATEWAY_ALLOWED_IPS"].split(",") if x.strip()
+            ]
+        if os.environ.get("GATEWAY_OAUTH_REDIRECT_HOSTS"):
+            cfg.oauth_allowed_redirect_hosts = [
+                x.strip()
+                for x in os.environ["GATEWAY_OAUTH_REDIRECT_HOSTS"].split(",")
+                if x.strip()
             ]
         if os.environ.get("GATEWAY_WORKDIR"):
             cfg.default_workdir = os.environ["GATEWAY_WORKDIR"]

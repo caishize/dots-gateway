@@ -5,7 +5,8 @@
 
 set -euo pipefail
 
-GATEWAY_DIR="${GATEWAY_DIR:-$HOME/gateway}"
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATEWAY_DIR="${GATEWAY_DIR:-$(cd -P "${SCRIPT_DIR}/.." && pwd)}"
 GATEWAY_USER="${GATEWAY_USER:-${SUDO_USER:-$(id -un)}}"
 CERT_OUT_DIR="${GATEWAY_DIR}/certs_letsencrypt"
 ACME_HOME="/root/.acme.sh"

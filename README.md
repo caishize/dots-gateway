@@ -1,4 +1,4 @@
-# Dots <-> Local Dev, Antigravity (`agy`) & Codex MCP Plugin & Hardened Gateway (`v1.5.23`)
+# Dots <-> Local Dev, Antigravity (`agy`) & Codex MCP Plugin & Hardened Gateway (`v1.5.24`)
 
 A zero-dependency Python 3.11+ **OpenAI `dots` / Codex / Agent Plugins 1.0** package and remote development gateway. It enables **dots** (running on OpenAI cloud machines) to securely inspect/edit workspace files, execute allowlisted development commands inside a Linux User + Mount Namespace VFS jail, and delegate tasks to **`agy` (`--sandbox`, with optional isolated read-only plugins & native hook sandboxing)** and **`codex` (`codex exec`, with optional isolated read-only plugins & native hook sandboxing)** via the **Model Context Protocol (MCP)**.
 
@@ -21,8 +21,9 @@ OpenAI Cloud Machine (`dots`)                            Local Dev Machine (`~/g
 
 ## Plugin & Repository Layout
 
-- `plugin.json` & `.codex-plugin/plugin.json` — Portable **Agent Plugins 1.0** + OpenAI `extensions.com.openai` & Codex plugin manifests (`v1.5.23`)
-- `pyproject.toml` — Zero-dependency Python 3.11+ package metadata (`v1.5.23`), `pytest`, and `ruff` configuration
+- `plugin.json` & `.codex-plugin/plugin.json` — Portable **Agent Plugins 1.0** + OpenAI `extensions.com.openai` & Codex plugin manifests (`v1.5.24`, `Apache-2.0`)
+- `pyproject.toml` — Zero-dependency Python 3.11+ package metadata (`v1.5.24`), `pytest`, and `ruff` configuration
+- `LICENSE` & `SECURITY.md` — Apache License 2.0 and private vulnerability disclosure / deployment baseline
 - `mcp.json` — Bundled `stdio` MCP server definition (`./dots_mcp.py`) supporting self-signed TLS SHA-256 pinning & HMAC-SHA256
 - `mcp.remote.example.json` — Example `streamable-http` MCP configuration for direct `/mcp` connectors
 - `config.example.json` — Reference host gateway configuration including isolated plugin runtime (`agent_runtime_home_root`, `plugin_state_dir`), `agy` & `codex` plugins, and Docker proxy settings
@@ -225,7 +226,7 @@ Because OpenAI's cloud connector firewall blocks non-`443` ports (`:8765`), raw 
 ### Option B: Direct Remote Streamable HTTP MCP (`/mcp`, Built-in OAuth 2.1 or Capability Path)
 
 When exposed on standard HTTPS `:443` with a custom domain, `dots-gateway` natively supports:
-- **Built-in MCP OAuth 2.1 (`gateway/oauth.py`)**: RFC 9728 Protected Resource Metadata (`/.well-known/oauth-protected-resource`), RFC 8414 Authorization Server Metadata (`/.well-known/oauth-authorization-server`), RFC 7591 Dynamic Client Registration (`/oauth/register`), PKCE `S256` `/oauth/authorize`, and stateless HMAC `/oauth/token`.
+- **Built-in MCP OAuth 2.1 (`gateway/oauth.py`)**: RFC 9728 Protected Resource Metadata (`/.well-known/oauth-protected-resource`), RFC 8414 Authorization Server Metadata (`/.well-known/oauth-authorization-server`), RFC 7591 Dynamic Client Registration (`/oauth/register`), PKCE `S256` `/oauth/authorize` (restricted by `oauth_allowed_redirect_hosts`), and stateless HMAC `/oauth/token`.
 - **Zero-Header Capability Path**: `https://<YOUR_DOMAIN>/mcp/<YOUR_GATEWAY_CREDENTIAL>` (for `No authentication` mode) or `Authorization: Bearer` header on `/mcp`.
 
 ### Option C: Install Plugin Repo (`stdio` Bridge)

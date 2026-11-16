@@ -17,7 +17,7 @@ import html
 import json
 import secrets
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from .config import GatewayConfig, verify_password_pbkdf2
@@ -38,19 +38,45 @@ def _b64url_decode(val: str) -> bytes:
     return base64.urlsafe_b64decode(padded.encode("ascii"))
 
 
-def _is_valid_redirect_uri(uri: str) -> bool:
-    """Allow HTTPS redirect URIs or loopback HTTP URIs per OAuth 2.1 Section 4.1.1."""
+def _is_redirect_host_allowed(host: str, allowed_hosts: Optional[Sequence[str]]) -> bool:
+    """Match normalized hostname against `oauth_allowed_redirect_hosts` (`*` or `*.domain` supported)."""
+    if allowed_hosts is None:
+        return True
+    norm_host = host.strip().lower().rstrip(".")
+    if not norm_host:
+        return False
+    for raw_pat in allowed_hosts:
+        pat = str(raw_pat or "").strip().lower().rstrip(".")
+        if not pat:
+            continue
+        if pat == "*":
+            return True
+        if pat.startswith("*.") and len(pat) > 2:
+            suffix = pat[1:]  # e.g. ".chatgpt.com"
+            if norm_host.endswith(suffix) and len(norm_host) > len(suffix):
+                return True
+        elif norm_host == pat:
+            return True
+    return False
+
+
+def _is_valid_redirect_uri(
+    uri: str, allowed_hosts: Optional[Sequence[str]] = None
+) -> bool:
+    """Allow allowlisted HTTPS redirect URIs or loopback HTTP URIs per OAuth 2.1 Section 4.1.1."""
     if not uri or len(uri) > 2048:
         return False
     parsed = urlparse(uri)
-    if parsed.fragment:
+    if parsed.fragment or parsed.username or parsed.password:
         return False
     scheme = parsed.scheme.lower()
     host = (parsed.hostname or "").lower()
-    if scheme == "https" and host:
-        return True
+    if not host:
+        return False
+    if scheme == "https":
+        return _is_redirect_host_allowed(host, allowed_hosts)
     if scheme == "http" and host in ("localhost", "127.0.0.1", "::1"):
-        return True
+        return _is_redirect_host_allowed(host, allowed_hosts)
     return False
 
 
@@ -231,10 +257,12 @@ class OAuthServer:
             }
         cleaned_uris: List[str] = []
         for u in redirect_uris:
-            if not isinstance(u, str) or not _is_valid_redirect_uri(u):
+            if not isinstance(u, str) or not _is_valid_redirect_uri(
+                u, self.config.oauth_allowed_redirect_hosts
+            ):
                 return 400, {
                     "error": "invalid_redirect_uri",
-                    "error_description": f"Invalid or insecure redirect_uri: {u!r}",
+                    "error_description": f"Invalid or disallowed redirect_uri: {u!r}",
                 }
             cleaned_uris.append(u)
 
@@ -282,8 +310,8 @@ class OAuthServer:
             return 400, self._error_html("Unsupported response_type (expected 'code').")
         if not client_id:
             return 400, self._error_html("Missing required parameter: client_id.")
-        if not _is_valid_redirect_uri(redirect_uri):
-            return 400, self._error_html("Invalid or insecure redirect_uri.")
+        if not _is_valid_redirect_uri(redirect_uri, self.config.oauth_allowed_redirect_hosts):
+            return 400, self._error_html("Invalid or disallowed redirect_uri.")
         if not code_challenge or code_challenge_method.upper() != "S256":
             return 400, self._error_html("OAuth 2.1 requires PKCE with code_challenge_method=S256.")
 
@@ -365,8 +393,10 @@ class OAuthServer:
         csrf_token = (form.get("csrf_token") or [""])[0].strip()
         credential = (form.get("gateway_token") or [""])[0]
 
-        if not client_id or not _is_valid_redirect_uri(redirect_uri):
-            return 400, None, self._error_html("Invalid client_id or redirect_uri.")
+        if not client_id or not _is_valid_redirect_uri(
+            redirect_uri, self.config.oauth_allowed_redirect_hosts
+        ):
+            return 400, None, self._error_html("Invalid client_id or disallowed redirect_uri.")
         if not code_challenge or code_challenge_method.upper() != "S256":
             return 400, None, self._error_html("Missing PKCE S256 challenge.")
         if not self._verify_csrf(csrf_token, client_id, redirect_uri):

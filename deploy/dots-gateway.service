@@ -8,7 +8,7 @@ Type=simple
 WorkingDirectory=%h/gateway
 Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/usr/local/bin/python3 -u %h/gateway/main.py --config %h/gateway/config.json
+ExecStart=/usr/bin/env python3 -u %h/gateway/main.py --config %h/gateway/config.json
 Restart=always
 RestartSec=2
 LimitNOFILE=65536

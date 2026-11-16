@@ -466,9 +466,19 @@ class GatewayServer:
             return True
 
         if req.method == "POST" and cleaned == "/oauth/register":
+            now = time.time()
+            if self.auth._is_rate_limited(effective_ip, now):
+                await send_json_response(
+                    writer,
+                    429,
+                    {"error": "slow_down", "error_description": "Too many failed attempts"},
+                    extra_headers=cors,
+                )
+                return True
             try:
                 body = self._parse_json_body(req)
             except Exception as exc:
+                self.auth._record_failure(effective_ip, now)
                 await send_json_response(
                     writer,
                     400,
@@ -477,6 +487,8 @@ class GatewayServer:
                 )
                 return True
             status, payload = self.oauth.register_client(body)
+            if status >= 400:
+                self.auth._record_failure(effective_ip, now)
             await send_json_response(writer, status, payload, extra_headers=cors)
             return True
 
@@ -556,6 +568,9 @@ class GatewayServer:
                 {
                     "ok": True,
                     "enforce_allowlist": self.config.enforce_allowlist,
+                    "oauth_allowed_redirect_hosts": list(
+                        self.config.oauth_allowed_redirect_hosts
+                    ),
                     "allowed_commands": self.config.allowed_commands,
                     "blocked_commands": self.config.blocked_commands,
                     "allowed_workdirs": self.config.allowed_workdirs,

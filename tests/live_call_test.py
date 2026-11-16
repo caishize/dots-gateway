@@ -28,6 +28,7 @@ from dots_client import DotsGatewayClient  # noqa: E402
 from gateway.tls import compute_cert_sha256  # noqa: E402
 
 DEMO_WORKDIR = str(Path.home() / "workspaces" / ".live_demo")
+LIVE_TEST_MODEL = (os.environ.get("GATEWAY_LIVE_TEST_MODEL") or "").strip() or None
 
 
 def banner(title: str) -> None:
@@ -148,7 +149,7 @@ async def run_live_tests(base_url: str, config_path: Path) -> None:
         prompt=dev_prompt,
         cwd=DEMO_WORKDIR,
         skip_permissions=True,
-        model="gemini-2.5-flash",
+        model=LIVE_TEST_MODEL,
         output_format="stream-json",
         timeout=180.0,
     ):
@@ -184,16 +185,16 @@ async def run_live_tests(base_url: str, config_path: Path) -> None:
     banner("6. Testing Bidirectional Multi-Turn `agy` Session over WSS (/v1/ws)")
     async with hmac_client.connect_websocket() as ws:
         assert ws.welcome.get("type") == "connected"
-        await ws.send_json(
-            {
-                "id": "agy-bi-1",
-                "action": "agy",
-                "interactive": True,
-                "cwd": DEMO_WORKDIR,
-                "model": "gemini-2.5-flash",
-                "prompt": "请记住项目代号：ORBIT_99。不要调用任何工具，仅回复 ACK_ORBIT。",
-            }
-        )
+        ws_agy_req = {
+            "id": "agy-bi-1",
+            "action": "agy",
+            "interactive": True,
+            "cwd": DEMO_WORKDIR,
+            "prompt": "请记住项目代号：ORBIT_99。不要调用任何工具，仅回复 ACK_ORBIT。",
+        }
+        if LIVE_TEST_MODEL:
+            ws_agy_req["model"] = LIVE_TEST_MODEL
+        await ws.send_json(ws_agy_req)
 
         session_id = None
         turn1_resp = None
@@ -290,6 +291,13 @@ async def run_live_tests(base_url: str, config_path: Path) -> None:
         )
         assert b_init["result"]["serverInfo"]["name"] == "dots-gateway"
 
+        mcp_agy_args = {
+            "prompt": "不要调用任何工具，直接回复 MCP_PLUGIN_AGY_OK。",
+            "cwd": DEMO_WORKDIR,
+            "skip_permissions": True,
+        }
+        if LIVE_TEST_MODEL:
+            mcp_agy_args["model"] = LIVE_TEST_MODEL
         b_agy = await _stdio_rpc(
             {
                 "jsonrpc": "2.0",
@@ -297,12 +305,7 @@ async def run_live_tests(base_url: str, config_path: Path) -> None:
                 "method": "tools/call",
                 "params": {
                     "name": "run_agy",
-                    "arguments": {
-                        "prompt": "不要调用任何工具，直接回复 MCP_PLUGIN_AGY_OK。",
-                        "cwd": DEMO_WORKDIR,
-                        "model": "gemini-2.5-flash",
-                        "skip_permissions": True,
-                    },
+                    "arguments": mcp_agy_args,
                     "_meta": {"progressToken": "live-agy-prog"},
                 },
             }

@@ -8,7 +8,7 @@ Type=simple
 WorkingDirectory=%h/gateway
 Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=%h/.config/dots-gateway/tunnel.env
-ExecStart=/usr/local/bin/tunnel-client run --profile dots-gateway
+ExecStart=/usr/bin/env tunnel-client run --profile dots-gateway
 Restart=always
 RestartSec=3
 LimitNOFILE=65536

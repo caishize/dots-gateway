@@ -210,8 +210,8 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "model": {
                     "type": "string",
                     "description": (
-                        "Optional model override for `agy` (e.g. `claude-sonnet-4-5`, "
-                        "`gemini-2.5-pro`). Call `list_agy_models` for valid IDs. When "
+                        "Optional model override for `agy` (e.g. `gemini-2.5-pro`, "
+                        "`claude-sonnet-4-5`). Call `list_agy_models` for valid IDs. When "
                         "omitted, the gateway default (`dots-gateway agy-model`) is used."
                     ),
                 },

@@ -83,10 +83,15 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         # 2b. Enforce strict version parity across package, manifests, pyproject.toml, and README
         pyproject_data = tomllib.loads((GATEWAY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         expected_ver = gateway.__version__
-        self.assertEqual(expected_ver, "1.5.23")
+        self.assertEqual(expected_ver, "1.5.24")
         self.assertEqual(root_manifest["version"], expected_ver)
+        self.assertEqual(root_manifest.get("license"), "Apache-2.0")
         self.assertEqual(codex_manifest["version"], expected_ver)
+        self.assertEqual(codex_manifest.get("license"), "Apache-2.0")
         self.assertEqual(pyproject_data["project"]["version"], expected_ver)
+        self.assertTrue((GATEWAY_ROOT / "LICENSE").is_file())
+        self.assertIn("Apache License", (GATEWAY_ROOT / "LICENSE").read_text(encoding="utf-8"))
+        self.assertTrue((GATEWAY_ROOT / "SECURITY.md").is_file())
         readme_text = (GATEWAY_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn(f"v{expected_ver}", readme_text)
         self.assertEqual(len(TOOL_DEFINITIONS), 16)
@@ -562,7 +567,33 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         asm = json.loads(asm_raw)
         self.assertIn("S256", asm["code_challenge_methods_supported"])
 
-        # 3. Dynamic Client Registration (RFC 7591)
+        # 3. Dynamic Client Registration (RFC 7591) & redirect host allowlist enforcement
+        for bad_redir in (
+            "https://evil.example/exfil",
+            "https://evilchatgpt.com/cb",
+            "https://chatgpt.com@evil.example/cb",
+            "http://chatgpt.com/cb",
+        ):
+            st_bad_reg, _, _ = await asyncio.to_thread(
+                _req,
+                "POST",
+                "/oauth/register",
+                {"client_name": "phish", "redirect_uris": [bad_redir], "token_endpoint_auth_method": "none"},
+            )
+            self.assertEqual(st_bad_reg, 400, f"Should reject untrusted redirect_uri: {bad_redir}")
+
+        for good_redir in (
+            "https://sub.chatgpt.com/oauth/cb",
+            "http://127.0.0.1:54321/callback",
+        ):
+            st_good_reg, _, _ = await asyncio.to_thread(
+                _req,
+                "POST",
+                "/oauth/register",
+                {"client_name": "trusted", "redirect_uris": [good_redir], "token_endpoint_auth_method": "none"},
+            )
+            self.assertEqual(st_good_reg, 201, f"Should allow trusted redirect_uri: {good_redir}")
+
         redirect_uri = "https://chatgpt.com/connector_platform_oauth_redirect"
         st, _, reg_raw = await asyncio.to_thread(
             _req,
@@ -572,6 +603,20 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(st, 201)
         client_id = json.loads(reg_raw)["client_id"]
+
+        # Unallowlisted redirect_uri on /oauth/authorize GET must also be rejected (400)
+        phish_qs = urllib.parse.urlencode(
+            {
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": "https://evil.example/exfil",
+                "state": "xyz123",
+                "code_challenge": "c" * 43,
+                "code_challenge_method": "S256",
+            }
+        )
+        st_phish_auth, _, _ = await asyncio.to_thread(_req, "GET", f"/oauth/authorize?{phish_qs}")
+        self.assertEqual(st_phish_auth, 400)
 
         # 4. Authorization Code + PKCE S256
         verifier = "v" * 64

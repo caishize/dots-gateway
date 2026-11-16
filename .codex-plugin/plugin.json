@@ -1,6 +1,7 @@
 {
   "name": "dots-gateway",
-  "version": "1.5.23",
+  "version": "1.5.24",
+  "license": "Apache-2.0",
   "description": "Remote development, Antigravity (agy) & OpenAI Codex (codex) MCP plugin enabling OpenAI dots to inspect/edit local files, execute allowlisted dev commands, and run agy or codex.",
   "author": {
     "name": "caishize",
