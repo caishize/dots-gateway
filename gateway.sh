@@ -49,14 +49,26 @@ is_codex_auth_configured() {
 ensure_unit_installed() {
   mkdir -p "${USER_UNIT_DIR}"
   local need_reload=0
-  if [[ ! -f "${USER_UNIT_FILE}" ]] || ! cmp -s "${SOURCE_UNIT_FILE}" "${USER_UNIT_FILE}"; then
-    cp "${SOURCE_UNIT_FILE}" "${USER_UNIT_FILE}"
+  local rendered_gw rendered_tun
+  rendered_gw="$(sed "s|%h/gateway|${GATEWAY_DIR}|g" "${SOURCE_UNIT_FILE}")"
+  if [[ ! -f "${USER_UNIT_FILE}" ]] || [[ "$(cat "${USER_UNIT_FILE}")" != "${rendered_gw}" ]]; then
+    printf "%s\n" "${rendered_gw}" > "${USER_UNIT_FILE}"
     need_reload=1
   fi
   if [[ -f "${SOURCE_TUNNEL_UNIT_FILE}" ]]; then
-    if [[ ! -f "${TUNNEL_UNIT_FILE}" ]] || ! cmp -s "${SOURCE_TUNNEL_UNIT_FILE}" "${TUNNEL_UNIT_FILE}"; then
-      cp "${SOURCE_TUNNEL_UNIT_FILE}" "${TUNNEL_UNIT_FILE}"
+    rendered_tun="$(sed "s|%h/gateway|${GATEWAY_DIR}|g" "${SOURCE_TUNNEL_UNIT_FILE}")"
+    if [[ ! -f "${TUNNEL_UNIT_FILE}" ]] || [[ "$(cat "${TUNNEL_UNIT_FILE}")" != "${rendered_tun}" ]]; then
+      printf "%s\n" "${rendered_tun}" > "${TUNNEL_UNIT_FILE}"
       need_reload=1
+    fi
+  fi
+  # Auto-install ~/.local/bin/dots-gateway symlink when absent or pointing to a gateway.sh
+  local bin_dir="${HOME}/.local/bin"
+  local cli_link="${bin_dir}/dots-gateway"
+  mkdir -p "${bin_dir}" 2>/dev/null || true
+  if [[ -d "${bin_dir}" && -w "${bin_dir}" ]]; then
+    if [[ ! -e "${cli_link}" ]] || [[ "$(basename "$(readlink "${cli_link}" 2>/dev/null || true)")" == "gateway.sh" ]]; then
+      ln -sf "${GATEWAY_DIR}/gateway.sh" "${cli_link}" 2>/dev/null || true
     fi
   fi
   if (( need_reload == 1 )); then
