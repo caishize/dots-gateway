@@ -174,7 +174,7 @@ async def async_main() -> int:
     display_host = cfg.public_ip or cfg.host
 
     print("=" * 76)
-    print("  Dots <-> Local Dev & Antigravity (agy) Hardened Gateway + MCP Server")
+    print("  Dots <-> Local Dev (agy / codex / claude) Hardened Gateway + MCP Server")
     print("=" * 76)
     print(f"  Config File         : {cfg_path}")
     print(f"  HTTPS/SSE Endpoint  : {scheme}://{display_host}:{cfg.port}")
@@ -195,7 +195,11 @@ async def async_main() -> int:
     )
     print(
         f"  Codex Binary        : {cfg.codex_binary} "
-        f"(skip_permissions={cfg.codex_default_skip_permissions}, sandbox={cfg.codex_default_sandbox})"
+        f"(skip_permissions={cfg.codex_default_skip_permissions}, sandbox={cfg.codex_default_sandbox}, max_concurrent_codex={cfg.max_concurrent_codex})"
+    )
+    print(
+        f"  Claude Binary       : {cfg.claude_binary} "
+        f"(skip_permissions={cfg.claude_default_skip_permissions}, mode={cfg.claude_default_permission_mode}, max_concurrent_claude={cfg.max_concurrent_claude})"
     )
     print("-" * 76)
     print(f"  Bearer API Token    : {cfg.api_tokens[0]}")
@@ -233,14 +237,33 @@ async def async_main() -> int:
                 }
             }
         }
-        print("\n[方式 1 · 推荐] dots 选择「OAuth」认证 (使用域名避免云端拦截裸 IP):")
+        openclaw_json = {
+            "mcp": {
+                "servers": {
+                    "dots-gateway": {
+                        "transport": "streamable-http",
+                        "url": f"{dns_base_url}/mcp",
+                        "headers": {
+                            "Authorization": f"Bearer {cfg.api_tokens[0]}",
+                        },
+                    }
+                }
+            }
+        }
+        print("\n[方式 1 · 推荐] OpenAI dots / ChatGPT / Claude.ai 选择「OAuth」认证:")
         print(f"  MCP Server URL    : {dns_base_url}/mcp")
         print(f"  (如提示手动输入 OAuth 设置: Authorization URL = {dns_base_url}/oauth/authorize , Token URL = {dns_base_url}/oauth/token , Client ID = dots-client , Scope = mcp)")
-        print("\n[方式 2 · 最稳免弹窗一键直连] dots 选择「无需身份认证」(内置 256 位加密路径密钥保护):")
+        print("\n[方式 2 · 免弹窗一键直连] 选择「无需身份认证」(内置 256 位加密路径密钥保护):")
         print(f"  MCP Server URL    : {dns_base_url}/mcp/{cfg.api_tokens[0]}")
-        print("\n[方式 3] 标准 Streamable HTTP MCP JSON (支持自定义 Header 的客户端):")
+        print("\n[方式 3] 标准 Streamable HTTP MCP JSON (Cursor / Windsurf / VS Code / Antigravity):")
         print(json.dumps(remote_mcp_json, indent=2, ensure_ascii=False))
-        print("\n[方式 4] 本地 stdio 桥接插件配置 (`~/.config/dots-gateway/client.json`):")
+        print("\n[方式 4] Claude Code CLI 一键接入:")
+        print(f'  claude mcp add --transport http dots-gateway "{dns_base_url}/mcp" --header "Authorization: Bearer {cfg.api_tokens[0]}"')
+        print("\n[方式 5] OpenAI Codex CLI 一键接入:")
+        print(f'  GATEWAY_TOKEN="{cfg.api_tokens[0]}" codex mcp add dots-gateway --url "{dns_base_url}/mcp" --bearer-token-env-var GATEWAY_TOKEN')
+        print("\n[方式 6] OpenClaw 配置 (`~/.openclaw/openclaw.json`):")
+        print(json.dumps(openclaw_json, indent=2, ensure_ascii=False))
+        print("\n[方式 7] 本地 stdio 桥接插件配置 (`~/.config/dots-gateway/client.json`):")
         print(json.dumps(client_json, indent=2, ensure_ascii=False))
         return 0
 

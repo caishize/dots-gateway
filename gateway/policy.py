@@ -18,6 +18,7 @@ from .config import (
     GATEWAY_ROOT,
     GatewayConfig,
     agy_plugins_config_state,
+    claude_plugins_config_state,
     codex_plugins_config_state,
     docker_access_enabled,
     effective_plugin_state_dir,
@@ -58,6 +59,20 @@ class ValidatedAgyPlugin:
 class ValidatedCodexPlugin:
     name: str
     marketplace_name: str
+    version: str
+    source_dir: str
+    vfs_discovery_dir: str
+    hooks_relpath: Optional[str]
+    manifest: str
+
+    @property
+    def has_hooks(self) -> bool:
+        return bool(self.hooks_relpath)
+
+
+@dataclass(frozen=True)
+class ValidatedClaudePlugin:
+    name: str
     version: str
     source_dir: str
     vfs_discovery_dir: str
@@ -282,7 +297,7 @@ _BWRAP_TWO_ARG_OPTS = frozenset(
 _BWRAP_THREE_ARG_OPTS = frozenset({"--overlay"})
 
 _AUDIT_SECRET_PREFIX_RE = re.compile(
-    r"(?:sk-[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}"
+    r"(?:(?:sk|xai)-[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}"
     r"|dots_(?:at|rt)\.[A-Za-z0-9._-]+|AIza[0-9A-Za-z_-]{20,})"
 )
 _AUDIT_BEARER_RE = re.compile(r"(?i)(bearer\s+)[^\s\"';&|]+")
@@ -917,7 +932,7 @@ class CommandPolicy:
         self._allowed_fullpaths = {
             cmd for cmd in config.allowed_commands if "/" in cmd
         }
-        for op_bin in (config.agy_binary, config.codex_binary):
+        for op_bin in (config.agy_binary, config.codex_binary, config.claude_binary):
             if op_bin and ("/" in op_bin or str(op_bin).startswith("~")):
                 try:
                     exp_bin = os.path.expanduser(str(op_bin).strip())
@@ -1013,6 +1028,17 @@ class CommandPolicy:
                     raw_candidates.append(item.strip())
         return self._collect_plugin_paths_from_candidates(raw_candidates)
 
+    def get_configured_claude_plugin_paths(self) -> List[str]:
+        """Return lexical and resolved paths of operator-configured Claude plugin directories (active or inactive)."""
+        state = claude_plugins_config_state(self.config)
+        raw_candidates: List[str] = list(state.get("raw_dirs") or [])
+        cfg_dirs = getattr(self.config, "claude_plugin_dirs", None)
+        if isinstance(cfg_dirs, (list, tuple)):
+            for item in cfg_dirs:
+                if isinstance(item, str) and item.strip():
+                    raw_candidates.append(item.strip())
+        return self._collect_plugin_paths_from_candidates(raw_candidates)
+
     def is_agy_plugin_path(self, candidate_path: str) -> bool:
         """Return True if `candidate_path` lies within any configured AGY plugin directory."""
         if not candidate_path:
@@ -1027,6 +1053,15 @@ class CommandPolicy:
         if not candidate_path:
             return False
         for plg_root in self.get_configured_codex_plugin_paths():
+            if _path_is_within(candidate_path, plg_root):
+                return True
+        return False
+
+    def is_claude_plugin_path(self, candidate_path: str) -> bool:
+        """Return True if `candidate_path` lies within any configured Claude plugin directory."""
+        if not candidate_path:
+            return False
+        for plg_root in self.get_configured_claude_plugin_paths():
             if _path_is_within(candidate_path, plg_root):
                 return True
         return False
@@ -1051,7 +1086,7 @@ class CommandPolicy:
             try:
                 exp_sb = os.path.expanduser(str(raw_sb).strip())
                 if exp_sb.startswith("/") and exp_sb != "/":
-                    for int_sub in ("plugin_bundles", "codex_home"):
+                    for int_sub in ("plugin_bundles", "codex_home", "claude_home"):
                         sub_lex = os.path.join(os.path.abspath(exp_sb), int_sub)
                         guards.append(sub_lex)
                         if os.path.exists(exp_sb):
@@ -1144,6 +1179,13 @@ class CommandPolicy:
                 resolved,
             )
 
+        if self.is_claude_plugin_path(lexical_abs) or self.is_claude_plugin_path(resolved):
+            return (
+                False,
+                f"Access to Claude plugin resource path '{target}' is forbidden outside Claude sessions",
+                resolved,
+            )
+
         if self.is_plugin_state_path(lexical_abs) or self.is_plugin_state_path(resolved):
             return (
                 False,
@@ -1213,6 +1255,9 @@ class CommandPolicy:
 
             if self.is_codex_plugin_path(lex_abs) or self.is_codex_plugin_path(real_str):
                 return False, f"Executable '{exe}' resides in a Codex-only plugin resource path"
+
+            if self.is_claude_plugin_path(lex_abs) or self.is_claude_plugin_path(real_str):
+                return False, f"Executable '{exe}' resides in a Claude-only plugin resource path"
 
             if self.is_plugin_state_path(lex_abs) or self.is_plugin_state_path(real_str):
                 return False, f"Executable '{exe}' resides in an isolated plugin runtime/state path"
@@ -1302,6 +1347,12 @@ class CommandPolicy:
             "CODEX_PLUGIN_ROOT",
             "CODEX_PLUGIN_DIRS",
             "CODEX_REGISTERED_PLUGINS",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_PLUGIN_DIRS",
+            "CLAUDE_REGISTERED_PLUGINS",
+            "ANTHROPIC_API_" + "KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
             "PLUGIN_ROOT",
             "PLUGIN_DATA",
             "CLAUDE_PLUGIN_DATA",
@@ -1431,12 +1482,47 @@ class CommandPolicy:
                 pass
         return False
 
+    def _is_claude_executable_token(
+        self, exe_tok: str, resolved_cwd: Optional[str] = None
+    ) -> bool:
+        if not exe_tok:
+            return False
+        if os.path.basename(exe_tok) == "claude":
+            return True
+        real_cand = self._resolve_exec_candidate(exe_tok, resolved_cwd)
+        if real_cand and os.path.basename(real_cand) == "claude":
+            return True
+        if self.config.claude_binary:
+            if exe_tok == self.config.claude_binary:
+                return True
+            try:
+                cfg_exp = os.path.expanduser(self.config.claude_binary)
+                cfg_abs = os.path.abspath(cfg_exp)
+                cfg_real = os.path.realpath(cfg_exp)
+                if "/" in exe_tok or exe_tok.startswith("~"):
+                    tok_exp = os.path.expanduser(exe_tok)
+                    tok_abs = (
+                        os.path.abspath(tok_exp)
+                        if os.path.isabs(tok_exp)
+                        else os.path.abspath(
+                            os.path.join(resolved_cwd or os.getcwd(), tok_exp)
+                        )
+                    )
+                    if tok_abs in (cfg_abs, cfg_real):
+                        return True
+                if real_cand and real_cand in (cfg_abs, cfg_real):
+                    return True
+            except OSError:
+                pass
+        return False
+
     def _check_protected_arguments(
         self,
         tokens: Sequence[str],
         resolved_cwd: str,
         _trusted_agy_argv: bool = False,
         _trusted_codex_argv: bool = False,
+        _trusted_claude_argv: bool = False,
     ) -> Tuple[bool, str]:
         """Block CLI arguments targeting protected paths or escaping allowed_workdirs."""
         tok_list = list(tokens)
@@ -1446,9 +1532,25 @@ class CommandPolicy:
         is_codex_bin = bool(
             tok_list and self._is_codex_executable_token(tok_list[0], resolved_cwd)
         )
+        is_claude_bin = bool(
+            tok_list and self._is_claude_executable_token(tok_list[0], resolved_cwd)
+        )
         saw_trusted_settings = False
+        saw_trusted_mcp_cfg = False
         saw_codex_exec = False
         after_double_dash = False
+        rt_claude_plg_prefix = (
+            os.path.join(
+                os.path.abspath(
+                    os.path.expanduser(
+                        str(self.config.agent_runtime_home_root or "/mnt/dots-agent-home").strip()
+                    )
+                ),
+                "claude",
+                "plugins",
+            ).rstrip("/")
+            + "/"
+        )
         _safe_zero_arg_before_dd = {
             "--help",
             "-h",
@@ -1461,6 +1563,9 @@ class CommandPolicy:
             "--debug",
             "--sandbox",
             "--dangerously-skip-permissions",
+            "--strict-mcp-config",
+            "--print",
+            "-p",
             "--ide",
             "--no-ide",
             "--chrome",
@@ -1468,7 +1573,7 @@ class CommandPolicy:
         }
         for idx, tok in enumerate(tok_list[1:], start=1):
             if tok == "--":
-                if _trusted_agy_argv:
+                if _trusted_agy_argv or _trusted_claude_argv:
                     prev_tok = tok_list[idx - 1] if idx > 1 else ""
                     if idx != len(tok_list) - 2 or (
                         prev_tok.startswith("-")
@@ -1477,7 +1582,7 @@ class CommandPolicy:
                     ):
                         return (
                             False,
-                            "Unexpected or option-swallowed '--' in agy arguments; pass prompt via the dedicated 'prompt' field",
+                            "Unexpected or option-swallowed '--' in agent arguments; pass prompt via the dedicated 'prompt' field",
                         )
                 after_double_dash = True
                 continue
@@ -1493,6 +1598,22 @@ class CommandPolicy:
                     tok.startswith("--print=")
                     or (after_double_dash and tok_list[-2] == "--")
                 ):
+                    continue
+            if _trusted_claude_argv:
+                if not after_double_dash:
+                    if not saw_trusted_settings and tok.startswith("--settings={"):
+                        saw_trusted_settings = True
+                        continue
+                    if not saw_trusted_mcp_cfg and tok == '--mcp-config={"mcpServers":{}}':
+                        saw_trusted_mcp_cfg = True
+                        continue
+                    if tok in ("--strict-mcp-config", "--setting-sources=user"):
+                        continue
+                    if tok.startswith("--plugin-dir=") and tok[len("--plugin-dir=") :].startswith(
+                        rt_claude_plg_prefix
+                    ):
+                        continue
+                if idx == len(tok_list) - 1 and after_double_dash and tok_list[-2] == "--":
                     continue
             if _trusted_codex_argv:
                 if not after_double_dash and tok == "exec":
@@ -1514,9 +1635,19 @@ class CommandPolicy:
                         "--remote-control",
                         "--plugin-dir",
                         "--plugin-dirs",
+                        "--mcp-config",
+                        "--strict-mcp-config",
+                        "--setting-sources",
                     )
                     or tok.startswith(
-                        ("--settings=", "--remote-control=", "--plugin-dir=", "--plugin-dirs=")
+                        (
+                            "--settings=",
+                            "--remote-control=",
+                            "--plugin-dir=",
+                            "--plugin-dirs=",
+                            "--mcp-config=",
+                            "--setting-sources=",
+                        )
                     )
                     or tok == "--settings"
                 ):
@@ -1555,6 +1686,26 @@ class CommandPolicy:
                         return (
                             False,
                             f"Subcommand 'codex {tok}' is forbidden in task execution; manage plugins via 'dots-gateway codex-plugins'",
+                        )
+                if is_claude_bin:
+                    if tok in ("--plugin", "--plugins") or tok.startswith(
+                        ("--plugin=", "--plugins=")
+                    ):
+                        return False, f"Flag '{tok}' on 'claude' is forbidden by gateway security policy"
+                    if tok in ("plugin", "plugins", "mcp", "auth") and tok_list[idx - 1] not in (
+                        "-p",
+                        "--print",
+                        "--model",
+                        "--effort",
+                        "--resume",
+                        "-r",
+                        "--input-format",
+                        "--output-format",
+                        "--permission-mode",
+                    ):
+                        return (
+                            False,
+                            f"Subcommand 'claude {tok}' is forbidden in task execution; manage Claude settings/plugins via 'dots-gateway claude-setup' / 'dots-gateway claude-plugins'",
                         )
                 if tok in ("-s", "--sandbox") and idx + 1 < len(tok_list):
                     if tok_list[idx + 1] == "danger-full-access":
@@ -1610,6 +1761,8 @@ class CommandPolicy:
                             ".gnupg",
                             ".gemini",
                             ".codex",
+                            ".claude",
+                            ".claude.json",
                             ".config",
                             ".bashrc",
                             ".profile",
@@ -1643,6 +1796,12 @@ class CommandPolicy:
                     return (
                         False,
                         f"Argument '{val}' targets a Codex-only plugin resource path",
+                    )
+
+                if self.is_claude_plugin_path(lex) or self.is_claude_plugin_path(res):
+                    return (
+                        False,
+                        f"Argument '{val}' targets a Claude-only plugin resource path",
                     )
 
                 if self.is_plugin_state_path(lex) or self.is_plugin_state_path(res):
@@ -1703,6 +1862,7 @@ class CommandPolicy:
         _depth: int = 0,
         _trusted_agy_argv: bool = False,
         _trusted_codex_argv: bool = False,
+        _trusted_claude_argv: bool = False,
     ) -> PolicyDecision:
         if _depth > 8:
             return PolicyDecision(False, reason="Excessive nested subshell depth")
@@ -1902,6 +2062,7 @@ class CommandPolicy:
                 resolved_cwd,
                 _trusted_agy_argv=(_trusted_agy_argv and _depth == 0 and idx == 0),
                 _trusted_codex_argv=(_trusted_codex_argv and _depth == 0 and idx == 0),
+                _trusted_claude_argv=(_trusted_claude_argv and _depth == 0 and idx == 0),
             )
             if not ok_prot:
                 return PolicyDecision(False, reason=prot_err, resolved_cwd=resolved_cwd)
@@ -2123,6 +2284,14 @@ class CommandPolicy:
                     reason="Direct invocation of 'codex' via exec_command is forbidden; use dedicated 'run_codex' so sandbox and workspace policies are enforced",
                     resolved_cwd=resolved_cwd,
                 )
+            if self._is_claude_executable_token(effective_exe, resolved_cwd) and not (
+                _trusted_claude_argv and _depth == 0 and effective_idx == 0 and not requires_shell
+            ):
+                return PolicyDecision(
+                    False,
+                    reason="Direct invocation of 'claude' via exec_command is forbidden; use dedicated 'run_claude' so sandbox and workspace policies are enforced",
+                    resolved_cwd=resolved_cwd,
+                )
 
             # If invoking `bwrap` (bubblewrap), validate wrapper flags and recursively validate inner command
             effective_exe = seg_tokens[effective_idx]
@@ -2168,11 +2337,13 @@ class CommandPolicy:
                         if not hd_decision.allowed:
                             return hd_decision
 
-        # Resolve 'agy' / 'codex' / 'bwrap' binary paths automatically if the first token matches
+        # Resolve 'agy' / 'codex' / 'claude' / 'bwrap' binary paths automatically if the first token matches
         if argv and argv[0] == "agy" and os.path.exists(self.config.agy_binary):
             argv = [self.config.agy_binary] + argv[1:]
         elif argv and argv[0] == "codex" and os.path.exists(self.config.codex_binary):
             argv = [self.config.codex_binary] + argv[1:]
+        elif argv and argv[0] == "claude" and os.path.exists(self.config.claude_binary):
+            argv = [self.config.claude_binary] + argv[1:]
         elif argv and argv[0] == "bwrap" and os.path.exists(self.config.bwrap_binary):
             argv = [self.config.bwrap_binary] + argv[1:]
 
@@ -2633,6 +2804,9 @@ class CommandPolicy:
             ("agy_plugins_file", "agy_plugins_file"),
             ("codex_env_file", "codex_env_file"),
             ("codex_plugins_file", "codex_plugins_file"),
+            ("claude_env_file", "claude_env_file"),
+            ("claude_model_file", "claude_model_file"),
+            ("claude_plugins_file", "claude_plugins_file"),
             ("docker_mode_file", "docker_mode_file"),
             ("docker_proxy_socket", "docker_proxy_socket"),
             ("docker_upstream_socket", "docker_upstream_socket"),
@@ -2649,6 +2823,8 @@ class CommandPolicy:
                 (".config", "runtime/tunnel/credential config (~/.config)"),
                 (".gemini", "AGY login & state directory (~/.gemini)"),
                 (".codex", "Codex credential directory (~/.codex)"),
+                (".claude", "Claude Code credential directory (~/.claude)"),
+                (".claude.json", "Claude Code state file (~/.claude.json)"),
                 (".ssh", "SSH credential directory (~/.ssh)"),
                 (".gnupg", "GPG credential directory (~/.gnupg)"),
                 (".aliyun", "cloud credential directory (~/.aliyun)"),
@@ -2670,6 +2846,11 @@ class CommandPolicy:
                 protected_boundaries,
                 os.path.join(str(self.config.sandbox_state_dir), "codex_home"),
                 "sandbox isolated codex_home backing",
+            )
+            _register_boundary(
+                protected_boundaries,
+                os.path.join(str(self.config.sandbox_state_dir), "claude_home"),
+                "sandbox isolated claude_home backing",
             )
 
         writable_boundaries: List[Tuple[str, str]] = []
@@ -2703,6 +2884,11 @@ class CommandPolicy:
                 writable_boundaries,
                 os.path.join(str(self.config.sandbox_state_dir), "codex_home"),
                 "sandbox isolated codex_home backing",
+            )
+            _register_boundary(
+                writable_boundaries,
+                os.path.join(str(self.config.sandbox_state_dir), "claude_home"),
+                "sandbox isolated claude_home backing",
             )
         _register_boundary(
             writable_boundaries,
@@ -3854,6 +4040,7 @@ class CommandPolicy:
                 self.is_protected_path(norm)
                 or self.is_agy_plugin_path(norm)
                 or self.is_codex_plugin_path(norm)
+                or self.is_claude_plugin_path(norm)
                 or self.is_plugin_state_path(norm)
                 or not self.is_within_allowed_workdirs(norm)
             ):
@@ -3911,6 +4098,7 @@ class CommandPolicy:
                 norm not in seen
                 and not self.is_agy_plugin_path(norm)
                 and not self.is_codex_plugin_path(norm)
+                and not self.is_claude_plugin_path(norm)
             ):
                 seen.add(norm)
                 roots.append(norm)
@@ -4182,6 +4370,7 @@ class CommandPolicy:
             iso_agy_plugins_root,
             *self.get_configured_agy_plugin_paths(),
             *self.get_configured_codex_plugin_paths(),
+            *self.get_configured_claude_plugin_paths(),
         ]
         for plg in validated_plugins:
             for p_guard in (plg.source_dir, plg.vfs_discovery_dir):
@@ -4257,7 +4446,7 @@ class CommandPolicy:
                     continue
                 if self.is_agy_plugin_path(rd_cand) and rd_cand not in active_plugin_allow_paths:
                     continue
-                if self.is_codex_plugin_path(rd_cand):
+                if self.is_codex_plugin_path(rd_cand) or self.is_claude_plugin_path(rd_cand):
                     continue
                 if (
                     any(
@@ -4521,6 +4710,7 @@ class CommandPolicy:
                 norm not in seen
                 and not self.is_agy_plugin_path(norm)
                 and not self.is_codex_plugin_path(norm)
+                and not self.is_claude_plugin_path(norm)
             ):
                 seen.add(norm)
                 roots.append(norm)
@@ -4828,5 +5018,618 @@ class CommandPolicy:
             if prompt.startswith("-") and "--" not in extra:
                 argv.append("--")
             argv.append(prompt)
+
+        return argv
+
+    def validate_claude_plugins(
+        self,
+        cwd: Optional[str] = None,
+        add_dirs: Optional[Sequence[str]] = None,
+        require_mount_ns_check: bool = False,
+    ) -> List[ValidatedClaudePlugin]:
+        """Validate operator-registered Claude Code plugin directories fail-closed."""
+        state = claude_plugins_config_state(self.config)
+        if state.get("config_error"):
+            self._raise_plugin_policy_error(str(state["config_error"]))
+        if not state.get("enabled"):
+            return []
+
+        raw_dirs = list(state.get("raw_dirs") or [])
+        if not raw_dirs:
+            self._raise_plugin_policy_error(
+                "Claude plugins are enabled, but no plugin directories are registered "
+                "(configure 'claude_plugin_dirs' or run 'dots-gateway claude-plugins add <DIR>')"
+            )
+
+        if not self.config.isolate_mount_namespace:
+            self._raise_plugin_policy_error(
+                "Claude plugins require isolate_mount_namespace=True so kernel VFS read-only mounts "
+                "and Claude hook-jail sandboxing stay enforced"
+            )
+        if require_mount_ns_check and not can_use_mount_namespace():
+            self._raise_plugin_policy_error(
+                "Claude plugins require unprivileged Linux user+mount namespaces, "
+                "which are unavailable on this host"
+            )
+
+        home_lex = os.path.abspath(str(Path.home()))
+        try:
+            home_res = str(Path.home().resolve())
+        except OSError:
+            home_res = home_lex
+
+        if os.path.islink(home_lex) or home_lex != home_res:
+            self._raise_plugin_policy_error(
+                f"Claude plugins require a non-symlink HOME directory (got '{home_lex}' -> '{home_res}')"
+            )
+
+        for cl_p, cl_label in (
+            (os.path.join(home_res, ".claude"), "~/.claude"),
+            (os.path.join(home_res, ".claude.json"), "~/.claude.json"),
+        ):
+            if os.path.islink(cl_p):
+                self._raise_plugin_policy_error(f"Claude plugins forbid symlinked '{cl_label}'")
+
+        (
+            forbidden_exact_roots,
+            forbidden_system_trees,
+            protected_boundaries,
+            writable_boundaries,
+        ) = self._build_plugin_boundary_sets(
+            home_lex=home_lex, home_res=home_res, cwd=cwd, add_dirs=add_dirs
+        )
+        rt_root = self.validate_agent_runtime_home_root(
+            home_lex=home_lex,
+            home_res=home_res,
+            forbidden_exact_roots=forbidden_exact_roots,
+            forbidden_system_trees=forbidden_system_trees,
+            protected_boundaries=protected_boundaries,
+            writable_boundaries=writable_boundaries,
+        )
+        st_dir = self.validate_plugin_state_dir(
+            home_lex=home_lex,
+            home_res=home_res,
+            rt_root=rt_root,
+            forbidden_exact_roots=forbidden_exact_roots,
+            forbidden_system_trees=forbidden_system_trees,
+            protected_boundaries=protected_boundaries,
+            cwd=cwd,
+            add_dirs=add_dirs,
+        )
+
+        validated: List[ValidatedClaudePlugin] = []
+        seen_names: Dict[str, str] = {}
+
+        for raw_dir in raw_dirs:
+            source_dir = self._validate_plugin_source_directory_tree(
+                raw_dir,
+                agent_label="Claude",
+                home_lex=home_lex,
+                home_res=home_res,
+                rt_root=rt_root,
+                st_dir=st_dir,
+                forbidden_exact_roots=forbidden_exact_roots,
+                forbidden_system_trees=forbidden_system_trees,
+                protected_boundaries=protected_boundaries,
+                writable_boundaries=writable_boundaries,
+                allow_internal_symlinks=False,
+            )
+
+            dir_base = os.path.basename(source_dir)
+            if not _SAFE_AGY_PLUGIN_NAME_RE.match(dir_base):
+                self._raise_plugin_policy_error(
+                    f"Invalid Claude plugin directory name '{dir_base}' at '{source_dir}'"
+                )
+
+            plugin_name = dir_base
+            plugin_version = "local"
+            manifest_label = ""
+
+            claude_manifest_p = Path(source_dir) / ".claude-plugin" / "plugin.json"
+            fallback_manifest_p = Path(source_dir) / "plugin.json"
+            active_manifest_p: Optional[Path] = None
+            if claude_manifest_p.exists() or claude_manifest_p.is_symlink():
+                active_manifest_p = claude_manifest_p
+                manifest_label = ".claude-plugin/plugin.json"
+            elif fallback_manifest_p.exists() or fallback_manifest_p.is_symlink():
+                active_manifest_p = fallback_manifest_p
+                manifest_label = "plugin.json"
+
+            if active_manifest_p is not None:
+                mst = os.lstat(active_manifest_p)
+                if stat.S_ISLNK(mst.st_mode) or not stat.S_ISREG(mst.st_mode):
+                    self._raise_plugin_policy_error(
+                        f"Claude plugin manifest '{active_manifest_p}' must be a regular non-symlink file"
+                    )
+                try:
+                    m_data = json.loads(active_manifest_p.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    self._raise_plugin_policy_error(
+                        f"Invalid JSON in Claude plugin manifest '{active_manifest_p}': {exc}"
+                    )
+                if not isinstance(m_data, dict):
+                    self._raise_plugin_policy_error(
+                        f"Claude plugin manifest '{active_manifest_p}' must contain a JSON object"
+                    )
+                if m_data.get("disabled") is True:
+                    self._raise_plugin_policy_error(
+                        f"Claude plugin '{source_dir}' has 'disabled: true' in '{manifest_label}'"
+                    )
+                raw_mname = m_data.get("name")
+                if raw_mname is not None:
+                    if not isinstance(raw_mname, str) or not _SAFE_AGY_PLUGIN_NAME_RE.match(
+                        raw_mname.strip()
+                    ):
+                        self._raise_plugin_policy_error(
+                            f"Invalid 'name' field in '{active_manifest_p}'"
+                        )
+                    plugin_name = raw_mname.strip()
+                raw_ver = m_data.get("version")
+                if raw_ver is not None:
+                    if not isinstance(raw_ver, str) or not _SAFE_CODEX_VERSION_RE.match(
+                        raw_ver.strip()
+                    ):
+                        self._raise_plugin_policy_error(
+                            f"Invalid 'version' field in '{active_manifest_p}'"
+                        )
+                    plugin_version = raw_ver.strip()
+                raw_hooks_ref = m_data.get("hooks")
+                if raw_hooks_ref is not None:
+                    if not isinstance(raw_hooks_ref, str) or os.path.normpath(
+                        raw_hooks_ref.strip()
+                    ) not in (os.path.join("hooks", "hooks.json"), "hooks.json"):
+                        self._raise_plugin_policy_error(
+                            f"Unsupported 'hooks' path '{raw_hooks_ref}' in '{active_manifest_p}'; "
+                            "must be './hooks/hooks.json' or './hooks.json'"
+                        )
+
+            hooks_relpath: Optional[str] = None
+            if (Path(source_dir) / "hooks" / "hooks.json").is_file():
+                hooks_relpath = os.path.join("hooks", "hooks.json")
+            elif (Path(source_dir) / "hooks.json").is_file():
+                hooks_relpath = "hooks.json"
+
+            has_components = any(
+                os.path.isdir(os.path.join(source_dir, comp))
+                for comp in ("skills", "agents", "commands", "hooks")
+            )
+            if not (manifest_label or hooks_relpath or has_components):
+                self._raise_plugin_policy_error(
+                    f"Directory '{source_dir}' is not a valid Claude Code plugin "
+                    "(missing .claude-plugin/plugin.json, skills/, agents/, commands/, or hooks/hooks.json)"
+                )
+            if not manifest_label:
+                manifest_label = hooks_relpath or "directory"
+
+            if plugin_name in seen_names:
+                self._raise_plugin_policy_error(
+                    f"Duplicate Claude plugin name '{plugin_name}' between '{seen_names[plugin_name]}' and '{source_dir}'"
+                )
+            for prev in validated:
+                if _paths_overlap_any_direction(source_dir, prev.source_dir):
+                    self._raise_plugin_policy_error(
+                        f"Registered Claude plugin directories '{prev.source_dir}' and '{source_dir}' overlap"
+                    )
+
+            vfs_discovery_dir = os.path.join(rt_root, "claude", "plugins", plugin_name)
+
+            for hooks_cand_rel in (os.path.join("hooks", "hooks.json"), "hooks.json"):
+                hooks_cand_full = Path(source_dir) / hooks_cand_rel
+                if hooks_cand_full.exists() or hooks_cand_full.is_symlink():
+                    try:
+                        validate_plugin_hooks_manifest(
+                            hooks_cand_full,
+                            agent="claude",
+                            plugin_name=plugin_name,
+                            source_dir=source_dir,
+                            vfs_discovery_dir=vfs_discovery_dir,
+                        )
+                    except Exception as exc:
+                        self._raise_plugin_policy_error(str(exc))
+
+            seen_names[plugin_name] = source_dir
+            validated.append(
+                ValidatedClaudePlugin(
+                    name=plugin_name,
+                    version=plugin_version,
+                    source_dir=source_dir,
+                    vfs_discovery_dir=vfs_discovery_dir,
+                    hooks_relpath=hooks_relpath,
+                    manifest=manifest_label,
+                )
+            )
+
+        return validated
+
+    def get_claude_plugins_info(self) -> Dict[str, Any]:
+        """Return safe, secret-redacted diagnostic state for operator-registered Claude Code plugins."""
+        state = claude_plugins_config_state(self.config)
+        plugins_file_display = redact_diagnostic_text(
+            str(self.config.claude_plugins_file or ""), self.config
+        )
+        rt_display = redact_diagnostic_text(
+            str(self.config.agent_runtime_home_root or "/mnt/dots-agent-home"),
+            self.config,
+        )
+        state_dir_display = redact_diagnostic_text(
+            effective_plugin_state_dir(self.config), self.config
+        )
+        enabled = bool(state.get("enabled"))
+        configured = bool(state.get("configured"))
+        source = redact_diagnostic_text(str(state.get("source") or ""), self.config)
+        raw_dirs = [
+            redact_diagnostic_text(str(d), self.config)
+            for d in (state.get("raw_dirs") or [])
+        ]
+
+        if state.get("config_error"):
+            return {
+                "enabled": True,
+                "configured": True,
+                "source": source,
+                "plugins_file": plugins_file_display,
+                "agent_runtime_home_root": rt_display,
+                "plugin_state_dir": state_dir_display,
+                "configured_dirs": raw_dirs,
+                "valid": False,
+                "status": "error",
+                "plugins": [],
+                "error": redact_diagnostic_text(str(state["config_error"]), self.config),
+            }
+
+        if not enabled:
+            return {
+                "enabled": False,
+                "configured": configured,
+                "source": source,
+                "plugins_file": plugins_file_display,
+                "agent_runtime_home_root": rt_display,
+                "plugin_state_dir": state_dir_display,
+                "configured_dirs": raw_dirs,
+                "valid": True,
+                "status": "disabled",
+                "plugins": [],
+                "error": None,
+            }
+
+        try:
+            validated = self.validate_claude_plugins()
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "configured": True,
+                "source": source,
+                "plugins_file": plugins_file_display,
+                "agent_runtime_home_root": rt_display,
+                "plugin_state_dir": state_dir_display,
+                "configured_dirs": raw_dirs,
+                "valid": False,
+                "status": "error",
+                "plugins": [],
+                "error": redact_diagnostic_text(str(exc), self.config),
+            }
+
+        return {
+            "enabled": True,
+            "configured": True,
+            "source": source,
+            "plugins_file": plugins_file_display,
+            "agent_runtime_home_root": rt_display,
+            "plugin_state_dir": state_dir_display,
+            "configured_dirs": raw_dirs,
+            "mount_namespace_available": bool(can_use_mount_namespace()),
+            "hook_jail_enforced": True,
+            "valid": True,
+            "status": "active",
+            "plugins": [
+                {
+                    "name": p.name,
+                    "version": p.version,
+                    "source_dir": redact_diagnostic_text(p.source_dir, self.config),
+                    "vfs_discovery_dir": redact_diagnostic_text(
+                        p.vfs_discovery_dir, self.config
+                    ),
+                    "hooks_relpath": p.hooks_relpath,
+                    "manifest": p.manifest,
+                    "mode": "ro",
+                }
+                for p in validated
+            ],
+            "error": None,
+        }
+
+    def build_claude_sandbox_settings(
+        self,
+        cwd: Optional[str] = None,
+        add_dirs: Optional[Sequence[str]] = None,
+        _validated_plugins: Optional[Sequence[ValidatedClaudePlugin]] = None,
+    ) -> Dict[str, Any]:
+        """Build per-session `--settings` JSON enforcing `permissions.deny` and hook policy for `claude`."""
+        deny_rules: List[str] = []
+        seen_deny: set[str] = set()
+
+        def _emit_deny(rule: str) -> None:
+            if rule and rule not in seen_deny:
+                seen_deny.add(rule)
+                deny_rules.append(rule)
+
+        docker_on = docker_access_enabled(self.config)
+        for raw_cmd in self.config.blocked_commands:
+            cmd_str = str(raw_cmd).strip()
+            if not cmd_str:
+                continue
+            base = os.path.basename(cmd_str)
+            if docker_on and base in DOCKER_CLI_BASENAMES:
+                continue
+            if base and base not in _SHELL_PREFIX_KEYWORDS and base != "time" and ")" not in base:
+                _emit_deny(f"Bash({base}:*)")
+
+        home_lex = os.path.abspath(str(Path.home()))
+        try:
+            home_res = str(Path.home().resolve())
+        except OSError:
+            home_res = home_lex
+        claude_runtime_parents = {
+            os.path.join(h, sub)
+            for h in {home_lex, home_res}
+            for sub in (".claude", ".claude.json", ".config", ".local")
+        }
+        for raw_prot in self.config.protected_paths:
+            try:
+                p = Path(str(raw_prot)).expanduser()
+                lex_abs = os.path.abspath(str(p))
+            except OSError:
+                continue
+            if lex_abs in claude_runtime_parents or ")" in lex_abs:
+                continue
+            _emit_deny(f"Read({lex_abs}/**)")
+            _emit_deny(f"Edit({lex_abs}/**)")
+            _emit_deny(f"Write({lex_abs}/**)")
+
+        for sensitive_cfg_sub in ("dots-gateway", "tunnel-client", "systemd"):
+            cfg_sub_p = os.path.join(home_res, ".config", sensitive_cfg_sub)
+            if ")" not in cfg_sub_p:
+                _emit_deny(f"Read({cfg_sub_p}/**)")
+                _emit_deny(f"Edit({cfg_sub_p}/**)")
+                _emit_deny(f"Write({cfg_sub_p}/**)")
+
+        ok_cwd, _, resolved_cwd = self.validate_workdir(cwd)
+        ws_roots: List[str] = []
+        if ok_cwd:
+            ws_roots.append(resolved_cwd)
+            for ws_d in self.get_agy_workspace_dirs(cwd=cwd, add_dirs=add_dirs):
+                if ws_d not in ws_roots:
+                    ws_roots.append(ws_d)
+        for root_w in self._allowed_roots:
+            if root_w not in ws_roots:
+                ws_roots.append(root_w)
+        ro_prot_rel_set = frozenset(WORKSPACE_READONLY_PROTECTED_RELPATHS)
+        for ws_r in ws_roots:
+            for inj_rel in WORKSPACE_HOOK_INJECTION_RELPATHS:
+                inj_abs = os.path.join(ws_r, inj_rel)
+                if ")" in inj_abs:
+                    continue
+                if inj_rel not in ro_prot_rel_set:
+                    _emit_deny(f"Read({inj_abs})")
+                    _emit_deny(f"Read({inj_abs}/**)")
+                _emit_deny(f"Edit({inj_abs})")
+                _emit_deny(f"Edit({inj_abs}/**)")
+                _emit_deny(f"Write({inj_abs})")
+                _emit_deny(f"Write({inj_abs}/**)")
+
+        settings_obj: Dict[str, Any] = {
+            "permissions": {
+                "deny": deny_rules,
+            }
+        }
+        if not _validated_plugins:
+            settings_obj["disableAllHooks"] = True
+        return settings_obj
+
+    def build_claude_argv(
+        self,
+        prompt: Optional[str] = None,
+        args: Optional[Sequence[str]] = None,
+        skip_permissions: Optional[bool] = None,
+        permission_mode: Optional[str] = None,
+        print_mode: bool = True,
+        output_format: Optional[str] = None,
+        input_format: Optional[str] = None,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        session_id: Optional[str] = None,
+        continue_last: bool = False,
+        add_dirs: Optional[Sequence[str]] = None,
+        cwd: Optional[str] = None,
+        _validated_plugins: Optional[Sequence[ValidatedClaudePlugin]] = None,
+    ) -> List[str]:
+        """Construct a validated `claude` CLI invocation list confined to allowed_workdirs."""
+        ok_cwd, cwd_err, resolved_cwd = self.validate_workdir(cwd)
+        if not ok_cwd:
+            raise PermissionError(cwd_err)
+
+        claude_bin = (
+            self.config.claude_binary
+            if os.path.exists(self.config.claude_binary)
+            else "claude"
+        )
+        argv: List[str] = [claude_bin]
+
+        use_skip = (
+            self.config.claude_default_skip_permissions
+            if skip_permissions is None
+            else bool(skip_permissions)
+        )
+        allowed_perm_modes = (
+            "bypassPermissions",
+            "acceptEdits",
+            "auto",
+            "dontAsk",
+            "plan",
+            "default",
+        )
+        eff_perm_mode = (
+            str(permission_mode).strip()
+            if permission_mode is not None
+            else str(self.config.claude_default_permission_mode or "bypassPermissions").strip()
+        )
+        if eff_perm_mode not in allowed_perm_modes:
+            raise PermissionError(
+                f"Invalid or forbidden claude permission_mode '{eff_perm_mode}'; "
+                f"allowed: {', '.join(allowed_perm_modes)}"
+            )
+
+        extra = [str(a) for a in (args or [])]
+        _claude_value_flags = {
+            "--model",
+            "--effort",
+            "--resume",
+            "-r",
+            "--input-format",
+            "--output-format",
+            "--print",
+            "-p",
+            "--system-prompt",
+            "--append-system-prompt",
+            "--max-turns",
+            "--fallback-model",
+            "--allowedTools",
+            "--allowed-tools",
+            "--disallowedTools",
+            "--disallowed-tools",
+            "--tools",
+            "--betas",
+            "--agent",
+            "--agents",
+            "--json-schema",
+        }
+        for raw_arg in extra:
+            if raw_arg == "--":
+                raise PermissionError(
+                    "Passing '--' in claude args is forbidden; pass prompt via the dedicated 'prompt' field"
+                )
+            if raw_arg == "--add-dir" or raw_arg.startswith("--add-dir="):
+                raise PermissionError(
+                    "Raw '--add-dir' in args is forbidden; pass 'add_dirs' for workspace validation"
+                )
+            if (
+                raw_arg
+                in (
+                    "--settings",
+                    "--setting-sources",
+                    "--mcp-config",
+                    "--strict-mcp-config",
+                    "--remote-control",
+                    "--dangerously-skip-permissions",
+                    "--permission-mode",
+                )
+                or raw_arg.startswith(
+                    (
+                        "--settings=",
+                        "--setting-sources=",
+                        "--mcp-config=",
+                        "--remote-control=",
+                        "--permission-mode=",
+                    )
+                )
+            ):
+                raise PermissionError(
+                    f"Raw '{raw_arg}' override in claude args is forbidden by gateway security policy"
+                )
+            if (
+                raw_arg in ("--plugin", "--plugins", "--plugin-dir", "--plugin-dirs")
+                or raw_arg.startswith(
+                    ("--plugin=", "--plugins=", "--plugin-dir=", "--plugin-dirs=")
+                )
+                or raw_arg in ("plugin", "plugins", "mcp", "auth")
+            ):
+                raise PermissionError(
+                    "Declaring or managing Claude plugins/MCP per task via CLI args is forbidden; "
+                    "register operator-approved plugins via 'dots-gateway claude-plugins'"
+                )
+            if prompt is not None and (
+                raw_arg in ("--print", "-p") or raw_arg.startswith(("--print=", "-p="))
+            ):
+                raise PermissionError(
+                    "Cannot combine 'prompt' with '-p'/'--print' in 'args'; pass prompt via 'prompt' only"
+                )
+
+        if extra and extra[-1] in _claude_value_flags:
+            raise PermissionError(
+                f"Trailing flag '{extra[-1]}' in claude args is missing its value"
+            )
+
+        ok_extra, err_extra = self._check_protected_arguments(
+            [claude_bin, *extra], resolved_cwd, _trusted_agy_argv=False
+        )
+        if not ok_extra:
+            raise PermissionError(err_extra)
+
+        plugins_state = claude_plugins_config_state(self.config)
+        active_validated_plugins: List[ValidatedClaudePlugin] = list(_validated_plugins or [])
+        if (plugins_state.get("config_error") or plugins_state.get("enabled")) and _validated_plugins is None:
+            active_validated_plugins = self.validate_claude_plugins(cwd=cwd, add_dirs=add_dirs)
+
+        if print_mode and "-p" not in extra and "--print" not in extra:
+            argv.append("-p")
+
+        if permission_mode is not None:
+            if eff_perm_mode == "bypassPermissions":
+                argv.append("--dangerously-skip-permissions")
+            else:
+                argv.extend(["--permission-mode", eff_perm_mode])
+        elif use_skip:
+            argv.append("--dangerously-skip-permissions")
+        else:
+            fallback_mode = "acceptEdits" if eff_perm_mode == "bypassPermissions" else eff_perm_mode
+            argv.extend(["--permission-mode", fallback_mode])
+
+        argv.append("--setting-sources=user")
+        argv.append("--strict-mcp-config")
+        argv.append('--mcp-config={"mcpServers":{}}')
+
+        claude_settings = self.build_claude_sandbox_settings(
+            cwd=cwd,
+            add_dirs=add_dirs,
+            _validated_plugins=active_validated_plugins,
+        )
+        argv.append(f"--settings={json.dumps(claude_settings, separators=(',', ':'))}")
+
+        for plg in active_validated_plugins:
+            argv.append(f"--plugin-dir={plg.vfs_discovery_dir}")
+
+        if model and "--model" not in extra:
+            argv.extend(["--model", model])
+        if effort and "--effort" not in extra:
+            eff_val = str(effort).strip()
+            if eff_val not in ("low", "medium", "high", "xhigh", "max"):
+                raise ValueError(
+                    f"Unsupported claude effort '{effort}'; expected low/medium/high/xhigh/max"
+                )
+            argv.extend(["--effort", eff_val])
+
+        if session_id and "--resume" not in extra and "-r" not in extra:
+            argv.extend(["--resume", str(session_id)])
+        elif continue_last and "--continue" not in extra and "-c" not in extra:
+            argv.append("--continue")
+
+        for resolved_dir in self.get_agy_workspace_dirs(cwd=cwd, add_dirs=add_dirs):
+            argv.extend(["--add-dir", resolved_dir])
+
+        if input_format and "--input-format" not in extra:
+            argv.extend(["--input-format", input_format])
+        if output_format and "--output-format" not in extra:
+            argv.extend(["--output-format", output_format])
+        if (
+            print_mode
+            and output_format == "stream-json"
+            and "--verbose" not in extra
+        ):
+            argv.append("--verbose")
+
+        argv.extend(extra)
+
+        if prompt is not None:
+            argv.extend(["--", prompt])
 
         return argv

@@ -36,6 +36,7 @@ from .config import (
     GATEWAY_ROOT,
     GatewayConfig,
     agy_plugins_config_state,
+    claude_plugins_config_state,
     codex_plugins_config_state,
     docker_access_enabled,
     docker_access_state,
@@ -46,6 +47,7 @@ from .hook_jail import (
     PreparedAgentPluginRuntime,
     cleanup_prepared_plugin_runtime,
     prepare_agy_plugin_runtime,
+    prepare_claude_plugin_runtime,
     prepare_codex_plugin_runtime,
 )
 from .policy import CommandPolicy
@@ -110,12 +112,12 @@ def is_process_instance_alive(
 
 
 def _extract_initial_agent_id(
-    argv: Sequence[str], is_agy: bool, is_codex: bool
+    argv: Sequence[str], is_agy: bool, is_codex: bool, is_claude: bool = False
 ) -> Optional[str]:
-    """Extract resumed conversation/session ID from `agy` or `codex` CLI arguments when present."""
-    if is_agy:
+    """Extract resumed conversation/session ID from `agy`, `codex`, or `claude` CLI arguments when present."""
+    if is_agy or is_claude:
         for i, tok in enumerate(argv):
-            if tok in ("--conversation", "--resume") and i + 1 < len(argv):
+            if tok in ("--conversation", "--resume", "-r") and i + 1 < len(argv):
                 cand = argv[i + 1].strip()
                 if cand and not cand.startswith("-"):
                     return cand
@@ -136,9 +138,13 @@ def _extract_initial_agent_id(
 
 
 def _extract_stream_agent_id(text: str) -> Optional[str]:
-    """Extract `thread_id` / `conversation_id` from JSONL agent stdout lines when available."""
-    for raw_line in text.splitlines():
-        s = raw_line.strip()
+    """Extract `thread_id` / `conversation_id` / `session_id` from JSON or JSONL agent stdout."""
+    candidates: List[str] = list(text.splitlines())
+    whole = text.strip()
+    if whole.startswith("{") and whole.endswith("}") and "\n" in whole:
+        candidates.append(whole)
+    for raw_item in candidates:
+        s = raw_item.strip()
         if not s.startswith("{") or not s.endswith("}"):
             continue
         try:
@@ -147,7 +153,7 @@ def _extract_stream_agent_id(text: str) -> Optional[str]:
             continue
         if not isinstance(obj, dict):
             continue
-        for key in ("thread_id", "conversation_id", "conversationId"):
+        for key in ("thread_id", "conversation_id", "conversationId", "session_id"):
             val = obj.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip()
@@ -227,6 +233,9 @@ _STRIPPED_ENV_KEYS = {
     "OPENAI_API_" + "KEY",
     "CODEX_API_" + "KEY",
     "CODEX_ACCESS_TOKEN",
+    "ANTHROPIC_API_" + "KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
     "AGY_ADC_AUTH",
     "GOOGLE_CLOUD_QUOTA_PROJECT",
     # Never let host cloud credentials or VM metadata overrides leak into sandboxed sessions
@@ -250,6 +259,9 @@ _STRIPPED_ENV_KEYS = {
     "CODEX_PLUGIN_ROOT",
     "CODEX_PLUGIN_DIRS",
     "CODEX_REGISTERED_PLUGINS",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_PLUGIN_DIRS",
+    "CLAUDE_REGISTERED_PLUGINS",
     "PLUGIN_ROOT",
     "PLUGIN_DATA",
     "CLAUDE_PLUGIN_ROOT",
@@ -366,6 +378,7 @@ class ExecutionSession:
         queue_timeout: float = 1800.0,
         is_agy: bool = False,
         is_codex: bool = False,
+        is_claude: bool = False,
         spawn_argv: Optional[List[str]] = None,
         on_persist: Optional[Callable[["ExecutionSession", bool], None]] = None,
         pre_spawn_check: Optional[Callable[[], None]] = None,
@@ -386,6 +399,7 @@ class ExecutionSession:
         self.max_output_bytes = max_output_bytes
         self.is_agy = is_agy
         self.is_codex = is_codex
+        self.is_claude = is_claude
         self._on_persist = on_persist
         self._pre_spawn_check = pre_spawn_check
         self._prepare_spawn = prepare_spawn
@@ -398,7 +412,7 @@ class ExecutionSession:
         self.boot_id: str = _read_boot_id()
         self.proc_start_ticks: Optional[int] = None
         self.agent_conversation_id: Optional[str] = _extract_initial_agent_id(
-            argv, is_agy=is_agy, is_codex=is_codex
+            argv, is_agy=is_agy, is_codex=is_codex, is_claude=is_claude
         )
         self.returncode: Optional[int] = None
         self.started_at: float = time.time()
@@ -454,7 +468,7 @@ class ExecutionSession:
             self._stdout_bytes -= old_len
             self.stdout_truncated = True
         found_id = False
-        if (self.is_codex or self.is_agy) and not self.agent_conversation_id:
+        if (self.is_codex or self.is_agy or self.is_claude) and not self.agent_conversation_id:
             cand_id = _extract_stream_agent_id(text)
             if cand_id:
                 self.agent_conversation_id = cand_id
@@ -495,7 +509,7 @@ class ExecutionSession:
             self.status = "queued"
             if initial_stdin is not None:
                 self._pending_stdin.append((initial_stdin.encode("utf-8"), close_stdin))
-            slot_kind = "codex" if self.is_codex else "agy"
+            slot_kind = "codex" if self.is_codex else ("claude" if self.is_claude else "agy")
             self._emit(
                 "queued",
                 {"message": f"Waiting for available {slot_kind} concurrency slot", "cwd": self.cwd},
@@ -814,6 +828,10 @@ class ExecutionSession:
         elif self.status != "killed":
             self.status = "completed" if self.returncode == 0 else "failed"
 
+        if (self.is_claude or self.is_agy or self.is_codex) and not self.agent_conversation_id:
+            full_stdout = "".join(t for _, t in self._stdout_chunks)
+            if full_stdout:
+                self.agent_conversation_id = _extract_stream_agent_id(full_stdout)
         if self.is_codex and not self.agent_conversation_id:
             self.agent_conversation_id = _discover_codex_rollout_id(self.cwd, self.started_at)
 
@@ -864,15 +882,30 @@ class ExecutionSession:
         self._emit("stdin", {"bytes_written": len(raw), "closed": close_after})
 
     async def send_agy_turn(self, prompt: str, close_after: bool = False) -> None:
-        """Send a user turn to an interactive or stream-json `agy` session."""
+        """Send a user turn to an interactive or stream-json `agy` / `claude` session."""
         if self.stream_json:
-            payload = (
-                json.dumps(
-                    {"event": "user", "message": {"content": prompt}},
-                    ensure_ascii=False,
+            if self.is_claude:
+                payload = (
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": [{"type": "text", "text": prompt}],
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
+            else:
+                payload = (
+                    json.dumps(
+                        {"event": "user", "message": {"content": prompt}},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
             await self.write_stdin(payload, close_after=close_after)
         else:
             line = prompt if prompt.endswith("\n") else prompt + "\n"
@@ -964,7 +997,11 @@ class ExecutionSession:
         )
         res: Dict[str, Any] = {
             "session_id": self.session_id,
-            "session_kind": "agy" if self.is_agy else ("codex" if self.is_codex else "exec"),
+            "session_kind": (
+                "agy"
+                if self.is_agy
+                else ("codex" if self.is_codex else ("claude" if self.is_claude else "exec"))
+            ),
             "status": self.status,
             "process_alive": proc_alive,
             "reconciled_after_restart": False,
@@ -1000,9 +1037,14 @@ class ExecutionSession:
         return {
             "schema_version": 1,
             "session_id": self.session_id,
-            "session_kind": "agy" if self.is_agy else ("codex" if self.is_codex else "exec"),
+            "session_kind": (
+                "agy"
+                if self.is_agy
+                else ("codex" if self.is_codex else ("claude" if self.is_claude else "exec"))
+            ),
             "is_agy": self.is_agy,
             "is_codex": self.is_codex,
+            "is_claude": self.is_claude,
             "status": self.status,
             "pid": self.pid,
             "boot_id": self.boot_id,
@@ -1035,6 +1077,9 @@ class PersistedSession:
         self.is_agy: bool = bool(record.get("is_agy") or record.get("session_kind") == "agy")
         self.is_codex: bool = bool(
             record.get("is_codex") or record.get("session_kind") == "codex"
+        )
+        self.is_claude: bool = bool(
+            record.get("is_claude") or record.get("session_kind") == "claude"
         )
         self.status: str = str(record.get("status") or "completed")
         raw_pid = record.get("pid")
@@ -1112,11 +1157,18 @@ class PersistedSession:
 
     def to_summary(self, include_output: bool = True, after_seq: int = 0) -> Dict[str, Any]:
         alive = self.is_alive()
+        if (self.is_claude or self.is_agy or self.is_codex) and not self.agent_conversation_id:
+            if self.stdout:
+                self.agent_conversation_id = _extract_stream_agent_id(self.stdout)
         if self.is_codex and not self.agent_conversation_id:
             self.agent_conversation_id = _discover_codex_rollout_id(self.cwd, self.started_at)
         res: Dict[str, Any] = {
             "session_id": self.session_id,
-            "session_kind": "agy" if self.is_agy else ("codex" if self.is_codex else "exec"),
+            "session_kind": (
+                "agy"
+                if self.is_agy
+                else ("codex" if self.is_codex else ("claude" if self.is_claude else "exec"))
+            ),
             "status": self.status,
             "process_alive": alive,
             "reconciled_after_restart": self.reconciled_after_restart,
@@ -1145,9 +1197,14 @@ class PersistedSession:
         return {
             "schema_version": 1,
             "session_id": self.session_id,
-            "session_kind": "agy" if self.is_agy else ("codex" if self.is_codex else "exec"),
+            "session_kind": (
+                "agy"
+                if self.is_agy
+                else ("codex" if self.is_codex else ("claude" if self.is_claude else "exec"))
+            ),
             "is_agy": self.is_agy,
             "is_codex": self.is_codex,
+            "is_claude": self.is_claude,
             "status": self.status,
             "pid": self.pid,
             "boot_id": self.boot_id,
@@ -1269,6 +1326,7 @@ class SessionManager:
         self._persisted: Dict[str, PersistedSession] = {}
         self._agy_sem = asyncio.Semaphore(max(1, config.max_concurrent_agy))
         self._codex_sem = asyncio.Semaphore(max(1, config.max_concurrent_codex))
+        self._claude_sem = asyncio.Semaphore(max(1, config.max_concurrent_claude))
         self._sandbox_cleanup_lock = asyncio.Lock()
         self._last_sandbox_cleanup: Optional[Dict[str, Any]] = None
         self._agy_models_lock = asyncio.Lock()
@@ -1493,8 +1551,11 @@ class SessionManager:
             os.path.join(home_dir, ".gemini"),
             os.path.join(home_dir, ".config"),
             os.path.join(home_dir, ".codex"),
+            os.path.join(home_dir, ".claude"),
+            os.path.join(home_dir, ".claude.json"),
             *self.policy.get_configured_agy_plugin_paths(),
             *self.policy.get_configured_codex_plugin_paths(),
+            *self.policy.get_configured_claude_plugin_paths(),
         ]
 
     def _hook_jail_masked_paths(self) -> List[str]:
@@ -1506,6 +1567,8 @@ class SessionManager:
             *(self.config.protected_paths or ()),
             os.path.join(home_dir, ".gemini"),
             os.path.join(home_dir, ".codex"),
+            os.path.join(home_dir, ".claude"),
+            os.path.join(home_dir, ".claude.json"),
             os.path.join(home_dir, ".config"),
             os.path.join(home_dir, ".ssh"),
             os.path.join(home_dir, ".gnupg"),
@@ -1519,6 +1582,9 @@ class SessionManager:
             )
             extra_mandatory.append(
                 os.path.join(str(self.config.sandbox_state_dir), "codex_home")
+            )
+            extra_mandatory.append(
+                os.path.join(str(self.config.sandbox_state_dir), "claude_home")
             )
         for raw_p in extra_mandatory:
             if not raw_p:
@@ -1940,6 +2006,107 @@ class SessionManager:
         except OSError:
             return False
 
+    def _load_claude_env(self) -> Dict[str, str]:
+        """Load isolated Claude Code credentials/env overrides from `claude_env_file` (`0600`)."""
+        out: Dict[str, str] = {}
+        raw_path = (self.config.claude_env_file or "").strip()
+        if not raw_path:
+            return out
+        env_p = Path(raw_path).expanduser()
+        if not env_p.is_file():
+            return out
+        try:
+            for raw_line in env_p.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("unset "):
+                    ukey = line[6:].strip()
+                    if ukey:
+                        out.pop(ukey, None)
+                    continue
+                if "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                if k and v:
+                    out[k] = v
+        except OSError:
+            pass
+        return out
+
+    def get_claude_default_model(self) -> Tuple[Optional[str], str]:
+        """Return `(model, source)` used when callers omit `model` for `run_claude` (hot-reloaded)."""
+        raw_path = (self.config.claude_model_file or "").strip()
+        if raw_path:
+            model_p = Path(raw_path).expanduser()
+            try:
+                if model_p.is_file():
+                    for raw_line in model_p.read_text(encoding="utf-8").splitlines():
+                        cand = raw_line.strip()
+                        if cand and not cand.startswith("#"):
+                            return cand[:128], "claude_model_file"
+            except OSError:
+                pass
+        cfg_model = (self.config.claude_default_model or "").strip()
+        if cfg_model:
+            return cfg_model[:128], "config"
+        env_model = (self._load_claude_env().get("ANTHROPIC_MODEL") or "").strip()
+        if env_model:
+            return env_model[:128], "claude_env_file"
+        return None, "claude_settings"
+
+    def has_claude_auth(self) -> bool:
+        """Return True if Claude Code credentials exist in `claude.env` or `~/.claude/.credentials.json`."""
+        env_map = self._load_claude_env()
+        if any(
+            env_map.get(k)
+            for k in (
+                "ANTHROPIC_API_" + "KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+            )
+        ):
+            return True
+        creds_json = Path.home() / ".claude" / ".credentials.json"
+        try:
+            return creds_json.is_file() and creds_json.stat().st_size > 10
+        except OSError:
+            return False
+
+    def get_claude_auth_info(self) -> Dict[str, Any]:
+        """Return live Claude Code authentication & default model status (secret-redacted)."""
+        env_map = self._load_claude_env()
+        has_api_key = bool(env_map.get("ANTHROPIC_API_" + "KEY") or env_map.get("ANTHROPIC_AUTH_TOKEN"))
+        has_oauth_env = bool(env_map.get("CLAUDE_CODE_OAUTH_TOKEN"))
+        creds_json = Path.home() / ".claude" / ".credentials.json"
+        try:
+            has_oauth_file = creds_json.is_file() and creds_json.stat().st_size > 10
+        except OSError:
+            has_oauth_file = False
+        base_url = env_map.get("ANTHROPIC_BASE_URL") or None
+        default_model, default_source = self.get_claude_default_model()
+        mode = (
+            "api_key"
+            if has_api_key
+            else ("oauth" if (has_oauth_env or has_oauth_file) else "unconfigured")
+        )
+        return {
+            "configured": bool(has_api_key or has_oauth_env or has_oauth_file),
+            "mode": mode,
+            "base_url": redact_diagnostic_text(base_url, self.config) if base_url else None,
+            "env_file": redact_diagnostic_text(self.config.claude_env_file, self.config),
+            "default_model": default_model,
+            "default_model_source": default_source,
+        }
+
     def _cleanup_old_sessions(self) -> None:
         if len(self._sessions) > 100:
             completed = [
@@ -1982,6 +2149,16 @@ class SessionManager:
             1 for s in self._sessions.values() if s.is_codex and s.status == "queued"
         )
 
+    def active_claude_count(self) -> int:
+        return sum(
+            1 for s in self._sessions.values() if s.is_claude and s.status in ("starting", "running")
+        )
+
+    def queued_claude_count(self) -> int:
+        return sum(
+            1 for s in self._sessions.values() if s.is_claude and s.status == "queued"
+        )
+
     async def create_session(
         self,
         command: Union[str, Sequence[str]],
@@ -1997,6 +2174,7 @@ class SessionManager:
         queue_timeout: Optional[float] = None,
         is_agy: bool = False,
         is_codex: bool = False,
+        is_claude: bool = False,
         readonly_subpaths: Optional[Sequence[str]] = None,
         readonly_subpaths_getter: Optional[Callable[[], Sequence[str]]] = None,
         trusted_env: Optional[Dict[str, str]] = None,
@@ -2004,6 +2182,8 @@ class SessionManager:
         agy_plugin_mounts: Optional[Sequence[Tuple[str, str]]] = None,
         codex_plugins_enabled: bool = False,
         codex_plugin_mounts: Optional[Sequence[Tuple[str, str]]] = None,
+        claude_plugins_enabled: bool = False,
+        claude_plugin_mounts: Optional[Sequence[Tuple[str, str]]] = None,
         prepared_plugin_runtime: Optional[PreparedAgentPluginRuntime] = None,
         prevalidated_sandbox_state: Optional[Path] = None,
         pre_spawn_check: Optional[Callable[[], None]] = None,
@@ -2023,6 +2203,7 @@ class SessionManager:
             cwd=cwd,
             _trusted_agy_argv=is_agy,
             _trusted_codex_argv=is_codex,
+            _trusted_claude_argv=is_claude,
         )
         if not decision.allowed:
             raise PermissionError(decision.reason)
@@ -2042,8 +2223,10 @@ class SessionManager:
             or not home_covered
             or is_agy
             or is_codex
+            or is_claude
             or agy_plugins_enabled
             or codex_plugins_enabled
+            or claude_plugins_enabled
         ):
             prevalidated_sb = await asyncio.to_thread(
                 prepare_sandbox_runtime_state,
@@ -2093,6 +2276,7 @@ class SessionManager:
             masked_plugins = [
                 *self.policy.get_configured_agy_plugin_paths(),
                 *self.policy.get_configured_codex_plugin_paths(),
+                *self.policy.get_configured_claude_plugin_paths(),
             ]
             active_ro_subpaths = (
                 readonly_subpaths_getter()
@@ -2106,6 +2290,7 @@ class SessionManager:
                 protected_paths=self.config.protected_paths,
                 is_agy=is_agy,
                 is_codex=is_codex,
+                is_claude=is_claude,
                 readonly_subpaths=active_ro_subpaths,
                 sandbox_state_dir=self.config.sandbox_state_dir,
                 docker_mask_paths=self.config.docker_mask_paths,
@@ -2115,6 +2300,8 @@ class SessionManager:
                 agy_plugin_mounts=agy_plugin_mounts,
                 codex_plugins_enabled=codex_plugins_enabled,
                 codex_plugin_mounts=codex_plugin_mounts,
+                claude_plugins_enabled=claude_plugins_enabled,
+                claude_plugin_mounts=claude_plugin_mounts,
                 prepared_plugin_runtime=active_runtime,
                 agent_runtime_home_root=self.config.agent_runtime_home_root,
                 masked_plugin_paths=masked_plugins,
@@ -2155,6 +2342,7 @@ class SessionManager:
             ),
             is_agy=is_agy,
             is_codex=is_codex,
+            is_claude=is_claude,
             spawn_argv=spawn_argv,
             on_persist=(
                 self._on_live_session_persist if self._state_dir is not None else None
@@ -2678,6 +2866,247 @@ class SessionManager:
             )
         except BaseException:
             cleanup_prepared_plugin_runtime(codex_runtime_holder[0])
+            raise
+
+    async def create_claude_session(
+        self,
+        prompt: Optional[str] = None,
+        cwd: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+        args: Optional[Sequence[str]] = None,
+        skip_permissions: Optional[bool] = None,
+        permission_mode: Optional[str] = None,
+        print_mode: bool = True,
+        output_format: Optional[str] = None,
+        input_format: Optional[str] = None,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        session_id: Optional[str] = None,
+        continue_last: bool = False,
+        add_dirs: Optional[Sequence[str]] = None,
+        use_pty: bool = False,
+        timeout: Optional[float] = None,
+        initial_stdin: Optional[str] = None,
+        close_stdin: bool = True,
+    ) -> ExecutionSession:
+        """Create a dedicated `claude` (Claude Code CLI) session jailed to allowed_workdirs + isolated runtime."""
+        eff_model = model
+        if not eff_model and not any(
+            str(a) == "--model" or str(a).startswith("--model=") for a in (args or [])
+        ):
+            eff_model, _ = self.get_claude_default_model()
+
+        def _validate_and_build_claude_inputs() -> Tuple[
+            List[Any], str, List[str], List[str], List[str], Dict[str, str]
+        ]:
+            claude_plugins_state = claude_plugins_config_state(self.config)
+            val_cl_plgs: List[Any] = []
+            if claude_plugins_state.get("config_error") or claude_plugins_state.get("enabled"):
+                val_cl_plgs = self.policy.validate_claude_plugins(
+                    cwd=cwd, add_dirs=add_dirs, require_mount_ns_check=True
+                )
+            ok_cwd_cl, cwd_err_cl, res_cwd_cl = self.policy.validate_workdir(cwd)
+            if not ok_cwd_cl:
+                raise PermissionError(cwd_err_cl)
+            ws_dirs_cl = self.policy.get_agy_workspace_dirs(cwd=cwd, add_dirs=add_dirs)
+            built_cl_argv = self.policy.build_claude_argv(
+                prompt=prompt,
+                args=args,
+                skip_permissions=skip_permissions,
+                permission_mode=permission_mode,
+                print_mode=print_mode,
+                output_format=output_format,
+                input_format=input_format,
+                model=eff_model,
+                effort=effort,
+                session_id=session_id,
+                continue_last=continue_last,
+                add_dirs=add_dirs,
+                cwd=cwd,
+                _validated_plugins=val_cl_plgs,
+            )
+            _, ro_hooks_cl = self.policy.resolve_codex_git_metadata_dirs(
+                cwd=cwd, add_dirs=add_dirs
+            )
+            loaded_cl_env = self._load_claude_env()
+            return (
+                val_cl_plgs,
+                res_cwd_cl,
+                ws_dirs_cl,
+                built_cl_argv,
+                ro_hooks_cl,
+                loaded_cl_env,
+            )
+
+        (
+            validated_claude_plugins,
+            resolved_cwd_claude,
+            session_ws_claude,
+            argv,
+            ro_hook_dirs,
+            trusted_claude_env,
+        ) = await asyncio.to_thread(_validate_and_build_claude_inputs)
+        for strip_plg_key in (
+            "HOME",
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "AGY_PLUGIN_ROOT",
+            "AGY_PLUGIN_DIRS",
+            "AGY_REGISTERED_PLUGINS",
+            "CODEX_PLUGIN_ROOT",
+            "CODEX_PLUGIN_DIRS",
+            "CODEX_REGISTERED_PLUGINS",
+            "CLAUDE_PLUGIN_DIRS",
+            "CLAUDE_REGISTERED_PLUGINS",
+            "PLUGIN_ROOT",
+            "PLUGIN_DATA",
+            "CLAUDE_PLUGIN_ROOT",
+            "CLAUDE_PLUGIN_DATA",
+            "CLAUDE_PROJECT_DIR",
+            "AGY_PROJECT_DIR",
+            "HARNESS_PROJECT_DIR",
+            "OH_MY_AGENTS_ROOT",
+        ):
+            trusted_claude_env.pop(strip_plg_key, None)
+
+        gw_session_id = f"sess_{uuid.uuid4().hex[:16]}"
+        prevalidated_sb: Optional[Path] = None
+        prepared_claude_runtime: Optional[PreparedAgentPluginRuntime] = None
+        allowed_ws_claude: List[str] = []
+        if validated_claude_plugins:
+            for ws_cand in (
+                resolved_cwd_claude,
+                *session_ws_claude,
+                *self.policy._allowed_roots,
+            ):
+                if ws_cand and ws_cand not in allowed_ws_claude:
+                    allowed_ws_claude.append(ws_cand)
+            prevalidated_sb = await asyncio.to_thread(
+                prepare_sandbox_runtime_state,
+                self.config.sandbox_state_dir,
+                lock_timeout_seconds=self.config.sandbox_lock_timeout_seconds,
+                forbidden_roots=self._sandbox_forbidden_roots(),
+            )
+            prepared_claude_runtime = await asyncio.to_thread(
+                prepare_claude_plugin_runtime,
+                self.config,
+                validated_plugins=validated_claude_plugins,
+                sandbox_state_root=prevalidated_sb,
+                allowed_workspaces=allowed_ws_claude,
+                masked_paths=self._hook_jail_masked_paths(),
+                readonly_subpaths=ro_hook_dirs,
+                session_tag=gw_session_id,
+            )
+            trusted_claude_env["HOME"] = prepared_claude_runtime.isolated_home_dir
+            trusted_claude_env["CLAUDE_CONFIG_DIR"] = str(
+                prepared_claude_runtime.vfs_claude_config_dir
+            )
+            trusted_claude_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            oma_plg = next(
+                (p for p in validated_claude_plugins if p.name == "oh-my-agents"), None
+            )
+            primary_plg = oma_plg or (
+                validated_claude_plugins[0] if len(validated_claude_plugins) == 1 else None
+            )
+            if primary_plg is not None:
+                trusted_claude_env["CLAUDE_PLUGIN_ROOT"] = (
+                    primary_plg.vfs_discovery_dir
+                    if self.policy.is_protected_path(primary_plg.source_dir)
+                    else primary_plg.source_dir
+                )
+            trusted_claude_env["CLAUDE_REGISTERED_PLUGINS"] = os.pathsep.join(
+                (
+                    p.vfs_discovery_dir
+                    if self.policy.is_protected_path(p.source_dir)
+                    else p.source_dir
+                )
+                for p in validated_claude_plugins
+            )
+
+        claude_runtime_holder: List[Optional[PreparedAgentPluginRuntime]] = [prepared_claude_runtime]
+        claude_ro_subpaths_holder: List[List[str]] = [list(ro_hook_dirs)]
+        expected_claude_mounts = [(p.name, p.source_dir) for p in validated_claude_plugins]
+        expected_claude_specs = [
+            (p.name, p.source_dir, p.version, p.has_hooks, p.hooks_relpath)
+            for p in validated_claude_plugins
+        ]
+
+        def _revalidate_claude_plugins_before_spawn() -> None:
+            latest_state = claude_plugins_config_state(self.config)
+            current_plugins = []
+            if latest_state.get("config_error") or latest_state.get("enabled"):
+                current_plugins = self.policy.validate_claude_plugins(
+                    cwd=cwd, add_dirs=add_dirs, require_mount_ns_check=True
+                )
+            current_specs = [
+                (p.name, p.source_dir, p.version, p.has_hooks, p.hooks_relpath)
+                for p in current_plugins
+            ]
+            if current_specs != expected_claude_specs:
+                raise PermissionError(
+                    redact_diagnostic_text(
+                        "Claude plugin registration changed while session was queued; "
+                        "aborting queued session fail-closed.",
+                        self.config,
+                    )
+                )
+
+        def _refresh_claude_runtime_after_queue() -> Optional[PreparedAgentPluginRuntime]:
+            _, fresh_ro_hook_dirs = self.policy.resolve_codex_git_metadata_dirs(
+                cwd=cwd, add_dirs=add_dirs
+            )
+            claude_ro_subpaths_holder[0] = list(fresh_ro_hook_dirs)
+            if not validated_claude_plugins or prevalidated_sb is None:
+                return claude_runtime_holder[0]
+            current_plugins = self.policy.validate_claude_plugins(
+                cwd=cwd, add_dirs=add_dirs, require_mount_ns_check=True
+            )
+            refreshed = prepare_claude_plugin_runtime(
+                self.config,
+                validated_plugins=current_plugins,
+                sandbox_state_root=prevalidated_sb,
+                allowed_workspaces=allowed_ws_claude,
+                masked_paths=self._hook_jail_masked_paths(),
+                readonly_subpaths=fresh_ro_hook_dirs,
+                session_tag=gw_session_id,
+            )
+            claude_runtime_holder[0] = refreshed
+            return refreshed
+
+        caller_env = {str(k): str(v) for k, v in env.items()} if env else {}
+        is_stream_json = output_format == "stream-json" or "--output-format=stream-json" in argv
+        eff_timeout = self._resolve_timeout(
+            timeout, self.config.agent_default_timeout_seconds
+        )
+        try:
+            return await self.create_session(
+                command=argv,
+                cwd=cwd,
+                env=caller_env,
+                shell=False,
+                use_pty=use_pty,
+                stream_json=is_stream_json,
+                timeout=eff_timeout,
+                initial_stdin=initial_stdin,
+                close_stdin=close_stdin,
+                slot_sem=self._claude_sem,
+                queue_timeout=self.config.agy_queue_timeout_seconds,
+                is_claude=True,
+                readonly_subpaths=ro_hook_dirs,
+                readonly_subpaths_getter=lambda: claude_ro_subpaths_holder[0],
+                trusted_env=trusted_claude_env,
+                claude_plugins_enabled=bool(validated_claude_plugins),
+                claude_plugin_mounts=expected_claude_mounts,
+                prepared_plugin_runtime=prepared_claude_runtime,
+                prevalidated_sandbox_state=prevalidated_sb,
+                pre_spawn_check=_revalidate_claude_plugins_before_spawn,
+                refresh_plugin_runtime=_refresh_claude_runtime_after_queue,
+                on_cleanup=lambda: cleanup_prepared_plugin_runtime(claude_runtime_holder[0]),
+                session_id_override=gw_session_id,
+                session_workdirs=[resolved_cwd_claude, *session_ws_claude],
+            )
+        except BaseException:
+            cleanup_prepared_plugin_runtime(claude_runtime_holder[0])
             raise
 
     def get_session(

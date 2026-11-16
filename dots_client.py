@@ -33,7 +33,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 
 
 def load_client_config_file(explicit_path: Optional[str] = None) -> Dict[str, Any]:
-    """Load optional client credentials JSON from DOTS_GATEWAY_CLIENT_CONFIG, PLUGIN_DATA, or ~/.config."""
+    """Load optional client credentials JSON from DOTS_GATEWAY_CLIENT_CONFIG, PLUGIN_DATA / CLAUDE_PLUGIN_DATA, or ~/.config."""
     override = explicit_path or os.environ.get("DOTS_GATEWAY_CLIENT_CONFIG")
     if override:
         candidates: List[Path] = [Path(override).expanduser()]
@@ -41,6 +41,8 @@ def load_client_config_file(explicit_path: Optional[str] = None) -> Dict[str, An
         candidates = []
         if os.environ.get("PLUGIN_DATA"):
             candidates.append(Path(os.environ["PLUGIN_DATA"]).expanduser() / "client.json")
+        if os.environ.get("CLAUDE_PLUGIN_DATA"):
+            candidates.append(Path(os.environ["CLAUDE_PLUGIN_DATA"]).expanduser() / "client.json")
         candidates.append(Path.home() / ".config" / "dots-gateway" / "client.json")
         candidates.append(Path(__file__).resolve().parent / "client.json")
 
@@ -627,6 +629,88 @@ class DotsGatewayClient:
             payload["timeout"] = timeout
         yield from self._stream_sse("POST", "/v1/codex", payload, timeout=(timeout or 28800.0) + 30.0)
 
+    def run_claude(
+        self,
+        prompt: Optional[str] = None,
+        cwd: Optional[str] = None,
+        args: Optional[Sequence[str]] = None,
+        skip_permissions: bool = True,
+        permission_mode: Optional[str] = None,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        session_id: Optional[str] = None,
+        continue_last: bool = False,
+        output_format: Optional[str] = None,
+        add_dirs: Optional[Sequence[str]] = None,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Invoke `claude -p` on the gateway machine and return result."""
+        payload: Dict[str, Any] = {
+            "prompt": prompt,
+            "args": list(args or []),
+            "skip_permissions": skip_permissions,
+            "continue_last": continue_last,
+            "stream": False,
+        }
+        if cwd:
+            payload["cwd"] = cwd
+        if permission_mode:
+            payload["permission_mode"] = permission_mode
+        if model:
+            payload["model"] = model
+        if effort:
+            payload["effort"] = effort
+        if session_id:
+            payload["session_id"] = session_id
+        if output_format:
+            payload["output_format"] = output_format
+        if add_dirs:
+            payload["add_dirs"] = list(add_dirs)
+        if timeout is not None:
+            payload["timeout"] = timeout
+        return self._request_json("POST", "/v1/claude", payload, timeout=(timeout or 28800.0) + 30.0)
+
+    def stream_claude(
+        self,
+        prompt: Optional[str] = None,
+        cwd: Optional[str] = None,
+        args: Optional[Sequence[str]] = None,
+        skip_permissions: bool = True,
+        permission_mode: Optional[str] = None,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        session_id: Optional[str] = None,
+        continue_last: bool = False,
+        output_format: Optional[str] = "stream-json",
+        add_dirs: Optional[Sequence[str]] = None,
+        timeout: Optional[float] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """Invoke `claude -p` and stream real-time SSE events."""
+        payload: Dict[str, Any] = {
+            "prompt": prompt,
+            "args": list(args or []),
+            "skip_permissions": skip_permissions,
+            "continue_last": continue_last,
+            "stream": True,
+        }
+        if cwd:
+            payload["cwd"] = cwd
+        if permission_mode:
+            payload["permission_mode"] = permission_mode
+        if model:
+            payload["model"] = model
+        if effort:
+            payload["effort"] = effort
+        if session_id:
+            payload["session_id"] = session_id
+        if output_format:
+            payload["output_format"] = output_format
+        if add_dirs:
+            payload["add_dirs"] = list(add_dirs)
+        if timeout is not None:
+            payload["timeout"] = timeout
+        yield from self._stream_sse("POST", "/v1/claude", payload, timeout=(timeout or 28800.0) + 30.0)
+
     def create_session(self, **kwargs: Any) -> Dict[str, Any]:
         """Start an interactive session via REST (`POST /v1/sessions`)."""
         return self._request_json("POST", "/v1/sessions", kwargs)
@@ -999,6 +1083,25 @@ def main() -> int:
     p_codex.add_argument("--json", action="store_true", help="Emit JSONL events")
     p_codex.add_argument("--no-stream", action="store_true", help="Wait instead of streaming")
 
+    p_claude = sub.add_parser("claude", help="Run Anthropic Claude Code (`claude -p`) on the gateway")
+    p_claude.add_argument("prompt", help="Task prompt for Claude Code")
+    p_claude.add_argument("-m", "--model", default=None, help="Model override (e.g. sonnet, opus)")
+    p_claude.add_argument("-e", "--effort", default=None, help="Effort level (low|medium|high|max)")
+    p_claude.add_argument(
+        "--permission-mode",
+        default=None,
+        help="Claude permission mode when --no-skip-permissions is set (plan|acceptEdits|default)",
+    )
+    p_claude.add_argument(
+        "--no-skip-permissions",
+        action="store_true",
+        help="Disable --dangerously-skip-permissions and rely on --permission-mode",
+    )
+    p_claude.add_argument("--session", default=None, help="Resume Claude Code session UUID")
+    p_claude.add_argument("-c", "--continue-last", action="store_true", help="Resume last Claude session")
+    p_claude.add_argument("--output-format", default="text", help="Output format (text|json|stream-json)")
+    p_claude.add_argument("--no-stream", action="store_true", help="Wait instead of streaming")
+
     p_ls = sub.add_parser("ls", help="List remote workspace directory")
     p_ls.add_argument("path", nargs="?", default=".", help="Remote directory path")
     p_ls.add_argument("-r", "--recursive", action="store_true", help="Recursive listing")
@@ -1142,6 +1245,46 @@ def main() -> int:
             session_id=args.session,
             continue_last=args.continue_last,
             review=args.review,
+        ):
+            etype = ev.get("type")
+            if etype == "stdout":
+                sys.stdout.write(str(ev.get("data", "")))
+                sys.stdout.flush()
+            elif etype == "stderr":
+                sys.stderr.write(str(ev.get("data", "")))
+                sys.stderr.flush()
+            elif etype == "exit":
+                rc = int((ev.get("data") or {}).get("returncode") or 0)
+        return rc
+
+    if args.cmd == "claude":
+        skip_perms = not bool(args.no_skip_permissions)
+        if args.no_stream:
+            res = client.run_claude(
+                prompt=args.prompt,
+                cwd=args.cwd,
+                skip_permissions=skip_perms,
+                permission_mode=args.permission_mode,
+                model=args.model,
+                effort=args.effort,
+                session_id=args.session,
+                continue_last=args.continue_last,
+                output_format=args.output_format,
+            )
+            sys.stdout.write(res.get("stdout", ""))
+            sys.stderr.write(res.get("stderr", ""))
+            return int(res.get("returncode") or 0)
+        rc = 0
+        for ev in client.stream_claude(
+            prompt=args.prompt,
+            cwd=args.cwd,
+            skip_permissions=skip_perms,
+            permission_mode=args.permission_mode,
+            model=args.model,
+            effort=args.effort,
+            session_id=args.session,
+            continue_last=args.continue_last,
+            output_format=args.output_format,
         ):
             etype = ev.get("type")
             if etype == "stdout":

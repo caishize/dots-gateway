@@ -65,6 +65,27 @@ AGY_KNOWN_HOOK_EVENTS: Tuple[str, ...] = (
     "Notification",
 )
 
+CLAUDE_KNOWN_HOOK_EVENTS: Tuple[str, ...] = (
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Notification",
+    "SubagentStart",
+    "SubagentStop",
+    "Stop",
+    "TeammateIdle",
+    "TaskCompleted",
+    "ConfigChange",
+    "WorktreeCreate",
+    "WorktreeRemove",
+    "PreCompact",
+    "PostCompact",
+)
+
 CODEX_HOOK_EVENT_KEY_LABELS: Dict[str, str] = {
     "PreModelRequest": "pre_model_request",
     "PostModelRequest": "post_model_request",
@@ -165,7 +186,7 @@ class StagedPluginHookBundle:
 
 @dataclass(frozen=True)
 class PreparedAgentPluginRuntime:
-    """Prepared host staging artifacts mounted into a single `agy` or `codex` VFS session."""
+    """Prepared host staging artifacts mounted into a single `agy`, `codex`, or `claude` VFS session."""
 
     agent: str
     isolated_home_dir: str
@@ -175,6 +196,9 @@ class PreparedAgentPluginRuntime:
     host_sanitized_agy_settings: Optional[str] = None
     host_codex_config_toml: Optional[str] = None
     vfs_codex_home_dir: Optional[str] = None
+    host_sanitized_claude_settings: Optional[str] = None
+    host_sanitized_claude_json: Optional[str] = None
+    vfs_claude_config_dir: Optional[str] = None
     cleanup_dir: Optional[str] = None
 
 
@@ -769,7 +793,7 @@ def validate_plugin_hooks_manifest(
     allowed_events = (
         set(CODEX_HOOK_EVENT_KEY_LABELS.keys())
         if agent == "codex"
-        else set(AGY_KNOWN_HOOK_EVENTS)
+        else (set(CLAUDE_KNOWN_HOOK_EVENTS) if agent == "claude" else set(AGY_KNOWN_HOOK_EVENTS))
     )
 
     for event_name, groups in events_obj.items():
@@ -3163,6 +3187,179 @@ def prepare_codex_plugin_runtime(
         bundles=tuple(staged_bundles),
         host_codex_config_toml=str(out_codex_toml),
         vfs_codex_home_dir=vfs_codex_home,
+        cleanup_dir=str(session_bundle_root),
+    )
+
+
+def sanitize_host_claude_settings_file(
+    cfg: Optional[GatewayConfig],
+    out_path: Path,
+    *,
+    only_if_hooks_present: bool = False,
+    content_addressed: bool = False,
+) -> Optional[str]:
+    """Fail-closed inspect `~/.claude/settings.json` and write a hook/mcp-stripped copy."""
+    claude_dir = Path.home() / ".claude"
+    if claude_dir.is_symlink():
+        raise PermissionError(
+            redact_diagnostic_text(
+                f"Symlinked Claude config directory '{claude_dir}' is forbidden by security policy",
+                cfg,
+            )
+        )
+    host_settings = claude_dir / "settings.json"
+    if host_settings.is_symlink():
+        raise PermissionError(
+            redact_diagnostic_text(
+                f"Symlinked Claude settings file '{host_settings}' is forbidden by security policy",
+                cfg,
+            )
+        )
+    if not host_settings.exists():
+        return None
+    if not host_settings.is_file():
+        raise PermissionError(
+            redact_diagnostic_text(
+                f"Claude settings path '{host_settings}' must be a regular file",
+                cfg,
+            )
+        )
+    try:
+        s_data = json.loads(host_settings.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise PermissionError(
+            redact_diagnostic_text(f"Cannot parse '{host_settings}': {exc}", cfg)
+        ) from exc
+    if not isinstance(s_data, dict):
+        raise PermissionError(
+            redact_diagnostic_text(
+                f"Claude settings file '{host_settings}' must contain a JSON object",
+                cfg,
+            )
+        )
+    if only_if_hooks_present and "hooks" not in s_data and "mcpServers" not in s_data:
+        return None
+
+    cleaned = {
+        k: v
+        for k, v in s_data.items()
+        if k not in ("hooks", "mcpServers", "statusLine", "apiKeyHelper", "awsAuthRefresh")
+    }
+    rendered_bytes = (json.dumps(cleaned, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    _ensure_safe_dir(out_path.parent, mode=0o700)
+    target_file = out_path
+    if content_addressed:
+        digest = hashlib.sha256(rendered_bytes).hexdigest()[:16]
+        target_file = out_path.parent / f"claude_settings_{digest}.json"
+        if target_file.is_symlink():
+            raise PermissionError(f"Refusing symlinked sanitized Claude settings file '{target_file}'")
+        try:
+            if target_file.is_file() and target_file.read_bytes() == rendered_bytes:
+                return str(target_file)
+        except OSError:
+            pass
+    _atomic_write_file(target_file, rendered_bytes, mode=0o600)
+    return str(target_file)
+
+
+def sanitize_host_claude_json_file(
+    cfg: Optional[GatewayConfig],
+    out_path: Path,
+) -> str:
+    """Synthesize a clean `.claude.json` (`hasCompletedOnboarding=True`) with untrusted MCP/hooks stripped."""
+    base_data: Dict[str, Any] = {}
+    for cand_p in (Path.home() / ".claude" / ".claude.json", Path.home() / ".claude.json"):
+        if cand_p.is_symlink():
+            raise PermissionError(
+                redact_diagnostic_text(
+                    f"Symlinked Claude state file '{cand_p}' is forbidden by security policy",
+                    cfg,
+                )
+            )
+        if cand_p.is_file():
+            try:
+                parsed = json.loads(cand_p.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    base_data = parsed
+                    break
+            except Exception:
+                continue
+
+    cleaned: Dict[str, Any] = {}
+    for safe_k in ("oauthAccount", "userID", "theme", "hasCompletedOnboarding", "numStartups"):
+        if safe_k in base_data:
+            cleaned[safe_k] = base_data[safe_k]
+    cleaned["hasCompletedOnboarding"] = True
+    rendered = (json.dumps(cleaned, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    _ensure_safe_dir(out_path.parent, mode=0o700)
+    _atomic_write_file(out_path, rendered, mode=0o600)
+    return str(out_path)
+
+
+def prepare_claude_plugin_runtime(
+    cfg: GatewayConfig,
+    *,
+    validated_plugins: Sequence[Any],
+    sandbox_state_root: Path,
+    allowed_workspaces: Sequence[str],
+    masked_paths: Sequence[str],
+    readonly_subpaths: Sequence[str],
+    session_tag: Optional[str] = None,
+) -> PreparedAgentPluginRuntime:
+    """Prepare isolated `CLAUDE_CONFIG_DIR`, jailed `hooks/hooks.json`, and read-only plugin mounts for `claude`."""
+    runtime_root = os.path.abspath(str(cfg.agent_runtime_home_root or "/mnt/dots-agent-home").strip())
+    isolated_claude_home_user = os.path.join(runtime_root, "claude")
+    vfs_claude_cfg_dir = os.path.join(isolated_claude_home_user, ".claude")
+    bundles_root = sandbox_state_root / "plugin_bundles"
+    bin_dir = bundles_root / "_bin"
+    _ensure_safe_dir(bundles_root, mode=0o700)
+    _ensure_safe_dir(bin_dir, mode=0o755)
+    session_bundle_root = _prepare_session_bundle_root(bundles_root, session_tag)
+
+    state_root = Path(os.path.abspath(os.path.expanduser(effective_plugin_state_dir(cfg))))
+    _ensure_safe_dir(state_root, mode=0o700)
+
+    host_runner = _ensure_hook_jail_runner_binary(bin_dir)
+    vfs_runner = os.path.join(runtime_root, "bin", "dots-hook-jail.py")
+
+    staged_bundles: List[StagedPluginHookBundle] = []
+    for plg in validated_plugins:
+        hooks_rel: Optional[str] = plg.hooks_relpath
+        vfs_data_1 = os.path.join(vfs_claude_cfg_dir, "plugins", "data", plg.name)
+        bundle, _, _ = _prepare_single_plugin_bundle(
+            agent="claude",
+            plugin_name=plg.name,
+            source_dir=plg.source_dir,
+            vfs_discovery_dir=plg.vfs_discovery_dir,
+            hooks_relpath=hooks_rel,
+            bundles_root=session_bundle_root,
+            state_root=state_root,
+            agent_runtime_home_root=runtime_root,
+            vfs_runner_script=vfs_runner,
+            allowed_workspaces=allowed_workspaces,
+            masked_paths=masked_paths,
+            readonly_subpaths=readonly_subpaths,
+            plugin_version=getattr(plg, "version", "local"),
+            vfs_data_dirs=(vfs_data_1,),
+        )
+        staged_bundles.append(bundle)
+
+    out_settings = session_bundle_root / "claude" / "_sanitized_settings.json"
+    sanitized_settings = sanitize_host_claude_settings_file(
+        cfg, out_settings, only_if_hooks_present=False
+    )
+    out_cjson = session_bundle_root / "claude" / "_sanitized_claude.json"
+    sanitized_cjson = sanitize_host_claude_json_file(cfg, out_cjson)
+
+    return PreparedAgentPluginRuntime(
+        agent="claude",
+        isolated_home_dir=isolated_claude_home_user,
+        host_runner_script=str(host_runner),
+        vfs_runner_script=vfs_runner,
+        bundles=tuple(staged_bundles),
+        host_sanitized_claude_settings=sanitized_settings,
+        host_sanitized_claude_json=sanitized_cjson,
+        vfs_claude_config_dir=vfs_claude_cfg_dir,
         cleanup_dir=str(session_bundle_root),
     )
 

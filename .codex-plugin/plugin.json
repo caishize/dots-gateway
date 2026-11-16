@@ -1,8 +1,8 @@
 {
   "name": "dots-gateway",
-  "version": "1.5.24",
+  "version": "1.5.25",
   "license": "Apache-2.0",
-  "description": "Remote development, Antigravity (agy) & OpenAI Codex (codex) MCP plugin enabling OpenAI dots to inspect/edit local files, execute allowlisted dev commands, and run agy or codex.",
+  "description": "Remote development, Antigravity (agy), OpenAI Codex (codex) & Claude Code (claude) MCP plugin enabling AI agents to inspect/edit remote files, execute allowlisted dev commands, and run agy, codex, or claude.",
   "author": {
     "name": "caishize",
     "url": "https://github.com/caishize/dots-gateway"
@@ -11,7 +11,7 @@
   "mcpServers": "./mcp.json",
   "interface": {
     "displayName": "Dots Remote Dev Gateway",
-    "shortDescription": "Run local dev commands, edit workspace files, and invoke agy or codex via MCP",
+    "shortDescription": "Run local dev commands, edit workspace files, and invoke agy, codex, or claude via MCP",
     "category": "Development",
     "capabilities": ["Read", "Write"],
     "websiteURL": "https://github.com/caishize/dots-gateway"

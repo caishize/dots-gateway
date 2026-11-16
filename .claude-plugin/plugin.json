@@ -1,0 +1,20 @@
+{
+  "name": "dots-gateway",
+  "version": "1.5.25",
+  "license": "Apache-2.0",
+  "description": "Remote development, Antigravity (agy), OpenAI Codex (codex) & Claude Code (claude) MCP plugin enabling AI agents to inspect/edit remote files, execute allowlisted dev commands, and delegate tasks to agy, codex, or claude.",
+  "author": {
+    "name": "caishize",
+    "url": "https://github.com/caishize/dots-gateway"
+  },
+  "homepage": "https://github.com/caishize/dots-gateway",
+  "repository": "https://github.com/caishize/dots-gateway.git",
+  "skills": "./skills/",
+  "mcpServers": {
+    "dots-gateway": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dots_mcp.py"]
+    }
+  }
+}

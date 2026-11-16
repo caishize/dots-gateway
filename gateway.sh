@@ -24,10 +24,13 @@ CONFIG_FILE="${GATEWAY_CONFIG_FILE:-${GATEWAY_DIR}/config.json}"
 CLIENT_CONFIG_DIR="${GATEWAY_CLIENT_CONFIG_DIR:-${HOME}/.config/dots-gateway}"
 TUNNEL_ENV_FILE="${CLIENT_CONFIG_DIR}/tunnel.env"
 CODEX_ENV_FILE="${CLIENT_CONFIG_DIR}/codex.env"
+CLAUDE_ENV_FILE="${CLIENT_CONFIG_DIR}/claude.env"
 AGY_ENV_FILE="${CLIENT_CONFIG_DIR}/agy.env"
 AGY_MODEL_FILE="${CLIENT_CONFIG_DIR}/agy.model"
+CLAUDE_MODEL_FILE="${CLIENT_CONFIG_DIR}/claude.model"
 AGY_PLUGINS_FILE="${GATEWAY_AGY_PLUGINS_FILE:-${CLIENT_CONFIG_DIR}/agy-plugins.json}"
 CODEX_PLUGINS_FILE="${GATEWAY_CODEX_PLUGINS_FILE:-${CLIENT_CONFIG_DIR}/codex-plugins.json}"
+CLAUDE_PLUGINS_FILE="${GATEWAY_CLAUDE_PLUGINS_FILE:-${CLIENT_CONFIG_DIR}/claude-plugins.json}"
 DOCKER_MODE_FILE="${CLIENT_CONFIG_DIR}/docker.mode"
 DOCKER_PROXY_SOCKET="${CLIENT_CONFIG_DIR}/docker-proxy.sock"
 TUNNEL_HEALTH_URL="http://127.0.0.1:18766"
@@ -41,6 +44,16 @@ is_codex_auth_configured() {
     return 0
   fi
   if [[ -f "${CODEX_ENV_FILE}" ]] && grep -Eq '^(export[[:space:]]+)?(OPENAI|CODEX)_' "${CODEX_ENV_FILE}" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+is_claude_auth_configured() {
+  if [[ -f "${HOME}/.claude/.credentials.json" ]] && [[ $(wc -c < "${HOME}/.claude/.credentials.json" 2>/dev/null || echo 0) -gt 10 ]]; then
+    return 0
+  fi
+  if [[ -f "${CLAUDE_ENV_FILE}" ]] && grep -Eq '^(export[[:space:]]+)?(ANTHROPIC|CLAUDE_CODE)_' "${CLAUDE_ENV_FILE}" 2>/dev/null; then
     return 0
   fi
   return 1
@@ -147,11 +160,39 @@ if "codex_plugin_dirs" not in d:
 if not d.get("codex_plugins_file"):
     d["codex_plugins_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "codex-plugins.json")
     changed = True
+claude_bin = shutil.which("claude") or str(pathlib.Path.home() / ".local" / "bin" / "claude")
+if not d.get("claude_binary"):
+    d["claude_binary"] = claude_bin
+    changed = True
+if "claude_default_skip_permissions" not in d:
+    d["claude_default_skip_permissions"] = True
+    changed = True
+if not d.get("claude_default_permission_mode"):
+    d["claude_default_permission_mode"] = "bypassPermissions"
+    changed = True
+if not d.get("claude_env_file"):
+    d["claude_env_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "claude.env")
+    changed = True
+if not d.get("claude_model_file"):
+    d["claude_model_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "claude.model")
+    changed = True
+if "claude_plugins_enabled" not in d:
+    d["claude_plugins_enabled"] = False
+    changed = True
+if "claude_plugin_dirs" not in d:
+    d["claude_plugin_dirs"] = []
+    changed = True
+if not d.get("claude_plugins_file"):
+    d["claude_plugins_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "claude-plugins.json")
+    changed = True
 if d.get("sandbox_lock_timeout_seconds") is None:
     d["sandbox_lock_timeout_seconds"] = 5.0
     changed = True
 if d.get("max_concurrent_codex") is None or int(d.get("max_concurrent_codex") or 0) <= 2:
     d["max_concurrent_codex"] = 6
+    changed = True
+if d.get("max_concurrent_claude") is None or int(d.get("max_concurrent_claude") or 0) <= 0:
+    d["max_concurrent_claude"] = 4
     changed = True
 default_sb = "/mnt/data/dots-sandbox" if pathlib.Path("/mnt/data").is_dir() and os.access("/mnt/data", os.W_OK | os.X_OK) else (
     "/mnt/data/dots-sandbox" if pathlib.Path("/mnt/data/dots-sandbox").is_dir() and os.access("/mnt/data/dots-sandbox", os.W_OK | os.X_OK)
@@ -185,15 +226,25 @@ if d.get("agy_queue_timeout_seconds") is None or float(d.get("agy_queue_timeout_
     changed = True
 ac = d.get("allowed_commands")
 if isinstance(ac, list):
-    for c in ("codex", d["codex_binary"], "node", "npm", "npx", "pnpm", "pnpx", "corepack", "terraform", "trivy"):
+    for c in ("codex", d["codex_binary"], "claude", d["claude_binary"], "node", "npm", "npx", "pnpm", "pnpx", "corepack", "terraform", "trivy"):
         if c and c not in ac:
             ac.append(c)
             changed = True
 pp = d.get("protected_paths")
 codex_home = str(pathlib.Path.home() / ".codex")
-if isinstance(pp, list) and codex_home not in pp:
-    pp.append(codex_home)
-    changed = True
+claude_home = str(pathlib.Path.home() / ".claude")
+claude_json = str(pathlib.Path.home() / ".claude.json")
+if isinstance(pp, list):
+    for p_item in (codex_home, claude_home, claude_json):
+        if p_item not in pp:
+            pp.append(p_item)
+            changed = True
+oauth_hosts = d.get("oauth_allowed_redirect_hosts")
+if isinstance(oauth_hosts, list):
+    for oh in ("claude.com", "*.claude.com", "anthropic.com", "*.anthropic.com", "x.ai", "*.x.ai", "grok.com", "*.grok.com"):
+        if oh not in oauth_hosts:
+            oauth_hosts.append(oh)
+            changed = True
 if changed:
     cfg_p.write_text(json.dumps(d, indent=2) + "\n", encoding="utf-8")
     os.chmod(cfg_p, 0o600)
@@ -258,6 +309,7 @@ try:
                 os.path.join(rt_home_guard, "agy", ".gemini", "config", "plugins"),
                 *pol.get_configured_agy_plugin_paths(),
                 *pol.get_configured_codex_plugin_paths(),
+                *pol.get_configured_claude_plugin_paths(),
             ]
             merged_allow = []
             merged_seen = set()
@@ -506,18 +558,19 @@ min_d = d.get("sandbox_min_retention_days", 7)
 max_d = d.get("sandbox_max_retention_days", 30)
 max_agy = d.get("max_concurrent_agy", 3)
 max_cdx = d.get("max_concurrent_codex", 6)
+max_cld = d.get("max_concurrent_claude", 4)
 agt_to_h = float(d.get("agent_default_timeout_seconds", 28800.0)) / 3600.0
 max_to_h = float(d.get("max_timeout_seconds", 86400.0)) / 3600.0
 try:
     st = os.statvfs(sb_dir if os.path.exists(sb_dir) else os.path.dirname(sb_dir))
     free_gb = (st.f_frsize * st.f_bavail) / (1024 ** 3)
-    print(f"{sb_dir} (free={free_gb:.1f} GiB, retention={min_d:g}d..{max_d:g}d, agy={max_agy}, codex={max_cdx}, timeout={agt_to_h:g}h..{max_to_h:g}h)")
+    print(f"{sb_dir} (free={free_gb:.1f} GiB, retention={min_d:g}d..{max_d:g}d, agy={max_agy}, codex={max_cdx}, claude={max_cld}, timeout={agt_to_h:g}h..{max_to_h:g}h)")
 except OSError:
-    print(f"{sb_dir} (retention={min_d:g}d..{max_d:g}d, agy={max_agy}, codex={max_cdx}, timeout={agt_to_h:g}h..{max_to_h:g}h)")
+    print(f"{sb_dir} (retention={min_d:g}d..{max_d:g}d, agy={max_agy}, codex={max_cdx}, claude={max_cld}, timeout={agt_to_h:g}h..{max_to_h:g}h)")
 PY
 )"
   echo "  Sandbox Store    : ${sb_info}"
-  local agy_auth_summary codex_ver codex_auth_state
+  local agy_auth_summary codex_ver codex_auth_state claude_ver claude_auth_state
   agy_auth_summary="$(python3 - "${AGY_ENV_FILE}" <<'PY'
 import pathlib, sys
 env_p = pathlib.Path(sys.argv[1])
@@ -549,9 +602,22 @@ PY
   else
     codex_auth_state="auth=pending (run 'dots-gateway codex-setup')"
   fi
-  echo "  Local Agents     : agy (${agy_auth_summary}, model=$(current_agy_model_label)) + ${codex_ver} (${codex_auth_state})"
+  if command -v claude >/dev/null 2>&1; then
+    claude_ver="$(claude --version 2>/dev/null | head -n1 || echo 'claude')"
+  elif [[ -x "${HOME}/.local/bin/claude" ]]; then
+    claude_ver="$("${HOME}/.local/bin/claude" --version 2>/dev/null | head -n1 || echo 'claude')"
+  else
+    claude_ver="claude: not installed"
+  fi
+  if is_claude_auth_configured; then
+    claude_auth_state="auth=configured, model=$(current_claude_model_label)"
+  else
+    claude_auth_state="auth=pending (run 'dots-gateway claude-setup')"
+  fi
+  echo "  Local Agents     : agy (${agy_auth_summary}, model=$(current_agy_model_label)) | ${codex_ver} (${codex_auth_state}) | ${claude_ver} (${claude_auth_state})"
   echo "  AGY Plugins      : $(agy_plugins_summary)"
   echo "  Codex Plugins    : $(codex_plugins_summary)"
+  echo "  Claude Plugins   : $(claude_plugins_summary)"
   echo "  Docker Access    : $(docker_access_summary)"
 
   if is_tunnel_configured; then
@@ -713,12 +779,14 @@ try:
         exe0 = os.path.basename(argv[0]) if argv else ""
         is_agy = bool(det.get("session_kind") == "agy" or exe0 == "agy")
         is_codex = bool(det.get("session_kind") == "codex" or exe0 == "codex")
+        is_claude = bool(det.get("session_kind") == "claude" or exe0 == "claude")
         rec = {
             "schema_version": 1,
             "session_id": sid,
-            "session_kind": "agy" if is_agy else ("codex" if is_codex else "exec"),
+            "session_kind": "agy" if is_agy else ("codex" if is_codex else ("claude" if is_claude else "exec")),
             "is_agy": is_agy,
             "is_codex": is_codex,
+            "is_claude": is_claude,
             "status": det.get("status") or "completed",
             "pid": det.get("pid"),
             "boot_id": boot_id,
@@ -934,6 +1002,155 @@ cmd_codex_setup() {
     codex login status || true
   fi
   echo "✅ Codex CLI 凭证已安全保存至 ${CODEX_ENV_FILE} (0600) 及 ~/.codex/auth.json (即时生效，无需重启网关)。"
+}
+
+cmd_claude_setup() {
+  ensure_local_client_json
+  mkdir -p "${CLIENT_CONFIG_DIR}" "${HOME}/.claude"
+  chmod 700 "${CLIENT_CONFIG_DIR}" "${HOME}/.claude"
+
+  local subcmd="${1:-}"
+  if [[ "${subcmd}" == "status" || "${subcmd}" == "show" || "${subcmd}" == "info" ]]; then
+    echo "============================================================================"
+    echo "  Anthropic Claude Code CLI (claude) Authentication Status"
+    echo "============================================================================"
+    echo "  Hot-Reload Env   : ${CLAUDE_ENV_FILE} ($( [[ -f "${CLAUDE_ENV_FILE}" ]] && echo "present" || echo "absent" ))"
+    echo "  OAuth Credentials: ~/.claude/.credentials.json ($( [[ -f "${HOME}/.claude/.credentials.json" ]] && echo "present" || echo "absent" ))"
+    echo "  Default Model    : $(current_claude_model_label)"
+    echo "  Auth Ready       : $( is_claude_auth_configured && echo "yes" || echo "no (run '${PROG_NAME} claude-setup' or 'claude auth login')" )"
+    echo "============================================================================"
+    return 0
+  fi
+
+  if [[ "${subcmd}" == "clear" || "${subcmd}" == "reset" || "${subcmd}" == "oauth" ]]; then
+    rm -f "${CLAUDE_ENV_FILE}"
+    echo "✅ 已清除 ${CLAUDE_ENV_FILE}，run_claude 将自动回退使用本机 ~/.claude/.credentials.json (OAuth 登录态) — 即时生效，无需重启！"
+    return 0
+  fi
+
+  local var_ant="ANTHROPIC_API""_KEY"
+  local var_base="ANTHROPIC_BASE_URL"
+  local var_oauth="CLAUDE_CODE_OAUTH_""TOKEN"
+  local ant_val="${!var_ant:-}"
+  local base_val="${!var_base:-}"
+  local oauth_val="${!var_oauth:-}"
+
+  if [[ -z "${ant_val}" && -z "${oauth_val}" ]]; then
+    read -rsp "请输入用于本机 Claude Code CLI 的 Anthropic API Key (或 OAuth Token，输入不回显): " ant_val
+    echo ""
+  fi
+  ant_val="$(printf "%s" "${ant_val}" | tr -d '[:space:]')"
+  oauth_val="$(printf "%s" "${oauth_val}" | tr -d '[:space:]')"
+  if [[ -z "${ant_val}" && -z "${oauth_val}" ]]; then
+    echo "ERROR: 凭证不能为空 (如使用本机交互式 OAuth 登录，请直接运行 'claude auth login')。" >&2
+    exit 1
+  fi
+
+  if [[ -z "${base_val}" && -t 0 ]]; then
+    read -rp "可选自定义 ANTHROPIC_BASE_URL (默认使用 Anthropic 官方接口，直接回车跳过): " base_val
+    base_val="$(printf "%s" "${base_val}" | tr -d '[:space:]')"
+  fi
+
+  umask 077
+  {
+    printf "# Isolated Anthropic Claude Code CLI environment (0600, injected only into run_claude)\n"
+    if [[ -n "${ant_val}" ]]; then
+      printf "%s=%s\n" "${var_ant}" "${ant_val}"
+    fi
+    if [[ -n "${oauth_val}" ]]; then
+      printf "%s=%s\n" "${var_oauth}" "${oauth_val}"
+    fi
+    if [[ -n "${base_val}" ]]; then
+      printf "%s=%s\n" "${var_base}" "${base_val}"
+    fi
+  } > "${CLAUDE_ENV_FILE}"
+  chmod 600 "${CLAUDE_ENV_FILE}"
+
+  echo "✅ Claude Code CLI 凭证已安全保存至 ${CLAUDE_ENV_FILE} (0600，仅向 run_claude 注入，即时生效，无需重启网关)。"
+}
+
+current_claude_model_label() {
+  python3 - "${CLAUDE_MODEL_FILE}" "${CONFIG_FILE}" <<'PY'
+import json, pathlib, sys
+mf = pathlib.Path(sys.argv[1])
+if mf.is_file():
+    for ln in mf.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = ln.strip()
+        if s and not s.startswith("#"):
+            print(s)
+            raise SystemExit(0)
+try:
+    d = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+    m = str(d.get("claude_default_model") or "").strip()
+    if m:
+        print(f"{m} (config.json)")
+        raise SystemExit(0)
+except (OSError, ValueError):
+    pass
+sp = pathlib.Path.home() / ".claude" / "settings.json"
+try:
+    m = str(json.loads(sp.read_text(encoding="utf-8")).get("model") or "").strip()
+except (OSError, ValueError):
+    m = ""
+print(f"follow-claude-settings{f': {m}' if m else ''}")
+PY
+}
+
+cmd_claude_model() {
+  ensure_local_client_json
+  mkdir -p "${CLIENT_CONFIG_DIR}"
+  chmod 700 "${CLIENT_CONFIG_DIR}"
+
+  local subcmd="${1:-status}"
+  local target="${2:-}"
+
+  case "${subcmd}" in
+    status|show|info)
+      echo "============================================================================"
+      echo "  Anthropic Claude Code CLI Gateway Default Model (Hot-Reload / 免重启切换)"
+      echo "============================================================================"
+      echo "  Default Model    : $(current_claude_model_label)"
+      echo "  Hot-Reload File  : ${CLAUDE_MODEL_FILE}"
+      echo "  优先级           : run_claude 的 model 参数 > claude.model > config.json claude_default_model > ~/.claude/settings.json"
+      echo "----------------------------------------------------------------------------"
+      echo "  快速切换命令 (即时生效，无需重启网关):"
+      echo "    ${PROG_NAME} claude-model set <MODEL_ID>  # 例如 sonnet / opus / claude-sonnet-4-6"
+      echo "    ${PROG_NAME} claude-model reset           # 清除网关默认值, 跟随本地 ~/.claude/settings.json"
+      echo "    ${PROG_NAME} claude-model status          # 查看当前默认模型"
+      echo "============================================================================"
+      return 0
+      ;;
+    set|use)
+      ;;
+    reset|clear|default|unset)
+      rm -f "${CLAUDE_MODEL_FILE}"
+      echo "✅ 已清除网关默认 Claude 模型，run_claude 未指定 model 时将跟随本地设置 ($(current_claude_model_label)) — 即时生效，无需重启！"
+      return 0
+      ;;
+    *)
+      target="${subcmd}"
+      ;;
+  esac
+
+  target="$(printf "%s" "${target}" | tr -d '[:space:]')"
+  if [[ -z "${target}" ]]; then
+    echo "ERROR: 请指定模型 ID，例如: ${PROG_NAME} claude-model set sonnet" >&2
+    exit 1
+  fi
+  if [[ ! "${target}" =~ ^[A-Za-z0-9._:\[\]-]{1,128}$ ]]; then
+    echo "ERROR: 模型 ID '${target}' 含非法字符。" >&2
+    exit 1
+  fi
+
+  umask 077
+  local tmp_f="${CLAUDE_MODEL_FILE}.tmp.$$"
+  {
+    printf "# Gateway default Claude Code model (managed by 'dots-gateway claude-model', hot-reloaded per run_claude)\n"
+    printf "%s\n" "${target}"
+  } > "${tmp_f}"
+  chmod 600 "${tmp_f}"
+  mv -f "${tmp_f}" "${CLAUDE_MODEL_FILE}"
+  echo "✅ 网关默认 Claude Code 模型已设置为 [${target}] — 即时生效，无需重启！"
 }
 
 cmd_agy_auth() {
@@ -2418,6 +2635,475 @@ _err(
 PY
 }
 
+claude_plugins_summary() {
+  python3 - "${CONFIG_FILE}" "${GATEWAY_DIR}" "${CLAUDE_PLUGINS_FILE}" <<'PY' 2>/dev/null || echo "off (default)"
+import os, pathlib, sys
+cfg_p = pathlib.Path(sys.argv[1])
+gw_dir = sys.argv[2]
+pf_override = sys.argv[3]
+if gw_dir not in sys.path:
+    sys.path.insert(0, gw_dir)
+if pf_override:
+    os.environ.setdefault("GATEWAY_CLAUDE_PLUGINS_FILE", pf_override)
+from gateway.config import GatewayConfig
+from gateway.policy import CommandPolicy
+
+cfg = GatewayConfig.load(cfg_p) if cfg_p.is_file() else GatewayConfig(claude_plugins_file=pf_override)
+info = CommandPolicy(cfg).get_claude_plugins_info()
+status = info.get("status")
+plugins = info.get("plugins") or []
+cfg_dirs = info.get("configured_dirs") or []
+if status == "active":
+    names = ", ".join(f"{p['name']}(ro)" for p in plugins)
+    print(f"on [{names}] (source={info.get('source')})")
+elif status == "error":
+    print(f"ERROR ({info.get('error')})")
+else:
+    if cfg_dirs:
+        print(f"off ({len(cfg_dirs)} registered dir(s) staged; run 'dots-gateway claude-plugins on')")
+    else:
+        print("off (default; isolated)")
+PY
+}
+
+cmd_claude_plugins() {
+  mkdir -p "${CLIENT_CONFIG_DIR}"
+  chmod 700 "${CLIENT_CONFIG_DIR}" 2>/dev/null || true
+
+  python3 - "${CONFIG_FILE}" "${GATEWAY_DIR}" "${CLAUDE_PLUGINS_FILE}" "${PROG_NAME}" "$@" <<'PY'
+import dataclasses
+import errno
+import fcntl
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+cfg_path = pathlib.Path(sys.argv[1])
+gw_dir = sys.argv[2]
+plugins_file_arg = sys.argv[3]
+prog_name = sys.argv[4]
+cli_args = sys.argv[5:]
+
+if gw_dir not in sys.path:
+    sys.path.insert(0, gw_dir)
+if plugins_file_arg:
+    os.environ["GATEWAY_CLAUDE_PLUGINS_FILE"] = plugins_file_arg
+
+from gateway.config import GatewayConfig, claude_plugins_config_state, redact_diagnostic_text
+from gateway.hook_jail import prepare_claude_plugin_runtime
+from gateway.policy import CommandPolicy
+from gateway.sandbox import (
+    build_mount_ns_argv,
+    can_use_mount_namespace,
+    prepare_sandbox_runtime_state,
+)
+
+cfg = (
+    GatewayConfig.load(cfg_path)
+    if cfg_path.is_file()
+    else GatewayConfig(claude_plugins_file=plugins_file_arg)
+)
+if plugins_file_arg:
+    cfg.claude_plugins_file = plugins_file_arg
+
+plugins_file = pathlib.Path(os.path.abspath(os.path.expanduser(cfg.claude_plugins_file)))
+lock_timeout = max(0.05, float(cfg.sandbox_lock_timeout_seconds or 5.0))
+
+
+def _err(msg: str, code: int = 1) -> "None":
+    safe = redact_diagnostic_text(str(msg), cfg)
+    print(f"ERROR: {safe}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def _acquire_file_lock(lock_path: pathlib.Path) -> int:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(lock_path.parent, 0o700)
+    except OSError:
+        pass
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(lock_path), flags, 0o600)
+    except OSError as exc:
+        _err(f"Cannot open Claude plugin registry lock '{lock_path}': {exc}")
+    deadline = time.monotonic() + lock_timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                os.close(fd)
+                _err(f"flock failed on '{lock_path}': {exc}")
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                _err(
+                    f"Timed out after {lock_timeout:.2f}s waiting for Claude plugin registry lock '{lock_path}'"
+                )
+            time.sleep(0.05)
+
+
+def _write_plugins_state_atomic(enabled: bool, dirs: list[str]) -> None:
+    plugins_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(plugins_file.parent, 0o700)
+    except OSError:
+        pass
+    if plugins_file.is_symlink():
+        _err(f"Refusing to write symlinked claude_plugins_file '{plugins_file}'")
+    payload = {
+        "schema_version": 1,
+        "enabled": bool(enabled),
+        "plugin_dirs": list(dirs),
+    }
+    tmp_p = plugins_file.parent / f".{plugins_file.name}.tmp.{os.getpid()}"
+    try:
+        if tmp_p.exists() or tmp_p.is_symlink():
+            tmp_p.unlink()
+        tmp_p.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.chmod(tmp_p, 0o600)
+        os.replace(tmp_p, plugins_file)
+    except OSError as exc:
+        try:
+            tmp_p.unlink(missing_ok=True)
+        except OSError:
+            pass
+        _err(f"Failed to write '{plugins_file}': {exc}")
+
+
+def _validate_candidate_dirs(cand_dirs: list[str]) -> list:
+    probe_cfg = dataclasses.replace(
+        cfg,
+        claude_plugins_enabled=True,
+        claude_plugin_dirs=list(cand_dirs),
+        claude_plugins_file=str(plugins_file.parent / f".nonexistent-claude-probe-{os.getpid()}.json"),
+    )
+    pol = CommandPolicy(probe_cfg)
+    return pol.validate_claude_plugins(require_mount_ns_check=False)
+
+
+def _print_status() -> None:
+    pol = CommandPolicy(cfg)
+    info = pol.get_claude_plugins_info()
+    print("============================================================================")
+    print("  Anthropic Claude Code CLI Trusted Read-Only Plugins (Hot-Reload / 免重启管理)")
+    print("============================================================================")
+    print(f"  Status           : {info.get('status')} (enabled={info.get('enabled')})")
+    print(f"  Config Source    : {info.get('source')}")
+    print(f"  Hot-Reload File  : {info.get('plugins_file')}")
+    print(f"  Runtime Home     : {info.get('agent_runtime_home_root')} (隔离 CLAUDE_CONFIG_DIR 发现根)")
+    print(f"  Plugin State Dir : {info.get('plugin_state_dir')} (CLAUDE_PLUGIN_DATA 与 Hook 临时态专用)")
+    cfg_dirs = info.get("configured_dirs") or []
+    if cfg_dirs:
+        print(f"  Registered Dirs  : {len(cfg_dirs)}")
+        for idx, d in enumerate(cfg_dirs, 1):
+            print(f"    {idx}) {d}")
+    else:
+        print("  Registered Dirs  : <none> (默认关闭，与原行为完全一致)")
+    active_plgs = info.get("plugins") or []
+    if active_plgs:
+        print("  Active Mappings  :")
+        for p in active_plgs:
+            print(
+                f"    - {p['name']} v{p['version']} [{p['mode']}, {p['manifest']}, hook-jail=enforced]: "
+                f"{p['source_dir']} -> {p['vfs_discovery_dir']}"
+            )
+    if info.get("error"):
+        print(f"  Policy Error     : {info.get('error')}")
+    print("----------------------------------------------------------------------------")
+    print("  运维命令 (仅限宿主管理员操作，任务不可动态覆盖；即时生效，无需重启网关):")
+    print(f"    {prog_name} claude-plugins add <PLUGIN_DIR> [--enable] # 校验并登记可信 Claude 插件目录")
+    print(f"    {prog_name} claude-plugins on                          # 开启已登记插件只读挂载与 Hook 沙箱")
+    print(f"    {prog_name} claude-plugins off                         # 一键关闭插件能力并回滚至隔离态")
+    print(f"    {prog_name} claude-plugins remove <PLUGIN_DIR>         # 移除单个插件目录")
+    print(f"    {prog_name} claude-plugins clear                       # 清空登记并恢复默认关闭态")
+    print(f"    {prog_name} claude-plugins doctor                      # 执行目录边界、Hook 沙箱与只读自检")
+    print("============================================================================")
+
+
+subcmd = cli_args[0].strip().lower() if cli_args else "status"
+rest = cli_args[1:]
+
+if subcmd in ("status", "show", "info", "list", "ls"):
+    _print_status()
+    raise SystemExit(0)
+
+if subcmd in ("add", "register"):
+    enable_now = False
+    raw_targets: list[str] = []
+    for tok in rest:
+        if tok in ("--enable", "-e", "--on"):
+            enable_now = True
+        else:
+            raw_targets.append(tok)
+    if len(raw_targets) != 1 or not raw_targets[0].strip():
+        _err(f"Usage: {prog_name} claude-plugins add <PLUGIN_DIR> [--enable]")
+    cand = os.path.abspath(os.path.expanduser(raw_targets[0].strip()))
+
+    lock_fd = _acquire_file_lock(plugins_file.parent / f".{plugins_file.name}.lock")
+    try:
+        state = claude_plugins_config_state(cfg)
+        if state.get("config_error"):
+            _err(f"Existing claude-plugins registry is corrupted: {state['config_error']}")
+        cur_dirs = [os.path.abspath(os.path.expanduser(x)) for x in (state.get("raw_dirs") or [])]
+        new_dirs = list(cur_dirs)
+        if cand not in new_dirs:
+            new_dirs.append(cand)
+        try:
+            validated = _validate_candidate_dirs(new_dirs)
+        except Exception as exc:
+            _err(str(exc))
+        new_enabled = True if enable_now else bool(state.get("enabled"))
+        _write_plugins_state_atomic(new_enabled, new_dirs)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+    names = ", ".join(p.name for p in validated)
+    print(f"✅ 已通过安全边界与 Hook 清单校验并登记 Claude Code 插件目录: {cand} (plugins: {names})")
+    if not new_enabled:
+        print(f"💡 当前处于默认关闭态，确认无误后执行 '{prog_name} claude-plugins on' 即可免重启启用。")
+    else:
+        print("✅ Claude Code 隔离发现 (--plugin-dir)、只读挂载与 Hook 沙箱已即时生效 (无需重启网关)。")
+    raise SystemExit(0)
+
+if subcmd in ("on", "enable"):
+    lock_fd = _acquire_file_lock(plugins_file.parent / f".{plugins_file.name}.lock")
+    try:
+        state = claude_plugins_config_state(cfg)
+        if state.get("config_error"):
+            _err(state["config_error"])
+        cur_dirs = [os.path.abspath(os.path.expanduser(x)) for x in (state.get("raw_dirs") or [])]
+        if not cur_dirs:
+            _err(
+                f"尚未登记任何插件目录；请先执行 '{prog_name} claude-plugins add <PLUGIN_DIR>' 再启用。"
+            )
+        try:
+            validated = _validate_candidate_dirs(cur_dirs)
+        except Exception as exc:
+            _err(str(exc))
+        _write_plugins_state_atomic(True, cur_dirs)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+    names = ", ".join(f"{p.name} -> {p.vfs_discovery_dir}" for p in validated)
+    print(f"✅ Claude Code 已登记插件已启用 [{names}] — 新 run_claude 会话即时生效，无需重启！")
+    raise SystemExit(0)
+
+if subcmd in ("off", "disable"):
+    lock_fd = _acquire_file_lock(plugins_file.parent / f".{plugins_file.name}.lock")
+    try:
+        state = claude_plugins_config_state(cfg)
+        cur_dirs = (
+            [os.path.abspath(os.path.expanduser(x)) for x in (state.get("raw_dirs") or [])]
+            if not state.get("config_error")
+            else []
+        )
+        _write_plugins_state_atomic(False, cur_dirs)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    print("✅ Claude Code 插件挂载已关闭并回滚至隔离状态 — 新会话即时生效，无需重启！")
+    raise SystemExit(0)
+
+if subcmd in ("remove", "rm", "del", "unregister"):
+    if len(rest) != 1 or not rest[0].strip():
+        _err(f"Usage: {prog_name} claude-plugins remove <PLUGIN_DIR>")
+    target = os.path.abspath(os.path.expanduser(rest[0].strip()))
+    lock_fd = _acquire_file_lock(plugins_file.parent / f".{plugins_file.name}.lock")
+    try:
+        state = claude_plugins_config_state(cfg)
+        if state.get("config_error"):
+            _err(state["config_error"])
+        cur_dirs = [os.path.abspath(os.path.expanduser(x)) for x in (state.get("raw_dirs") or [])]
+        new_dirs = [d for d in cur_dirs if d != target]
+        if len(new_dirs) == len(cur_dirs):
+            _err(f"Claude plugin directory '{target}' is not registered")
+        new_enabled = bool(state.get("enabled")) and bool(new_dirs)
+        if new_enabled:
+            try:
+                _validate_candidate_dirs(new_dirs)
+            except Exception as exc:
+                _err(str(exc))
+        _write_plugins_state_atomic(new_enabled, new_dirs)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    print(f"✅ 已移除 Claude 插件目录: {target} (enabled={new_enabled})")
+    raise SystemExit(0)
+
+if subcmd in ("clear", "reset"):
+    lock_fd = _acquire_file_lock(plugins_file.parent / f".{plugins_file.name}.lock")
+    try:
+        if cfg.claude_plugins_enabled or cfg.claude_plugin_dirs:
+            _write_plugins_state_atomic(False, [])
+        else:
+            try:
+                if plugins_file.is_symlink() or plugins_file.exists():
+                    plugins_file.unlink()
+            except OSError as exc:
+                _err(f"Failed to remove '{plugins_file}': {exc}")
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    print("✅ 已清空已登记 Claude 插件并恢复默认关闭态 — 即时生效，无需重启！")
+    raise SystemExit(0)
+
+if subcmd in ("doctor", "check", "verify"):
+    from gateway.config import effective_plugin_state_dir
+    from gateway.hook_jail import cleanup_prepared_plugin_runtime
+
+    require_mns = "--require-mount-ns" in rest
+    state = claude_plugins_config_state(cfg)
+    if state.get("config_error"):
+        _err(f"[1/4] 配置状态检查失败: {state['config_error']}")
+    enabled = bool(state.get("enabled"))
+    raw_dirs = [os.path.abspath(os.path.expanduser(x)) for x in (state.get("raw_dirs") or [])]
+    print(f"[1/4] 配置状态检查通过: enabled={enabled}, source={state.get('source')}, dirs={len(raw_dirs)}")
+
+    try:
+        sb_root = prepare_sandbox_runtime_state(
+            cfg.sandbox_state_dir,
+            lock_timeout_seconds=lock_timeout,
+            forbidden_roots=raw_dirs,
+        )
+    except Exception as exc:
+        _err(f"[2/4] 沙箱运行态与锁健康检查失败: {exc}")
+    print(f"[2/4] 沙箱运行态与锁健康检查通过: {sb_root} (tmp 写入探针正常)")
+
+    validated = []
+    prepared_rt = None
+    probe_pol = CommandPolicy(cfg)
+    try:
+        if raw_dirs:
+            try:
+                validated = _validate_candidate_dirs(raw_dirs)
+            except Exception as exc:
+                _err(f"[3/4] 插件三类目录隔离、符号链接与 Hook 清单检查失败: {exc}")
+            probe_active_cfg = dataclasses.replace(
+                cfg,
+                claude_plugins_enabled=True,
+                claude_plugin_dirs=list(raw_dirs),
+                claude_plugins_file=str(plugins_file.parent / f".nonexistent-claude-doc-{os.getpid()}.json"),
+            )
+            probe_pol = CommandPolicy(probe_active_cfg)
+            try:
+                probe_cwd_abs = os.path.abspath(os.path.expanduser(cfg.default_workdir))
+                prepared_rt = prepare_claude_plugin_runtime(
+                    probe_active_cfg,
+                    validated_plugins=validated,
+                    sandbox_state_root=sb_root,
+                    allowed_workspaces=[probe_cwd_abs, *probe_pol._allowed_roots],
+                    masked_paths=[str(pathlib.Path(gw_dir).resolve()), *cfg.protected_paths],
+                    readonly_subpaths=[],
+                )
+            except Exception as exc:
+                _err(f"[3/4] Claude 隔离 settings.json 与 Hook 沙箱打包失败: {exc}")
+            print(
+                "[3/4] 三类目录边界、隔离 CLAUDE_CONFIG_DIR 与 Hook 沙箱重写检查通过: "
+                + ", ".join(f"{p.name}({p.source_dir} -> {p.vfs_discovery_dir})" for p in validated)
+            )
+        else:
+            if enabled:
+                _err("[3/4] claude_plugins_enabled=true 但未配置任何插件目录")
+            print("[3/4] 当前未登记 Claude 插件目录 (默认关闭态兼容校验通过)")
+
+        mns_ok = can_use_mount_namespace()
+        if not mns_ok:
+            if require_mns:
+                _err("[4/4] 当前内核/容器环境不支持 unshare --user --mount")
+            print("[4/4] 内核挂载命名空间探针跳过 (当前环境 unshare 受容器 seccomp 限制)")
+            raise SystemExit(0)
+
+        if validated and prepared_rt is not None:
+            import shlex
+            mount_pairs = [(p.name, p.source_dir) for p in validated]
+            nested_hook_cfgs = []
+            for b in prepared_rt.bundles:
+                jdir = pathlib.Path(b.host_jail_config_dir)
+                existing_cfgs = sorted(jdir.glob("*.json")) if jdir.is_dir() else []
+                if existing_cfgs:
+                    probe_payload = json.loads(existing_cfgs[0].read_text(encoding="utf-8"))
+                    probe_payload["event_name"] = "SessionStart"
+                    probe_payload["resolved_argv"] = ["/bin/true"]
+                    pfile = jdir / "__doctor_probe.json"
+                    pfile.write_text(json.dumps(probe_payload, indent=2) + "\n", encoding="utf-8")
+                    os.chmod(pfile, 0o644)
+                    nested_hook_cfgs.append(os.path.join(b.vfs_jail_config_dir, "__doctor_probe.json"))
+            hook_probe_lines = "".join(
+                f"python3 -I {shlex.quote(prepared_rt.vfs_runner_script)} --config {shlex.quote(hc)} < /dev/null\n"
+                for hc in nested_hook_cfgs
+            )
+            probe_script = (
+                "set -eu\n"
+                "for d in \"$@\"; do\n"
+                "  [ -d \"$d\" ] || { echo \"missing:$d\" >&2; exit 21; }\n"
+                "  if ( : > \"$d/.dots_ro_probe\" ) 2>/dev/null; then\n"
+                "    rm -f \"$d/.dots_ro_probe\" 2>/dev/null || true\n"
+                "    echo \"writable:$d\" >&2; exit 22;\n"
+                "  fi\n"
+                "done\n"
+                "if [ -e \"$HOME/.config/dots-gateway/config.json\" ] || [ -e \"$HOME/.config/dots-gateway/tunnel.env\" ]; then\n"
+                "  echo 'secret_exposed' >&2; exit 23;\n"
+                "fi\n"
+                + hook_probe_lines
+            )
+            check_targets = []
+            for p in validated:
+                check_targets.extend([p.source_dir, p.vfs_discovery_dir])
+            probe_cwd = pathlib.Path(cfg.default_workdir).expanduser()
+            probe_cwd.mkdir(parents=True, exist_ok=True)
+            ns_argv = build_mount_ns_argv(
+                ["/bin/sh", "-c", probe_script, "sh", *check_targets],
+                cwd=str(probe_cwd),
+                allowed_workdirs=cfg.allowed_workdirs,
+                protected_paths=cfg.protected_paths,
+                is_claude=True,
+                sandbox_state_dir=cfg.sandbox_state_dir,
+                claude_plugins_enabled=True,
+                claude_plugin_mounts=mount_pairs,
+                prepared_plugin_runtime=prepared_rt,
+                agent_runtime_home_root=cfg.agent_runtime_home_root,
+                masked_plugin_paths=probe_pol.get_configured_claude_plugin_paths(),
+                sandbox_lock_timeout_seconds=lock_timeout,
+                plugin_state_dir=effective_plugin_state_dir(cfg),
+            )
+            proc = subprocess.run(ns_argv, capture_output=True, text=True, timeout=15)
+            if proc.returncode != 0:
+                _err(
+                    f"[4/4] 真实沙箱 VFS 只读挂载与嵌套 Hook 沙箱探针失败 (rc={proc.returncode}): "
+                    f"{proc.stderr.strip() or proc.stdout.strip()}"
+                )
+            print("[4/4] 真实沙箱 VFS 隔离 CLAUDE_CONFIG_DIR、嵌套 Hook 沙箱、只读挂载与凭据屏蔽探针通过")
+        else:
+            print("[4/4] 内核 unshare --user --mount 可用")
+        raise SystemExit(0)
+    finally:
+        cleanup_prepared_plugin_runtime(prepared_rt)
+
+_err(
+    f"未知的 claude-plugins 子命令 '{subcmd}' (可选: status | add | on | off | remove | clear | doctor)"
+)
+PY
+}
+
 cmd_config() {
   (cd "${GATEWAY_DIR}" && python3 main.py --print-plugin-config)
 }
@@ -2450,9 +3136,12 @@ Dots Gateway & Secure MCP Tunnel 运维管理命令行 (${PROG_NAME})
   agy-auth [mode]      免重启切换 Antigravity CLI 认证方式: adc [PROJECT_ID] | oauth | toggle | status
   agy-model [cmd]      免重启切换网关 agy 默认模型: list | set <MODEL_ID> | reset | status
   agy-plugins [cmd]    免重启管理隔离只读 AGY 插件与 Hook 沙箱: status | add <DIR> | on | off | remove | clear | doctor
-  codex-plugins [cmd]  免重启管理隔离只读 Codex 插件与 Hook 沙箱: status | add <DIR> | on | off | remove | clear | doctor
-  docker [cmd]         免重启开关沙箱 Docker 访问 (策略过滤代理): on | off | toggle | status | test
   codex-setup          交互式配置本机 OpenAI Codex CLI 的 API Key (0600 隔离存储，即时生效)
+  codex-plugins [cmd]  免重启管理隔离只读 Codex 插件与 Hook 沙箱: status | add <DIR> | on | off | remove | clear | doctor
+  claude-setup [cmd]   交互式配置本机 Anthropic Claude Code CLI 凭证 (status | clear，0600 隔离存储，即时生效)
+  claude-model [cmd]   免重启切换网关 Claude Code 默认模型: set <MODEL_ID> | reset | status
+  claude-plugins [cmd] 免重启管理隔离只读 Claude Code 插件与 Hook 沙箱: status | add <DIR> | on | off | remove | clear | doctor
+  docker [cmd]         免重启开关沙箱 Docker 访问 (策略过滤代理): on | off | toggle | status | test
   start                启动网关服务 (及已配置的 Tunnel 服务) 并执行健康检查
   stop                 停止网关与 Tunnel 后台服务
   restart              平滑排空活跃会话后重启网关与 Tunnel 服务 (支持 --wait / --force，别名: reload)
@@ -2466,6 +3155,7 @@ Dots Gateway & Secure MCP Tunnel 运维管理命令行 (${PROG_NAME})
   ${PROG_NAME} tunnel-setup           # 绑定 OpenAI tunnel_... 与 Runtime Key 并启动官方隧道
   ${PROG_NAME} agy-plugins status     # 查看 AGY 只读插件隔离发现、Hook 沙箱与挂载状态
   ${PROG_NAME} codex-plugins status   # 查看 Codex 只读插件隔离发现、信任哈希与 Hook 沙箱状态
+  ${PROG_NAME} claude-plugins status  # 查看 Claude Code 只读插件隔离发现与 Hook 沙箱状态
   ${PROG_NAME} status                 # 查看网关与 OpenAI 隧道实时连接状态
   ${PROG_NAME} restart                # 一键重启网关与隧道服务
   ${PROG_NAME} logs -f                # 实时滚动查看网关与隧道日志
@@ -2492,6 +3182,12 @@ case "${ACTION}" in
   codex-setup|setup-codex)
     cmd_codex_setup "$@"
     ;;
+  claude-setup|setup-claude|claude-auth|auth-claude)
+    cmd_claude_setup "$@"
+    ;;
+  claude-model|claude-models)
+    cmd_claude_model "$@"
+    ;;
   agy-auth|auth-agy|agy-setup|setup-agy)
     cmd_agy_auth "$@"
     ;;
@@ -2503,6 +3199,9 @@ case "${ACTION}" in
     ;;
   codex-plugins|codex-plugin)
     cmd_codex_plugins "$@"
+    ;;
+  claude-plugins|claude-plugin)
+    cmd_claude_plugins "$@"
     ;;
   docker|docker-access)
     cmd_docker "$@"

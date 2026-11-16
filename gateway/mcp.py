@@ -31,13 +31,17 @@ _FORBIDDEN_TASK_PLUGIN_KEYS = (
     "plugin_dirs",
     "agy_plugin_dirs",
     "codex_plugin_dirs",
+    "claude_plugin_dirs",
     "plugins",
     "codex_plugins",
+    "claude_plugins",
     "plugin_root",
     "agy_plugins_enabled",
     "codex_plugins_enabled",
+    "claude_plugins_enabled",
     "agy_plugins_file",
     "codex_plugins_file",
+    "claude_plugins_file",
     "agent_runtime_home_root",
     "plugin_state_dir",
 )
@@ -49,7 +53,7 @@ def _reject_task_plugin_overrides(payload: Any) -> None:
             if key in payload:
                 raise PermissionError(
                     f"Task-level '{key}' declaration is forbidden by security policy; "
-                    "register trusted AGY/Codex plugins via operator configuration only"
+                    "register trusted AGY/Codex/Claude plugins via operator configuration only"
                 )
 
 
@@ -69,9 +73,10 @@ SERVER_INSTRUCTIONS = (
     "Connected to the user's remote development machine via Dots Gateway. "
     "Prefer `fs_read`, `fs_write`, `fs_patch`, and `fs_list` for fast, atomic file operations "
     "without shell-escaping issues. Use `exec_command` for allowlisted shell commands, builds, "
-    "linters, and git workflows. Use `run_agy` (local Antigravity CLI) or `run_codex` (local "
-    "OpenAI Codex CLI `codex exec`) to delegate multi-file feature implementation, refactoring, "
-    "cross-model code review, or autonomous debugging. "
+    "linters, and git workflows. Use `run_agy` (local Antigravity CLI), `run_codex` (local "
+    "OpenAI Codex CLI `codex exec`), or `run_claude` (local Anthropic Claude Code CLI `claude -p`) "
+    "to delegate multi-file feature implementation, refactoring, cross-model code review, or "
+    "autonomous debugging. "
     "Use `session_start`, `session_poll`, `session_input`, and `session_signal` for background "
     "tasks or interactive multi-turn processes."
 )
@@ -348,21 +353,119 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "run_claude",
+        "title": "Run Local Anthropic Claude Code Agent (claude)",
+        "description": (
+            "Invoke Anthropic Claude Code CLI (`claude -p`) on the remote development machine "
+            "to autonomously implement features, refactor, run architectural/code reviews, "
+            "debug, and verify tests inside the jailed workspace."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Detailed engineering, refactoring, or review task instruction for local `claude`.",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Target project repository / working directory on the remote host.",
+                },
+                "skip_permissions": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "Pass `--dangerously-skip-permissions` for unattended execution inside "
+                        "the gateway mount-namespace sandbox (default: true)."
+                    ),
+                },
+                "permission_mode": {
+                    "type": "string",
+                    "enum": [
+                        "default",
+                        "acceptEdits",
+                        "plan",
+                        "auto",
+                        "dontAsk",
+                        "bypassPermissions",
+                    ],
+                    "description": (
+                        "Optional Claude Code `--permission-mode` when `skip_permissions=false` "
+                        "(e.g. `'plan'` for read-only planning/audit or `'acceptEdits'`)."
+                    ),
+                },
+                "model": {
+                    "type": "string",
+                    "description": (
+                        "Optional model override for `claude` (e.g. `sonnet`, `opus`, "
+                        "`claude-sonnet-4-6`). When omitted, the gateway default "
+                        "(`dots-gateway claude-model`) is used."
+                    ),
+                },
+                "effort": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "max"],
+                    "description": "Optional reasoning effort level (`--effort`).",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional existing Claude Code session UUID to resume (`--resume <ID>`).",
+                },
+                "continue_last": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Continue the most recent Claude Code conversation in `cwd` (`--continue`).",
+                },
+                "output_format": {
+                    "type": "string",
+                    "enum": ["text", "json", "stream-json"],
+                    "description": (
+                        "Optional output format (`text` by default; `json` returns structured JSON "
+                        "including `session_id`; `stream-json` emits NDJSON events)."
+                    ),
+                },
+                "add_dirs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Additional validated workspace directories to grant access to (`--add-dir`).",
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional extra validated CLI flags passed to `claude` (e.g. `['--max-turns', '25']`).",
+                },
+                "timeout": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "description": "Timeout in seconds (default: 28800 [8h], max: 86400 [24h]).",
+                },
+            },
+            "required": ["prompt"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": True,
+        },
+    },
+    {
         "name": "session_start",
         "title": "Start Background or Interactive Session",
         "description": (
             "Start a non-blocking background command (`type='exec'`), multi-turn interactive "
-            "`agy` session (`type='agy'`), or background `codex` run (`type='codex'`) and "
-            "immediately return its `session_id`."
+            "`agy` session (`type='agy'`), multi-turn interactive `claude` session (`type='claude'`), "
+            "or background `codex` run (`type='codex'`) and immediately return its `session_id`."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "type": {
                     "type": "string",
-                    "enum": ["exec", "agy", "codex"],
+                    "enum": ["exec", "agy", "codex", "claude"],
                     "default": "exec",
-                    "description": "Session type: 'exec' for shell/CLI commands, 'agy' for Antigravity, or 'codex' for OpenAI Codex.",
+                    "description": "Session type: 'exec' for shell/CLI commands, 'agy' for Antigravity, 'codex' for OpenAI Codex, or 'claude' for Anthropic Claude Code.",
                 },
                 "command": {
                     "oneOf": [
@@ -373,7 +476,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Initial prompt when `type='agy'` or `type='codex'`.",
+                    "description": "Initial prompt when `type='agy'`, `type='codex'`, or `type='claude'`.",
                 },
                 "cwd": {
                     "type": "string",
@@ -396,6 +499,18 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "type": "boolean",
                     "default": True,
                 },
+                "permission_mode": {
+                    "type": "string",
+                    "enum": [
+                        "default",
+                        "acceptEdits",
+                        "plan",
+                        "auto",
+                        "dontAsk",
+                        "bypassPermissions",
+                    ],
+                    "description": "Optional Claude Code `--permission-mode` when `type='claude'` and `skip_permissions=false`.",
+                },
                 "sandbox_mode": {
                     "type": "string",
                     "enum": ["workspace-write", "read-only"],
@@ -412,12 +527,12 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "Optional existing Codex session ID to resume when `type='codex'`.",
+                    "description": "Optional existing Codex or Claude Code session ID to resume when `type='codex'` or `type='claude'`.",
                 },
                 "continue_last": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Resume the most recent `agy` or `codex` session in `cwd`.",
+                    "description": "Resume the most recent `agy`, `codex`, or `claude` session in `cwd`.",
                 },
                 "search": {
                     "type": "boolean",
@@ -432,12 +547,12 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "add_dirs": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Additional validated workspace directories to grant access to (`agy` or `codex`).",
+                    "description": "Additional validated workspace directories to grant access to (`agy`, `codex`, or `claude`).",
                 },
                 "args": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional validated CLI flags passed to `agy` or `codex`.",
+                    "description": "Optional validated CLI flags passed to `agy`, `codex`, or `claude`.",
                 },
                 "stdin": {
                     "type": "string",
@@ -446,7 +561,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "timeout": {
                     "type": "number",
                     "minimum": 0.1,
-                    "description": "Timeout in seconds (default: 28800 [8h] for agy/codex, 21600 [6h] for exec; max: 86400 [24h]).",
+                    "description": "Timeout in seconds (default: 28800 [8h] for agy/codex/claude, 21600 [6h] for exec; max: 86400 [24h]).",
                 },
             },
             "additionalProperties": False,
@@ -520,7 +635,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "title": "Send Input or Follow-Up Turn to Session",
         "description": (
             "Write stdin text (`data`) to a running `exec` session, or send a follow-up user turn "
-            "(`prompt`) to a multi-turn `agy` session."
+            "(`prompt`) to a multi-turn `agy` or `claude` session."
         ),
         "inputSchema": {
             "type": "object",
@@ -532,7 +647,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Follow-up user message for an interactive `agy` session.",
+                    "description": "Follow-up user message for an interactive `agy` or `claude` session.",
                 },
                 "close_stdin": {
                     "type": "boolean",
@@ -599,8 +714,8 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "session_kind": {
                     "type": "string",
-                    "enum": ["exec", "agy", "codex"],
-                    "description": "Filter by session kind (`exec`, `agy`, or `codex`).",
+                    "enum": ["exec", "agy", "codex", "claude"],
+                    "description": "Filter by session kind (`exec`, `agy`, `codex`, or `claude`).",
                 },
             },
             "additionalProperties": False,
@@ -809,6 +924,16 @@ PROMPT_DEFINITIONS: List[Dict[str, Any]] = [
         ],
     },
     {
+        "name": "delegate_to_claude",
+        "title": "Delegate Feature or Review to Local Anthropic Claude Code (claude)",
+        "description": "Orchestrate local `claude -p` to implement a feature, refactor, or perform an independent review.",
+        "arguments": [
+            {"name": "task", "description": "Engineering or review task for Claude Code", "required": True},
+            {"name": "cwd", "description": "Remote project path", "required": False},
+            {"name": "test_command", "description": "Verification command (e.g. pytest -v)", "required": False},
+        ],
+    },
+    {
         "name": "remote_tdd_loop",
         "title": "Remote Test-Driven Development Loop",
         "description": "Inspect code, write/patch tests and implementation on the remote host, and run test verification.",
@@ -909,7 +1034,7 @@ class MCPHandler:
                 continue
             name = params.get("name")
             args = params.get("arguments") or {}
-            if name in ("exec_command", "run_agy", "run_codex"):
+            if name in ("exec_command", "run_agy", "run_codex", "run_claude"):
                 return True
             if name == "session_poll" and isinstance(args, dict) and float(args.get("wait_seconds") or 0) > 0:
                 return True
@@ -1154,7 +1279,7 @@ class MCPHandler:
             return _jsonrpc_error(req_id, -32602, "Tool 'arguments' must be an object")
 
         try:
-            if tool_name in ("exec_command", "run_agy", "run_codex", "session_start"):
+            if tool_name in ("exec_command", "run_agy", "run_codex", "run_claude", "session_start"):
                 _reject_task_plugin_overrides(args)
 
             if tool_name == "gateway_status":
@@ -1168,8 +1293,11 @@ class MCPHandler:
                     "queued_agy_sessions": self.sessions.queued_agy_count(),
                     "active_codex_sessions": self.sessions.active_codex_count(),
                     "queued_codex_sessions": self.sessions.queued_codex_count(),
+                    "active_claude_sessions": self.sessions.active_claude_count(),
+                    "queued_claude_sessions": self.sessions.queued_claude_count(),
                     "max_concurrent_agy": self.config.max_concurrent_agy,
                     "max_concurrent_codex": self.config.max_concurrent_codex,
+                    "max_concurrent_claude": self.config.max_concurrent_claude,
                     "default_timeout_seconds": self.config.default_timeout_seconds,
                     "agent_default_timeout_seconds": self.config.agent_default_timeout_seconds,
                     "max_timeout_seconds": self.config.max_timeout_seconds,
@@ -1205,6 +1333,11 @@ class MCPHandler:
                     "codex_writable_roots": self.policy.get_codex_writable_roots(),
                     "codex_auth_configured": self.sessions.has_codex_auth(),
                     "codex_plugins": self.policy.get_codex_plugins_info(),
+                    "claude_binary": self.config.claude_binary,
+                    "claude_default_skip_permissions": self.config.claude_default_skip_permissions,
+                    "claude_default_permission_mode": self.config.claude_default_permission_mode,
+                    "claude_auth": self.sessions.get_claude_auth_info(),
+                    "claude_plugins": self.policy.get_claude_plugins_info(),
                     "tls_enabled": bool(self.config.tls_certfile and self.config.tls_keyfile),
                     "mtls_required": self.config.tls_require_client_cert,
                 }
@@ -1344,6 +1477,51 @@ class MCPHandler:
                     )
                 return _jsonrpc_result(req_id, _tool_success(result_data))
 
+            if tool_name == "run_claude":
+                prompt = args.get("prompt")
+                extra_args = args.get("args") or []
+                if not prompt and not extra_args:
+                    return _jsonrpc_result(
+                        req_id, _tool_error("Provide 'prompt' or 'args' for run_claude")
+                    )
+                session = await self.sessions.create_claude_session(
+                    prompt=prompt,
+                    cwd=args.get("cwd"),
+                    env=args.get("env"),
+                    args=extra_args,
+                    skip_permissions=args.get("skip_permissions"),
+                    permission_mode=args.get("permission_mode"),
+                    print_mode=True,
+                    output_format=args.get("output_format"),
+                    model=args.get("model"),
+                    effort=args.get("effort"),
+                    session_id=args.get("session_id"),
+                    continue_last=bool(args.get("continue_last", False)),
+                    add_dirs=args.get("add_dirs"),
+                    timeout=args.get("timeout"),
+                    close_stdin=True,
+                )
+                summary = await self._watch_session_with_progress(session, progress_token, emit_event)
+                result_data = {
+                    "session_id": summary["session_id"],
+                    "agent_conversation_id": summary.get("agent_conversation_id"),
+                    "status": summary["status"],
+                    "returncode": summary["returncode"],
+                    "cwd": summary["cwd"],
+                    "duration_seconds": summary["duration_seconds"],
+                    "stdout": summary["stdout"],
+                    "stderr": summary["stderr"],
+                }
+                if summary["returncode"] != 0:
+                    return _jsonrpc_result(
+                        req_id,
+                        _tool_error(
+                            f"claude exited with code {summary['returncode']} ({summary['status']})",
+                            result_data,
+                        ),
+                    )
+                return _jsonrpc_result(req_id, _tool_success(result_data))
+
             if tool_name == "session_start":
                 stype = str(args.get("type", "exec"))
                 if stype == "agy":
@@ -1398,6 +1576,28 @@ class MCPHandler:
                         timeout=args.get("timeout"),
                         close_stdin=True,
                     )
+                elif stype == "claude":
+                    session = await self.sessions.create_claude_session(
+                        prompt=None,
+                        cwd=args.get("cwd"),
+                        env=args.get("env"),
+                        args=args.get("args"),
+                        skip_permissions=args.get("skip_permissions"),
+                        permission_mode=args.get("permission_mode"),
+                        print_mode=True,
+                        output_format="stream-json",
+                        input_format="stream-json",
+                        model=args.get("model"),
+                        effort=args.get("effort"),
+                        session_id=args.get("session_id"),
+                        continue_last=bool(args.get("continue_last", False)),
+                        add_dirs=args.get("add_dirs"),
+                        use_pty=bool(args.get("use_pty", False)),
+                        timeout=args.get("timeout"),
+                        close_stdin=False,
+                    )
+                    if args.get("prompt"):
+                        await session.send_agy_turn(str(args["prompt"]), close_after=False)
                 else:
                     command = args.get("command")
                     if not command:
@@ -1609,8 +1809,11 @@ class MCPHandler:
                     "queued_agy_sessions": self.sessions.queued_agy_count(),
                     "active_codex_sessions": self.sessions.active_codex_count(),
                     "queued_codex_sessions": self.sessions.queued_codex_count(),
+                    "active_claude_sessions": self.sessions.active_claude_count(),
+                    "queued_claude_sessions": self.sessions.queued_claude_count(),
                     "max_concurrent_agy": self.config.max_concurrent_agy,
                     "max_concurrent_codex": self.config.max_concurrent_codex,
+                    "max_concurrent_claude": self.config.max_concurrent_claude,
                     "default_timeout_seconds": self.config.default_timeout_seconds,
                     "agent_default_timeout_seconds": self.config.agent_default_timeout_seconds,
                     "max_timeout_seconds": self.config.max_timeout_seconds,
@@ -1620,6 +1823,8 @@ class MCPHandler:
                     "docker": self.sessions.get_docker_info(),
                     "codex_auth_configured": self.sessions.has_codex_auth(),
                     "codex_plugins": self.policy.get_codex_plugins_info(),
+                    "claude_auth": self.sessions.get_claude_auth_info(),
+                    "claude_plugins": self.policy.get_claude_plugins_info(),
                     "session_persistence_enabled": bool(self.config.session_state_dir),
                     "persisted_sessions": len(self.sessions._persisted),
                     "default_workdir": self.config.default_workdir,
@@ -1669,6 +1874,9 @@ class MCPHandler:
                     "codex_sandbox_network_access": self.config.codex_sandbox_network_access,
                     "codex_writable_roots": self.policy.get_codex_writable_roots(),
                     "codex_plugins": self.policy.get_codex_plugins_info(),
+                    "claude_default_skip_permissions": self.config.claude_default_skip_permissions,
+                    "claude_default_permission_mode": self.config.claude_default_permission_mode,
+                    "claude_plugins": self.policy.get_claude_plugins_info(),
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -1750,6 +1958,31 @@ class MCPHandler:
                                     f"Working in remote directory `{cwd}` via dots-gateway MCP tools:\n"
                                     f"1. Inspect the repository layout with `fs_list` and `exec_command` (`git status`).\n"
                                     f"2. Delegate the following task to `run_codex` (`skip_permissions=true`, `sandbox_mode='workspace-write'`, `cwd='{cwd}'`):\n"
+                                    f"   Task: {task}\n"
+                                    f"3. Review changes with `exec_command` (`git diff`) and verify by running `{test_cmd}`."
+                                ),
+                            },
+                        }
+                    ],
+                },
+            )
+
+        if name == "delegate_to_claude":
+            task = p_args.get("task") or "<describe feature or review task>"
+            test_cmd = p_args.get("test_command") or "pytest -v"
+            return _jsonrpc_result(
+                req_id,
+                {
+                    "description": "Delegate implementation or review to local Anthropic Claude Code (`claude`) and verify.",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": (
+                                    f"Working in remote directory `{cwd}` via dots-gateway MCP tools:\n"
+                                    f"1. Inspect the repository layout with `fs_list` and `exec_command` (`git status`).\n"
+                                    f"2. Delegate the following task to `run_claude` (`skip_permissions=true`, `cwd='{cwd}'`):\n"
                                     f"   Task: {task}\n"
                                     f"3. Review changes with `exec_command` (`git diff`) and verify by running `{test_cmd}`."
                                 ),

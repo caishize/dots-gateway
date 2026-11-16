@@ -42,13 +42,17 @@ _FORBIDDEN_TASK_PLUGIN_KEYS = (
     "plugin_dirs",
     "agy_plugin_dirs",
     "codex_plugin_dirs",
+    "claude_plugin_dirs",
     "plugins",
     "codex_plugins",
+    "claude_plugins",
     "plugin_root",
     "agy_plugins_enabled",
     "codex_plugins_enabled",
+    "claude_plugins_enabled",
     "agy_plugins_file",
     "codex_plugins_file",
+    "claude_plugins_file",
     "agent_runtime_home_root",
     "plugin_state_dir",
 )
@@ -60,7 +64,7 @@ def _reject_task_plugin_overrides(payload: Any) -> None:
             if key in payload:
                 raise PermissionError(
                     f"Task-level '{key}' declaration is forbidden by security policy; "
-                    "register trusted AGY/Codex plugins via operator configuration only"
+                    "register trusted AGY/Codex/Claude plugins via operator configuration only"
                 )
 
 
@@ -579,6 +583,7 @@ class GatewayServer:
                     "isolate_mount_namespace": self.config.isolate_mount_namespace,
                     "max_concurrent_agy": self.config.max_concurrent_agy,
                     "max_concurrent_codex": self.config.max_concurrent_codex,
+                    "max_concurrent_claude": self.config.max_concurrent_claude,
                     "default_timeout_seconds": self.config.default_timeout_seconds,
                     "agent_default_timeout_seconds": self.config.agent_default_timeout_seconds,
                     "max_timeout_seconds": self.config.max_timeout_seconds,
@@ -607,6 +612,11 @@ class GatewayServer:
                     "codex_writable_roots": self.policy.get_codex_writable_roots(),
                     "codex_auth_configured": self.sessions.has_codex_auth(),
                     "codex_plugins": self.policy.get_codex_plugins_info(),
+                    "claude_binary": self.config.claude_binary,
+                    "claude_default_skip_permissions": self.config.claude_default_skip_permissions,
+                    "claude_default_permission_mode": self.config.claude_default_permission_mode,
+                    "claude_auth": self.sessions.get_claude_auth_info(),
+                    "claude_plugins": self.policy.get_claude_plugins_info(),
                 },
             )
             return
@@ -625,6 +635,10 @@ class GatewayServer:
 
         if req.method == "POST" and path == "/v1/codex":
             await self._handle_http_codex(req, writer)
+            return
+
+        if req.method == "POST" and path == "/v1/claude":
+            await self._handle_http_claude(req, writer)
             return
 
         if req.method == "POST" and path == "/v1/sessions":
@@ -1243,6 +1257,117 @@ class GatewayServer:
                 extra_headers={"X-Session-Id": session.session_id},
             )
 
+    async def _handle_http_claude(
+        self, req: HTTPRequest, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            body = self._parse_json_body(req)
+        except Exception as exc:
+            await send_json_response(
+                writer,
+                400,
+                {
+                    "ok": False,
+                    "error": f"Invalid JSON: {redact_diagnostic_text(str(exc), self.config)}",
+                },
+            )
+            return
+
+        try:
+            _reject_task_plugin_overrides(body)
+        except PermissionError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
+            logger.warning("HTTP claude plugin override rejection: route=%s reason=%s", req.path, safe_err)
+            await send_json_response(writer, 403, {"ok": False, "error": safe_err})
+            return
+
+        prompt = body.get("prompt")
+        args = body.get("args") or []
+        interactive = bool(body.get("interactive", False))
+        if prompt is None and not args and not interactive:
+            await send_json_response(
+                writer,
+                400,
+                {"ok": False, "error": "Provide 'prompt', 'args', or set 'interactive': true"},
+            )
+            return
+
+        stream = bool(body.get("stream", False)) or (
+            "text/event-stream" in req.headers.get("accept", "")
+        )
+        input_format = body.get("input_format")
+        output_format = body.get("output_format")
+        if interactive and not input_format:
+            input_format = "stream-json"
+            output_format = "stream-json"
+
+        close_stdin = bool(body.get("close_stdin", not interactive))
+
+        try:
+            session = await self.sessions.create_claude_session(
+                prompt=prompt if not interactive else None,
+                cwd=body.get("cwd"),
+                env=body.get("env"),
+                args=args,
+                skip_permissions=body.get("skip_permissions"),
+                permission_mode=body.get("permission_mode"),
+                print_mode=bool(body.get("print_mode", True)),
+                output_format=output_format,
+                input_format=input_format,
+                model=body.get("model"),
+                effort=body.get("effort"),
+                session_id=body.get("session_id"),
+                continue_last=bool(body.get("continue_last", False)),
+                add_dirs=body.get("add_dirs"),
+                use_pty=bool(body.get("use_pty", False)),
+                timeout=body.get("timeout"),
+                initial_stdin=body.get("stdin"),
+                close_stdin=close_stdin,
+            )
+            if interactive and prompt is not None:
+                await session.send_agy_turn(str(prompt), close_after=False)
+        except PermissionError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
+            logger.warning(
+                "HTTP claude policy rejection: route=%s cwd=%r reason=%s preview=%s",
+                req.path,
+                body.get("cwd"),
+                safe_err,
+                redact_for_audit_log(args or body.get("add_dirs") or body.get("permission_mode")),
+            )
+            await send_json_response(writer, 403, {"ok": False, "error": safe_err})
+            return
+        except SandboxStorageError as exc:
+            safe_err = redact_diagnostic_text(str(exc), self.config)
+            logger.error("HTTP claude sandbox storage failure: route=%s reason=%s", req.path, safe_err)
+            await send_json_response(writer, 503, {"ok": False, "error": safe_err})
+            return
+        except Exception as exc:
+            await send_json_response(
+                writer,
+                400,
+                {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+            )
+            return
+
+        if stream:
+            await self._stream_session_sse(session, writer, after_seq=0)
+        elif interactive and not bool(body.get("wait", False)):
+            await send_json_response(
+                writer,
+                200,
+                {"ok": True, **session.to_summary(include_output=False)},
+                extra_headers={"X-Session-Id": session.session_id},
+            )
+        else:
+            summary = await session.wait()
+            await send_json_response(
+                writer,
+                200,
+                {"ok": summary["returncode"] == 0, **summary},
+                extra_headers={"X-Session-Id": session.session_id},
+            )
+
     async def _handle_http_create_session(
         self, req: HTTPRequest, writer: asyncio.StreamWriter
     ) -> None:
@@ -1317,6 +1442,30 @@ class GatewayServer:
                     timeout=body.get("timeout"),
                     close_stdin=True,
                 )
+            elif session_type == "claude":
+                input_format = body.get("input_format", "stream-json")
+                output_format = body.get("output_format", "stream-json")
+                session = await self.sessions.create_claude_session(
+                    prompt=None,
+                    cwd=body.get("cwd"),
+                    env=body.get("env"),
+                    args=body.get("args"),
+                    skip_permissions=body.get("skip_permissions"),
+                    permission_mode=body.get("permission_mode"),
+                    print_mode=bool(body.get("print_mode", True)),
+                    output_format=output_format,
+                    input_format=input_format,
+                    model=body.get("model"),
+                    effort=body.get("effort"),
+                    session_id=body.get("session_id"),
+                    continue_last=bool(body.get("continue_last", False)),
+                    add_dirs=body.get("add_dirs"),
+                    use_pty=bool(body.get("use_pty", False)),
+                    timeout=body.get("timeout"),
+                    close_stdin=False,
+                )
+                if body.get("prompt"):
+                    await session.send_agy_turn(str(body["prompt"]), close_after=False)
             else:
                 command = body.get("command")
                 if not command:
@@ -1571,6 +1720,64 @@ class GatewayServer:
                             initial_stdin=msg.get("stdin"),
                             close_stdin=bool(msg.get("close_stdin", True)),
                         )
+                    except Exception as exc:
+                        await ws.send_json(
+                            {
+                                "type": "error",
+                                "id": req_id,
+                                "error": redact_diagnostic_text(str(exc), self.config),
+                            }
+                        )
+                        continue
+
+                    await ws.send_json(
+                        {
+                            "type": "session.created",
+                            "id": req_id,
+                            "session_id": session.session_id,
+                            "pid": session.pid,
+                            "argv": session.argv,
+                            "cwd": session.cwd,
+                        }
+                    )
+                    t = asyncio.create_task(_forward_session_events(session, req_id))
+                    stream_tasks.add(t)
+                    t.add_done_callback(stream_tasks.discard)
+                    continue
+
+                if action == "claude":
+                    interactive = bool(msg.get("interactive", False))
+                    prompt = msg.get("prompt")
+                    input_format = msg.get("input_format")
+                    output_format = msg.get("output_format")
+                    if interactive and not input_format:
+                        input_format = "stream-json"
+                        output_format = "stream-json"
+                    close_stdin = bool(msg.get("close_stdin", not interactive))
+                    try:
+                        _reject_task_plugin_overrides(msg)
+                        session = await self.sessions.create_claude_session(
+                            prompt=prompt if not interactive else None,
+                            cwd=msg.get("cwd"),
+                            env=msg.get("env"),
+                            args=msg.get("args"),
+                            skip_permissions=msg.get("skip_permissions"),
+                            permission_mode=msg.get("permission_mode"),
+                            print_mode=bool(msg.get("print_mode", True)),
+                            output_format=output_format,
+                            input_format=input_format,
+                            model=msg.get("model"),
+                            effort=msg.get("effort"),
+                            session_id=msg.get("session_id"),
+                            continue_last=bool(msg.get("continue_last", False)),
+                            add_dirs=msg.get("add_dirs"),
+                            use_pty=bool(msg.get("use_pty", False)),
+                            timeout=msg.get("timeout"),
+                            initial_stdin=msg.get("stdin"),
+                            close_stdin=close_stdin,
+                        )
+                        if interactive and prompt is not None:
+                            await session.send_agy_turn(str(prompt), close_after=False)
                     except Exception as exc:
                         await ws.send_json(
                             {

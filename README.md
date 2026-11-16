@@ -1,44 +1,71 @@
-# Dots <-> Local Dev, Antigravity (`agy`) & Codex MCP Plugin & Hardened Gateway (`v1.5.24`)
+# Dots Gateway — Hardened Remote Dev & Multi-Agent (`agy` / `codex` / `claude`) MCP Server (`v1.5.25`)
 
-A zero-dependency Python 3.11+ **OpenAI `dots` / Codex / Agent Plugins 1.0** package and remote development gateway (`Apache-2.0`). It enables **dots** (or any MCP-compatible client) to securely inspect/edit workspace files, execute allowlisted development commands inside a Linux User + Mount Namespace VFS jail, and delegate tasks to **`agy` (`--sandbox`, with optional isolated read-only plugins & native hook sandboxing)** and **`codex` (`codex exec`, with optional isolated read-only plugins & native hook sandboxing)** via the **Model Context Protocol (MCP)**.
+A **zero-dependency** Python 3.11+ remote development gateway and multi-platform plugin (`Apache-2.0`). `dots-gateway` connects cloud, desktop, and custom AI agents (**OpenAI `dots` / ChatGPT / Codex**, **Anthropic Claude Code / Claude.ai / Messages API**, **xAI Grok**, **OpenClaw**, **Google Antigravity `agy`**, **Cursor / Windsurf / VS Code**, and custom Python/TS agents) to your Linux development machine over the **Model Context Protocol (MCP)**, REST/SSE, and full-duplex WebSockets.
+
+All commands and local coding agents execute inside a **Linux User + Mount Namespace VFS jail (`unshare` + `pivot_root`)** confined strictly to authorized workspaces (`~/workspaces`), with optional **isolated read-only plugins** and **unified W^X native hook sandboxing (`dots-hook-jail.py`)** across **`agy`**, **`codex`**, and **`claude`**.
+
+---
+
+## Table of Contents
+
+- [Architecture Overview](#architecture-overview)
+- [Prerequisites](#prerequisites)
+- [1. Quick Start (Deploy in 3 Minutes)](#1-quick-start-deploy-in-3-minutes)
+- [2. Client Configuration Guide (OpenAI / Anthropic / Grok / OpenClaw / Custom Agents)](#2-client-configuration-guide-openai--anthropic--grok--openclaw--custom-agents)
+  - [2.1 Choose Your Transport & Exposure Mode](#21-choose-your-transport--exposure-mode)
+  - [2.2 OpenAI (`dots` / ChatGPT / Codex CLI / Responses API / Agents SDK)](#22-openai-dots--chatgpt--codex-cli--responses-api--agents-sdk)
+  - [2.3 Anthropic (Claude Code CLI / Claude.ai / Claude Desktop / Messages API)](#23-anthropic-claude-code-cli--claudeai--claude-desktop--messages-api)
+  - [2.4 xAI Grok (Responses API & `xai-sdk`)](#24-xai-grok-responses-api--xai-sdk)
+  - [2.5 OpenClaw (`openclaw.json` & CLI)](#25-openclaw-openclawjson--cli)
+  - [2.6 Other IDEs & Custom Agent Frameworks (`agy` / Cursor / MCP SDK / LangGraph / Python SDK)](#26-other-ides--custom-agent-frameworks-agy--cursor--mcp-sdk--langgraph--python-sdk)
+- [3. Day-2 Operations CLI Reference (`dots-gateway`)](#3-day-2-operations-cli-reference-dots-gateway)
+- [4. Exposed MCP Tools (17), Resources & Prompts](#4-exposed-mcp-tools-17-resources--prompts)
+- [5. Isolation & Security Architecture](#5-isolation--security-architecture)
+- [6. Repository Layout](#6-repository-layout)
+- [7. Running Automated & Live Tests](#7-running-automated--live-tests)
+- [License](#license)
+
+---
 
 ## Architecture Overview
 
-```
-OpenAI Cloud Machine (`dots`)                            Local Dev Machine (`~/gateway`)
-+-------------------------------------------+            +----------------------------------------------+
-| Option A: OpenAI Secure MCP Tunnel        |  Outbound  | GatewayServer (`gateway/server.py`)          |
-|  - `tunnel-client` -> Loopback HTTP       |  HTTP/2    |  1. Loopback `/mcp` + TLS 1.3 / mTLS + CIDR  |
-|    `http://127.0.0.1:18765/mcp`           | <========> |  2. Authenticator (`auth.py` / `oauth.py`)   |
-+-------------------------------------------+            |     - Bearer / Async PBKDF2 / HMAC / OAuth2.1 |
-| Option B: Direct Remote MCP / Plugin      |  TLS 1.3   |  3. MCP Server Engine (`gateway/mcp.py`)     |
-|  - `https://<DOMAIN>/mcp` or `dots_mcp.py`| <========> |     - Streamable HTTP (`/mcp`) + SSE Progress|
-|  - `skills/` (`remote-dev-gateway`,       |  POST /mcp |     - 16 Tools, Resources & Guided Prompts   |
-|    `delegate-to-agy`, `delegate-to-codex`)|            |  4. Policy, VFS Jail, Plugins, Hook Jail     |
-+-------------------------------------------+            |     - `agy --sandbox` & `codex exec`         |
-                                                         +----------------------------------------------+
+```text
+Cloud / Desktop / Custom AI Clients                      Linux Dev Host (`~/gateway`)
++---------------------------------------------+          +--------------------------------------------------+
+| • OpenAI: dots / ChatGPT / Codex / API      |          | GatewayServer (`gateway/server.py`)              |
+| • Anthropic: Claude Code / Claude / API     |  TLS 1.3 |  1. Transports                                   |
+| • xAI Grok: Responses API / xai-sdk         |   or     |     - Streamable HTTP `/mcp` + SSE Progress      |
+| • OpenClaw: `mcp.servers.dots-gateway`      |  Tunnel  |     - Loopback `127.0.0.1:18765/mcp` (Tunnel)    |
+| • IDEs & Custom Agents: agy / Cursor / SDK  | <======> |     - REST `/v1/*` + Duplex WebSocket `/v1/ws`   |
+|                                             |          |  2. Auth (`auth.py` / `oauth.py`)                |
+| Connection Modes:                           |          |     - Bearer / Bare Token / Capability Path      |
+|  A) OpenAI `tunnel-client` (0 inbound port) |          |     - OAuth 2.1 + PKCE / HMAC-SHA256 / mTLS      |
+|  B) Remote Streamable HTTP (`POST /mcp`)    |          |  3. Policy + VFS Namespace Jail (`sandbox.py`)   |
+|  C) Local/Pinned `stdio` (`dots_mcp.py`)    |          |     - Atomic `fs_*` + Allowlisted `exec_command` |
++---------------------------------------------+          |     - Local Agents: `agy` | `codex` | `claude`   |
+                                                         |     - Hook Jail (`dots-hook-jail.py`) + Docker   |
+                                                         +--------------------------------------------------+
 ```
 
 ---
 
 ## Prerequisites
 
-- **Operating System**: Linux with user `systemd` (`systemctl --user`) for background daemon management (or run `python3 main.py` directly in the foreground on containers/WSL).
-- **Required System Packages** (zero third-party `pip` packages required):
-  - `python3` (`>= 3.11`)
-  - `openssl` (auto-generates self-signed TLS 1.3 PKI on first start)
-  - `curl` & `git`
+- **Operating System**: Linux (`x86_64` / `arm64`) with user `systemd` (`systemctl --user`) for background daemon management (or run `python3 main.py` directly in containers/WSL).
+- **Required System Packages** (zero third-party `pip` dependencies):
+  - `python3` (`>= 3.11`), `openssl`, `curl`, `git`
   - `util-linux` (`unshare`, `setpriv`, `mount`) with unprivileged user + mount namespaces enabled:
     ```bash
-    # Preflight check (should exit 0):
+    # Preflight check (must exit 0):
     unshare --user --map-current-user --mount true
     ```
-    > **Ubuntu 24.04+ Note**: If AppArmor blocks unprivileged user namespaces (`Operation not permitted`), enable userns or configure an AppArmor profile (`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`).
-- **Optional Local Agent & Tunnel CLIs** (install only what you need):
-  - **OpenAI Codex CLI (`codex`) + `bubblewrap` (`bwrap`)**: Required only if calling `run_codex`.
-  - **Google Antigravity CLI (`agy`)**: Required only if calling `run_agy` / `list_agy_models`.
-  - **OpenAI `tunnel-client`**: Required only if using Option A (OpenAI Secure MCP Tunnel).
-  - **Docker Engine**: Required only if enabling policy-filtered container access (`dots-gateway docker on`).
+    > **Ubuntu 24.04+ Note**: If AppArmor restricts unprivileged user namespaces (`Operation not permitted`), allow userns (`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`) or install an AppArmor profile.
+- **Optional Local Coding Agents & Companions** (install any subset on the gateway host):
+  - **Google Antigravity CLI (`agy`)**: Enables `run_agy`, `list_agy_models`, and interactive `session_start(type="agy")`.
+  - **OpenAI Codex CLI (`codex`) + `bubblewrap` (`bwrap`)**: Enables `run_codex` and `codex exec review`.
+  - **Anthropic Claude Code CLI (`claude`)**: Enables `run_claude` and interactive `session_start(type="claude")`.
+  - **OpenAI `tunnel-client`**: Enables zero-inbound-port Secure MCP Tunnel (`dots-gateway tunnel-setup`).
+  - **Docker Engine**: Enables policy-filtered sandbox container access (`dots-gateway docker on`).
 
 ---
 
@@ -50,16 +77,16 @@ OpenAI Cloud Machine (`dots`)                            Local Dev Machine (`~/g
 git clone https://github.com/caishize/dots-gateway.git ~/gateway
 cd ~/gateway
 
-# Ensure ~/.local/bin is on PATH, then start the service:
+# Ensure ~/.local/bin is on PATH, then initialize & start the service:
 export PATH="$HOME/.local/bin:$PATH"
 ./gateway.sh start
 ```
 
-What `./gateway.sh start` does automatically on first run:
-1. Generates `config.json` (`0600`) with random 256-bit Bearer API token, HMAC-SHA256 secret, and PBKDF2 credentials.
-2. Generates a local Root CA + TLS 1.3 server/client certificate pair under `certs/` (`0600` private keys) and writes local CLI credentials to `~/.config/dots-gateway/client.json` (`0600`).
-3. Creates the isolated default workspace directory `~/workspaces`.
-4. Installs & starts `~/.config/systemd/user/dots-gateway.service` (with `loginctl enable-linger` so it survives SSH logout) and symlinks `~/.local/bin/dots-gateway`.
+On first run, `./gateway.sh start` automatically:
+1. Generates `config.json` (`0600`) with a 256-bit Bearer API token, 256-bit HMAC-SHA256 secret, and PBKDF2 Basic Auth credentials.
+2. Generates a local Root CA + TLS 1.3 server/client certificate pair in `certs/` (`0600`) and writes local CLI credentials to `~/.config/dots-gateway/client.json` (`0600`).
+3. Creates the jailed default workspace directory `~/workspaces`.
+4. Installs & starts `~/.config/systemd/user/dots-gateway.service` (enabling `loginctl enable-linger` so it survives SSH logout) and symlinks `~/.local/bin/dots-gateway`.
 
 > **Foreground / Container Mode (without `systemd`)**:
 > ```bash
@@ -67,57 +94,388 @@ What `./gateway.sh start` does automatically on first run:
 > python3 main.py
 > ```
 
-### Step 2: Verify Local Health & View Connection Credentials
+### Step 2: Verify Health & Print Ready-to-Use Client Snippets
 
 ```bash
 dots-gateway status
 python3 dots_client.py health
 python3 dots_client.py exec "git --version && python3 --version"
 
-# Print ready-to-use MCP URLs, Bearer/HMAC tokens, and client.json snippets:
+# Print your generated URLs, tokens, and copy-paste snippets for all clients:
 dots-gateway config
 ```
 
-### Step 3 (Optional): Configure Local Coding Agents (`codex` / `agy`)
+### Step 3 (Optional): Configure Local Coding Agents (`agy` / `codex` / `claude`)
+
+All agent credentials are stored with `0600` permissions under `~/.config/dots-gateway/` and **hot-reloaded per session without restarting the gateway**:
 
 ```bash
-# Configure OpenAI API Key for local Codex CLI (`run_codex`, stored 0600, effective immediately)
-dots-gateway codex-setup
-
-# Switch Antigravity auth profile (OAuth vs Google Cloud ADC) & default model (zero restart)
+# 1. Google Antigravity CLI (`run_agy`) — switch OAuth vs Google Cloud ADC & default model:
 dots-gateway agy-auth status
 dots-gateway agy-model list
+
+# 2. OpenAI Codex CLI (`run_codex`) — store isolated API credential:
+dots-gateway codex-setup
+
+# 3. Anthropic Claude Code CLI (`run_claude`) — store isolated credential
+#    (or run `claude auth login` on the host to use ~/.claude/.credentials.json):
+dots-gateway claude-setup
+dots-gateway claude-model status
 ```
 
 ---
 
-## 2. Connect Your MCP Client (`dots` / ChatGPT / Codex / Claude)
+## 2. Client Configuration Guide (OpenAI / Anthropic / Grok / OpenClaw / Custom Agents)
 
-### Option A (Recommended — Zero Inbound Ports): OpenAI Secure MCP Tunnel (`tunnel-client`)
+Run `dots-gateway config` on your gateway host at any time to print pre-filled URLs, `client.json`, and CLI commands for your deployment.
 
-Because cloud connector firewalls often block non-`443` ports (`:8765`), raw IPv4 URLs, and wildcard DNS (`sslip.io`), the easiest zero-inbound-port method for OpenAI `dots` is `tunnel-client`:
+### 2.1 Choose Your Transport & Exposure Mode
 
-1. Create or copy a **Tunnel ID** (`tunnel_...`) at <https://platform.openai.com/settings/organization/tunnels> (under the same OpenAI Org/Workspace as `dots`).
-2. Create a **Runtime Credential** with **`Tunnels Read + Use`** permissions at <https://platform.openai.com/settings/organization/api-keys>.
-3. Run on your gateway host:
-   ```bash
-   dots-gateway tunnel-setup
-   ```
-   This writes `~/.config/dots-gateway/tunnel.env` (`0600`), configures `~/.config/tunnel-client/dots-gateway.yaml` to forward concurrent Streamable HTTP requests to `http://127.0.0.1:18765/mcp` (avoiding single-pipe stdio head-of-line blocking), runs `tunnel-client doctor`, enables `dots-gateway-tunnel.service`, and verifies `http://127.0.0.1:18766/readyz`.
-4. In `dots` / ChatGPT Connectors, select your Secure MCP Tunnel (`No authentication` / `无需身份认证`). All commands, `agy`, and `codex` runs remain strictly confined to `~/workspaces` via Linux User + Mount Namespace VFS jailing.
+| Mode | Best For | Inbound Ports Needed? | TLS Requirement |
+| :--- | :--- | :--- | :--- |
+| **A. OpenAI Secure MCP Tunnel** (`dots-gateway tunnel-setup`) | OpenAI `dots` / ChatGPT Enterprise Connectors | **None (0 inbound ports)** | Outbound HTTP/2 tunnel to OpenAI -> local `http://127.0.0.1:18765/mcp` |
+| **B. Remote Streamable HTTP** (`https://<DOMAIN>/mcp`) | Cloud APIs (**OpenAI Responses API**, **Anthropic Messages API**, **xAI Grok API**, **Claude.ai**, **ChatGPT**) & remote IDEs (**Claude Code**, **Codex**, **OpenClaw**, **Cursor**) | `:443` via Caddy/Nginx/Cloudflare Tunnel/Tailscale Funnel, or `:8765` via `dots-gateway sync-ip` | Public CA certificate (Let's Encrypt / Cloudflare / Tailscale) required by cloud APIs |
+| **C. `dots_mcp.py` `stdio` Bridge** (`client.json` + SHA-256 Pin) | Local/desktop agents (**Claude Code**, **Codex**, **OpenClaw**, **Claude Desktop**, **Cursor**, **`agy`**) connecting over raw IP or self-signed TLS | Direct TCP to `:8765` (or SSH port-forward / WireGuard / Tailscale) | Works out-of-the-box with **self-signed TLS + SHA-256 fingerprint pinning + HMAC-SHA256 signing** |
 
-### Option B: Direct Remote Streamable HTTP MCP (`/mcp`, Built-in OAuth 2.1 or Bearer/Capability Path)
+> **Tip for Cloud-Hosted MCP Connectors (OpenAI / Anthropic / xAI Grok)**: Cloud APIs invoke your MCP server from their own data centers and require a **publicly trusted HTTPS certificate** (not self-signed). Either place Caddy / Nginx / Cloudflare Tunnel / Tailscale Funnel in front of `http://127.0.0.1:18765/mcp`, or run `dots-gateway sync-ip` (which issues a Let's Encrypt certificate for `<IP>.sslip.io`).
+>
+> **Tip for Mode C (`dots_mcp.py` `stdio` Bridge)**: Copy the `client.json` snippet printed by `dots-gateway config` into `~/.config/dots-gateway/client.json` (`chmod 600`) on your client machine once — `dots_mcp.py` will automatically load it without needing plaintext secrets inside IDE/agent config files.
 
-When exposed over HTTPS (either via a reverse proxy like Caddy/Nginx on `:443` with a custom domain, or directly via `dots-gateway sync-ip` Let's Encrypt certificate):
-- **Built-in MCP OAuth 2.1 (`gateway/oauth.py`)**: RFC 9728 Protected Resource Metadata (`/.well-known/oauth-protected-resource`), RFC 8414 Authorization Server Metadata (`/.well-known/oauth-authorization-server`), RFC 7591 Dynamic Client Registration (`/oauth/register`), PKCE `S256` `/oauth/authorize` (restricted by `oauth_allowed_redirect_hosts` in `config.json`), and stateless HMAC `/oauth/token`.
-- **Standard Bearer Header**: Point any Streamable HTTP MCP client at `https://<YOUR_DOMAIN>/mcp` with `Authorization: Bearer <YOUR_API_TOKEN>` (see `mcp.remote.example.json`).
-- **Zero-Header Capability Path**: `https://<YOUR_DOMAIN>/mcp/<YOUR_API_TOKEN>` for UIs without custom header fields.
+---
 
-### Option C: Install as Local / Remote `stdio` Plugin (`dots_mcp.py`)
+### 2.2 OpenAI (`dots` / ChatGPT / Codex CLI / Responses API / Agents SDK)
 
-Install this repository (`https://github.com/caishize/dots-gateway.git`) as a plugin in Codex or any MCP `stdio` host:
-1. Run `dots-gateway config` on the gateway host and copy the generated `client.json` block to `~/.config/dots-gateway/client.json` (`0600`) on the client machine (or set `GATEWAY_URL`, `GATEWAY_HMAC_SECRET`, and `GATEWAY_TLS_FINGERPRINT`).
-2. `mcp.json` launches `./dots_mcp.py`, bridging JSON-RPC over TLS 1.3 with SHA-256 certificate pinning and replay-proof HMAC-SHA256 request signing (or pass `./dots_mcp.py --local` when running on the same machine).
+#### 1) OpenAI `dots` & ChatGPT Connectors
+- **Recommended (Zero Inbound Ports — Secure MCP Tunnel)**:
+  1. Create a **Tunnel ID** (`tunnel_...`) at <https://platform.openai.com/settings/organization/tunnels> and a Runtime Credential with **`Tunnels Read + Use`** permissions.
+  2. On the gateway host, run:
+     ```bash
+     dots-gateway tunnel-setup
+     ```
+  3. In `dots` / ChatGPT Connectors, select your Secure MCP Tunnel (`No authentication`).
+- **Direct HTTPS (Built-in OAuth 2.1 or Capability URL)**:
+  - **OAuth 2.1 Mode**: Set MCP Server URL to `https://<YOUR_DOMAIN>/mcp` and choose **OAuth** (`dots-gateway` serves `/.well-known/oauth-protected-resource`, `/oauth/register`, PKCE `/oauth/authorize`, and `/oauth/token` out of the box).
+  - **Zero-Popup Capability URL**: Choose **No authentication** and set URL to `https://<YOUR_DOMAIN>/mcp/<BEARER_TOKEN_FROM_CONFIG>`.
+
+#### 2) OpenAI Codex CLI (`codex`)
+- **Remote Streamable HTTP (One-Liner, reads `DOTS_GATEWAY_TOKEN` from environment)**:
+  ```bash
+  read -rsp "Dots Gateway Token: " DOTS_GATEWAY_TOKEN && echo && export DOTS_GATEWAY_TOKEN
+  codex mcp add dots-gateway \
+    --url "https://<YOUR_DOMAIN>/mcp" \
+    --bearer-token-env-var DOTS_GATEWAY_TOKEN
+  ```
+  Or in `~/.codex/config.toml`:
+  ```toml
+  [mcp_servers.dots-gateway]
+  url = "https://<YOUR_DOMAIN>/mcp"
+  bearer_token_env_var = "DOTS_GATEWAY_TOKEN"
+  startup_timeout_sec = 20
+  tool_timeout_sec = 28800
+  ```
+- **Pinned `stdio` Bridge / Native Codex Plugin** (supports self-signed TLS + HMAC over raw IP via `~/.config/dots-gateway/client.json`):
+  ```bash
+  codex mcp add dots-gateway -- python3 /path/to/dots-gateway/dots_mcp.py
+  ```
+  *(This repo also ships `.codex-plugin/plugin.json` and `plugin.json` for direct plugin installation alongside bundled `skills/`.)*
+
+#### 3) OpenAI Responses API (Remote MCP Tool)
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI()
+resp = client.responses.create(
+    model="gpt-5",
+    tools=[
+        {
+            "type": "mcp",
+            "server_label": "dots_gateway",
+            "server_url": os.environ["DOTS_GATEWAY_MCP_URL"],  # e.g. "https://<YOUR_DOMAIN>/mcp"
+            "authorization": os.environ["DOTS_GATEWAY_TOKEN"],
+            "require_approval": "never",
+        }
+    ],
+    input="Check gateway_status and run pytest -q in ~/workspaces/my-project.",
+)
+print(resp.output_text)
+```
+
+#### 4) OpenAI Agents SDK (`openai-agents`)
+```python
+import os
+from agents import Agent, Runner
+from agents.mcp import MCPServerStreamableHttp
+
+async with MCPServerStreamableHttp(
+    name="dots-gateway",
+    params={
+        "url": os.environ["DOTS_GATEWAY_MCP_URL"],
+        "headers": {"Authorization": f"Bearer {os.environ['DOTS_GATEWAY_TOKEN']}"},
+        "timeout": 60,
+    },
+) as mcp_server:
+    agent = Agent(
+        name="RemoteDevEngineer",
+        instructions="Use dots-gateway MCP tools to inspect, edit, and test code in ~/workspaces.",
+        mcp_servers=[mcp_server],
+    )
+    result = await Runner.run(agent, "Inspect git status in ~/workspaces/app")
+    print(result.final_output)
+```
+
+---
+
+### 2.3 Anthropic (Claude Code CLI / Claude.ai / Claude Desktop / Messages API)
+
+#### 1) Claude Code CLI (`claude`)
+- **Method A — Remote Streamable HTTP (One-Liner)**:
+  ```bash
+  claude mcp add --transport http --scope user dots-gateway \
+    "https://<YOUR_DOMAIN>/mcp" \
+    --header "Authorization: Bearer ${DOTS_GATEWAY_TOKEN}"
+  ```
+- **Method B — Project-Shared `.mcp.json`** (supports `${ENV_VAR}` expansion natively):
+  ```json
+  {
+    "mcpServers": {
+      "dots-gateway": {
+        "type": "http",
+        "url": "https://<YOUR_DOMAIN>/mcp",
+        "headers": {
+          "Authorization": "Bearer ${DOTS_GATEWAY_TOKEN}"
+        }
+      }
+    }
+  }
+  ```
+- **Method C — Native Claude Code Plugin (`.claude-plugin/plugin.json`) or Pinned `stdio` Bridge**:
+  With `~/.config/dots-gateway/client.json` (`0600`) in place, load the full plugin (MCP server + `remote-dev-gateway`, `delegate-to-agy`, `delegate-to-codex`, and `delegate-to-claude` skills):
+  ```bash
+  claude --plugin-dir /path/to/dots-gateway
+  ```
+  or register the zero-dependency `stdio` bridge permanently:
+  ```bash
+  claude mcp add --transport stdio --scope user dots-gateway -- \
+    python3 /path/to/dots-gateway/dots_mcp.py
+  ```
+
+#### 2) Claude.ai Web & Claude Desktop
+- **Claude.ai / Claude Desktop Custom Connector (Remote HTTPS)**:
+  Open **Settings -> Integrations / Connectors -> Add Custom Connector** and enter:
+  - **URL**: `https://<YOUR_DOMAIN>/mcp` (uses built-in OAuth 2.1 + PKCE; `claude.ai` and `claude.com` callbacks are pre-allowlisted in `oauth_allowed_redirect_hosts`), **or**
+  - **Capability URL**: `https://<YOUR_DOMAIN>/mcp/<BEARER_TOKEN_FROM_CONFIG>`
+- **Claude Desktop Local Config (`claude_desktop_config.json` via `dots_mcp.py` + `~/.config/dots-gateway/client.json`)**:
+  ```json
+  {
+    "mcpServers": {
+      "dots-gateway": {
+        "command": "python3",
+        "args": ["/absolute/path/to/dots-gateway/dots_mcp.py"]
+      }
+    }
+  }
+  ```
+
+#### 3) Anthropic Messages API (MCP Connector)
+```python
+import os
+import anthropic
+
+client = anthropic.Anthropic()
+response = client.beta.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=4096,
+    mcp_servers=[
+        {
+            "type": "url",
+            "name": "dots-gateway",
+            "url": os.environ["DOTS_GATEWAY_MCP_URL"],  # e.g. "https://<YOUR_DOMAIN>/mcp"
+            "authorization_token": os.environ["DOTS_GATEWAY_TOKEN"],
+        }
+    ],
+    messages=[
+        {
+            "role": "user",
+            "content": "Call gateway_status and list projects in the default workspace.",
+        }
+    ],
+    betas=["mcp-client-2025-04-04"],
+)
+print(response.content)
+```
+
+---
+
+### 2.4 xAI Grok (Responses API & `xai-sdk`)
+
+`dots-gateway` accepts both `Authorization: Bearer <TOKEN>` and bare `Authorization: <TOKEN>`, so Grok's remote MCP tool works seamlessly via either the OpenAI-compatible SDK or native `xai-sdk`.
+
+#### 1) Grok Responses API (`https://api.x.ai/v1` via OpenAI SDK)
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.environ["XAI_API_KEY"],
+    base_url="https://api.x.ai/v1",
+)
+
+resp = client.responses.create(
+    model="grok-4",
+    tools=[
+        {
+            "type": "mcp",
+            "server_label": "dots_gateway",
+            "server_url": os.environ["DOTS_GATEWAY_MCP_URL"],
+            "authorization": os.environ["DOTS_GATEWAY_TOKEN"],
+        }
+    ],
+    input="Check gateway_status on my dev box and run git status in ~/workspaces/app.",
+)
+print(resp.output_text)
+```
+
+#### 2) Native xAI Python SDK (`xai-sdk`)
+```python
+import os
+from xai_sdk import Client
+from xai_sdk.chat import user
+from xai_sdk.tools import mcp
+
+client = Client(api_key=os.environ["XAI_API_KEY"])
+chat = client.chat.create(
+    model="grok-4",
+    tools=[
+        mcp(
+            server_url=os.environ["DOTS_GATEWAY_MCP_URL"],
+            server_label="dots_gateway",
+            authorization=os.environ["DOTS_GATEWAY_TOKEN"],
+        )
+    ],
+)
+chat.append(user("Inspect ~/workspaces using fs_list and run the unit tests."))
+response = chat.sample()
+print(response.content)
+```
+
+---
+
+### 2.5 OpenClaw (`openclaw.json` & CLI)
+
+OpenClaw configures MCP servers under `mcp.servers` in `~/.openclaw/openclaw.json` (or via `openclaw mcp add`):
+
+#### Option 1 — Remote Streamable HTTP (`~/.openclaw/openclaw.json`)
+```json
+{
+  "mcp": {
+    "servers": {
+      "dots-gateway": {
+        "transport": "streamable-http",
+        "url": "https://<YOUR_DOMAIN>/mcp",
+        "headers": {
+          "Authorization": "Bearer ${DOTS_GATEWAY_TOKEN}"
+        }
+      }
+    }
+  }
+}
+```
+Or via the OpenClaw CLI:
+```bash
+openclaw mcp add dots-gateway \
+  --transport streamable-http \
+  --url "https://<YOUR_DOMAIN>/mcp" \
+  --header "Authorization: Bearer ${DOTS_GATEWAY_TOKEN}"
+```
+
+#### Option 2 — Local / Self-Signed TLS Pinning via `dots_mcp.py` (`stdio`)
+Place `client.json` in `~/.config/dots-gateway/client.json` (`0600`), then add to `~/.openclaw/openclaw.json`:
+```json
+{
+  "mcp": {
+    "servers": {
+      "dots-gateway": {
+        "command": "python3",
+        "args": ["/absolute/path/to/dots-gateway/dots_mcp.py"]
+      }
+    }
+  }
+}
+```
+
+---
+
+### 2.6 Other IDEs & Custom Agent Frameworks (`agy` / Cursor / MCP SDK / LangGraph / Python SDK)
+
+#### 1) Google Antigravity (`agy` / IDE), Gemini CLI, Cursor, Windsurf & VS Code
+Add `dots-gateway` to your IDE's MCP config (`~/.gemini/settings.json`, `~/.cursor/mcp.json`, `~/.codeium/windsurf/mcp_config.json`, or VS Code `.vscode/mcp.json`):
+- **Via `dots_mcp.py` (`stdio` + `~/.config/dots-gateway/client.json`, works over self-signed IP)**:
+  ```json
+  {
+    "mcpServers": {
+      "dots-gateway": {
+        "command": "python3",
+        "args": ["/absolute/path/to/dots-gateway/dots_mcp.py"]
+      }
+    }
+  }
+  ```
+- **Via Streamable HTTP** (see [`mcp.remote.example.json`](mcp.remote.example.json); for VS Code `.vscode/mcp.json`, use top-level `"servers"` and `"type": "http"`).
+
+#### 2) Official Python MCP SDK (`mcp`) & LangGraph (`langchain-mcp-adapters`)
+```python
+import os
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+async def run_custom_mcp_agent() -> None:
+    headers = {"Authorization": f"Bearer {os.environ['DOTS_GATEWAY_TOKEN']}"}
+    async with streamablehttp_client(os.environ["DOTS_GATEWAY_MCP_URL"], headers=headers) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            status = await session.call_tool("gateway_status", {})
+            print(f"Loaded {len(tools.tools)} tools; status:", status.structuredContent)
+```
+With **LangGraph** (`pip install langgraph langchain-mcp-adapters`):
+```python
+import os
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
+mcp_client = MultiServerMCPClient(
+    {
+        "dots-gateway": {
+            "transport": "streamable_http",
+            "url": os.environ["DOTS_GATEWAY_MCP_URL"],
+            "headers": {"Authorization": f"Bearer {os.environ['DOTS_GATEWAY_TOKEN']}"},
+        }
+    }
+)
+tools = await mcp_client.get_tools()  # Pass directly into create_react_agent(model, tools)
+```
+
+#### 3) Zero-Dependency Python SDK (`DotsGatewayClient` — Direct REST / SSE / WebSocket)
+For custom Python orchestrators, CI pipelines, or agents that prefer direct typed Python methods without an MCP library, import [`dots_client.py`](dots_client.py) directly (stdlib only; auto-loads `~/.config/dots-gateway/client.json` or `GATEWAY_*` env vars with SHA-256 TLS pinning + replay-proof HMAC-SHA256 signing):
+```python
+from dots_client import DotsGatewayClient
+
+gw = DotsGatewayClient(load_config_file=True)
+
+print(gw.health())
+gw.write_file("hello.py", "print('hello from custom agent')\n", cwd="~/workspaces/demo")
+print(gw.exec_command("python3 hello.py", cwd="~/workspaces/demo")["stdout"])
+
+# Orchestrate all three local coding agents side-by-side:
+agy_res = gw.run_agy("Implement feature X and unit tests", cwd="~/workspaces/demo")
+codex_res = gw.run_codex(review=True, args=["--uncommitted"], sandbox_mode="read-only", cwd="~/workspaces/demo")
+claude_res = gw.run_claude(
+    "Review architecture and edge cases of uncommitted changes",
+    cwd="~/workspaces/demo",
+    skip_permissions=False,
+    permission_mode="plan",
+)
+```
 
 ---
 
@@ -125,116 +483,122 @@ Install this repository (`https://github.com/caishize/dots-gateway.git`) as a pl
 
 ```bash
 dots-gateway --help
-dots-gateway status           # Service health, sandbox storage, active agents, plugins & tunnel status
+dots-gateway status           # Live health, sandbox storage, agy/codex/claude status, plugins & tunnel
 dots-gateway start            # Start gateway (and configured tunnel) + run health checks
-dots-gateway restart          # Safely drains active sessions before restarting (pass --force to skip drain)
+dots-gateway restart          # Drain active sessions safely before restarting (--wait or --force)
 dots-gateway stop             # Stop gateway & tunnel services
-dots-gateway logs -f          # Tail systemd journal for gateway & tunnel (`dots-gateway logs tunnel -f` for tunnel only)
-dots-gateway config           # Print remote MCP URLs, OAuth endpoints & client.json snippets
-dots-gateway sync-ip [IP]     # Issue/renew Let's Encrypt short-lived IP + sslip.io certificate (requires TCP :80)
+dots-gateway logs -f          # Tail systemd journal (`dots-gateway logs tunnel -f` for tunnel only)
+dots-gateway config           # Print ready-to-use MCP snippets for OpenAI, Claude, Grok, OpenClaw & IDEs
+dots-gateway tunnel-setup     # Configure & start OpenAI Secure MCP Tunnel (`tunnel-client`)
+dots-gateway sync-ip [IP]     # Issue/renew Let's Encrypt short-lived IP + sslip.io certificate (TCP :80)
 
-# Hot-reloadable Agent & Sandbox Controls (effective immediately for new sessions, zero restart):
+# Hot-Reloadable Local Agent & Sandbox Controls (instant effect on new sessions, zero restart):
 dots-gateway agy-auth status|adc [PROJECT_ID]|oauth|toggle
 dots-gateway agy-model list|status|set <MODEL_ID>|reset
-dots-gateway agy-plugins status|add <PLUGIN_DIR>|on|off|remove <PLUGIN_DIR>|clear|doctor
+dots-gateway agy-plugins status|add <PLUGIN_DIR> [--enable]|on|off|remove <PLUGIN_DIR>|clear|doctor
+
 dots-gateway codex-setup
-dots-gateway codex-plugins status|add <PLUGIN_DIR>|on|off|remove <PLUGIN_DIR>|clear|doctor
+dots-gateway codex-plugins status|add <PLUGIN_DIR> [--enable]|on|off|remove <PLUGIN_DIR>|clear|doctor
+
+dots-gateway claude-setup [status|clear]
+dots-gateway claude-model status|set <MODEL_ID>|reset
+dots-gateway claude-plugins status|add <PLUGIN_DIR> [--enable]|on|off|remove <PLUGIN_DIR>|clear|doctor
+
 dots-gateway docker on|off|toggle|status|test
 ```
 
 ---
 
-## 4. Exposed MCP Tools (16), Resources & Prompts
+## 4. Exposed MCP Tools (17), Resources & Prompts
 
 | MCP Tool | Description |
 | :--- | :--- |
-| `gateway_status` | Live health, uptime, active/queued agent slots, allowed workspaces, trusted `agy` & `codex` plugin state, Docker proxy state, and policy summary |
-| `list_agy_models` | List model IDs available under the gateway's active `agy` auth mode (`adc` or `oauth`) plus default model info |
-| `run_agy` | Run `agy --sandbox` (`--dangerously-skip-permissions` optional) on the local host (`cwd`, `model`, `effort`, `conversation_id`, `continue_last`, `add_dirs`) |
-| `run_codex` | Run OpenAI Codex CLI (`codex -a never -s workspace-write exec`) on the local host (`cwd`, `sandbox_mode`, `model`, `effort`, `session_id`, `continue_last`, `review`) |
-| `exec_command` | Execute allowlisted commands or shell pipelines (`git`, `pytest`, `npm`, `cargo`, `./scripts/...`) with live SSE progress |
+| `gateway_status` | Live health, uptime, active/queued `agy`/`codex`/`claude` slots, allowed workspaces, plugin & hook jail state, Docker proxy state, and command policy |
+| `list_agy_models` | List model IDs available under the gateway's active `agy` auth mode (`adc` or `oauth`) plus default model |
+| `run_agy` | Run Google Antigravity CLI (`agy --sandbox`) inside the jailed workspace (`cwd`, `model`, `effort`, `conversation_id`, `continue_last`, `add_dirs`) |
+| `run_codex` | Run OpenAI Codex CLI (`codex -a never -s workspace-write exec` or `review`) inside the jailed workspace (`cwd`, `sandbox_mode`, `model`, `effort`, `session_id`, `continue_last`, `review`) |
+| `run_claude` | Run Anthropic Claude Code CLI (`claude -p`) inside the jailed workspace (`cwd`, `skip_permissions`, `permission_mode`, `model`, `effort`, `session_id`, `continue_last`, `output_format`, `add_dirs`) |
+| `exec_command` | Execute allowlisted commands, compound pipelines, or heredoc scripts (`git`, `pytest`, `npm`, `cargo`, `go`, `./scripts/...`) with live SSE progress |
 | `fs_stat` / `fs_list` | Inspect file/symlink metadata or list directory entries inside allowed workspaces |
 | `fs_read` | Read UTF-8 text or Base64 binary files with optional byte `offset`/`limit` |
-| `fs_write` / `fs_patch` / `fs_delete` | Atomically write, exact search-and-replace patch (`replace_all` guarded), or delete workspace files |
-| `session_start` | Launch non-blocking background `exec`, `codex`, or multi-turn interactive `agy` sessions |
-| `session_poll` | Poll incremental events (`after_seq`) with optional long-poll `wait_seconds` and `wait_for_exit` |
-| `session_input` / `session_signal` / `session_list` | Send `stdin` / follow-up `agy` turns, signal (`SIGINT`/`SIGTERM`/`SIGKILL`), or list live & persisted sessions |
+| `fs_write` / `fs_patch` / `fs_delete` | Atomically create/overwrite, exact search-and-replace patch (`replace_all` guarded), or delete workspace files |
+| `session_start` | Start background `exec`, `codex`, or interactive multi-turn `agy` / `claude` (`stream-json`) sessions |
+| `session_poll` | Poll incremental events (`after_seq`) with optional long-poll `wait_seconds`, `wait_for_exit`, and output paging |
+| `session_input` / `session_signal` / `session_list` | Send `stdin` or follow-up `agy`/`claude` turns, signal process groups (`SIGINT`/`SIGTERM`/`SIGKILL`), or list live & persisted sessions |
 
 - **MCP Resources**: `gateway://status`, `gateway://policy`, and template `file://{path}`
-- **MCP Prompts**: `delegate_to_agy`, `delegate_to_codex`, `remote_tdd_loop`
+- **MCP Prompts**: `delegate_to_agy`, `delegate_to_codex`, `delegate_to_claude`, `remote_tdd_loop`
+- **REST & WebSocket Parity**: Every capability is also exposed via `/v1/exec`, `/v1/agy`, `/v1/codex`, `/v1/claude`, `/v1/sessions`, `/v1/files/*`, and full-duplex `/v1/ws` (`action: "exec" | "agy" | "codex" | "claude"`).
 
 ---
 
-## 5. Advanced Isolation & Security Architecture
+## 5. Isolation & Security Architecture
 
-### Isolated Plugin Discovery & Unified Native Hook Sandboxing (`agy-plugins` & `codex-plugins`)
+### Three-Agent Isolated Plugin Discovery & Unified Hook Sandboxing (`agy-plugins` / `codex-plugins` / `claude-plugins`)
 
-By default, both `agy` and `codex` plugin mounting are **disabled (`agy_plugins_enabled: false`, `codex_plugins_enabled: false`)**.
+By default, plugin mounting is **disabled** for all three local agents (`agy_plugins_enabled: false`, `codex_plugins_enabled: false`, `claude_plugins_enabled: false`).
 
-#### Why Isolated Discovery + Unified Hook Sandboxing Are Required
-1. **Protected `HOME` vs Plugin Discovery (`deny > allow`)**: When a deployment protects `HOME`, Gateway keeps `read_file(<real_HOME>)` in `permissions.deny`. Discovering plugins under `<real_HOME>/.gemini/config/plugins/<name>` would hit user deny rules, whereas deleting parent `deny` rules would expose tunnel and gateway secrets.
-2. **Native Auto-Triggered Hooks Run Outside Inner Tool Sandboxes**: Both `agy` and `codex` execute `hooks.json` command handlers directly in the outer agent process (outside `agy --sandbox` and outside `codex-linux-sandbox`), where an unsandboxed hook could read agent OAuth/ADC/`auth.json` credentials or execute untrusted code planted inside a writable workspace.
+#### Security Guarantees
+1. **Isolated Runtime Homes (`agent_runtime_home_root`, default `/mnt/dots-agent-home`)**:
+   - Real host `$HOME` (`~/gateway`, `~/.config/dots-gateway`, `~/.config/tunnel-client`, `~/.ssh`, `~/.gemini`, `~/.codex`, `~/.claude`) stays masked and denied.
+   - Inside each session's private mount namespace:
+     - `agy` runs with `HOME=/mnt/dots-agent-home/agy` and discovers read-only plugins under `/mnt/dots-agent-home/agy/.gemini/config/plugins/<name>`.
+     - `codex` runs with `CODEX_HOME=/mnt/dots-agent-home/codex/.codex` (disk-backed at `<sandbox_state_dir>/codex_home`, `$CODEX_HOME/hooks.json` masked to `/dev/null`, and plugins mounted read-only with synthesized `trusted_hash` & `trusted_content_hash`).
+     - `claude` runs with `CLAUDE_CONFIG_DIR=/mnt/dots-agent-home/claude/.claude` (disk-backed at `<sandbox_state_dir>/claude_home`, `--setting-sources=user`, `--strict-mcp-config`, `--mcp-config={"mcpServers":{}}`, and operator-registered plugins passed via `--plugin-dir=/mnt/dots-agent-home/claude/plugins/<name>`).
+2. **Untrusted Workspace Config & Hook Blocking**:
+   - Active workspace config/hook injection paths (`.gemini/settings.json`, `.gemini/antigravity-cli`, `.gemini/config/plugins`, `.codex/hooks.json`, `.codex/config.toml`, `.agents/plugins`, `.claude/settings.local.json`, `.mcp.json`, `.git/hooks`) are masked or neutralized, while Git-tracked `.claude/settings.json` and `.claude/hooks` are locked `ro,noexec` so `git status`/`git diff` stay clean without trusting repo-planted hooks.
+   - Task-level overrides (`plugin_dirs`, `--plugin-dir`, `--mcp-config`, `--setting-sources`, etc.) are rejected fail-closed by `CommandPolicy` and `MCPHandler`.
+3. **Unified W^X Native Hook Jail (`gateway/hook_jail.py` -> `dots-hook-jail.py`)**:
+   - Every `hooks.json` command handler in registered `agy`, `codex`, and `claude` plugins is validated at registration/startup and rewritten to run inside `dots-hook-jail.py`.
+   - Each hook invocation enters an inner `unshare --user --map-current-user --mount --propagation private` + `pivot_root` jail that masks agent OAuth/ADC/API credentials, scrubs secret env vars, mounts workspaces **`rw,nosuid,nodev,noexec`** (W^X), enforces `python3 -I`, neutralizes `.git/config` command hooks (`GIT_CONFIG_COUNT`), and fails closed if namespace isolation is unavailable.
 
-Gateway solves both problems simultaneously **without opening real `HOME` or weakening parent `deny` rules**:
-- **Isolated Runtime & Plugin Discovery (`agent_runtime_home_root`, default `/mnt/dots-agent-home`)**: Inside the session's mount namespace, `agy` runs with `HOME=<agent_runtime_home_root>/agy` (discovering read-only plugins at `<agent_runtime_home_root>/agy/.gemini/config/plugins/<name>`) and `codex` runs with `HOME=<agent_runtime_home_root>/codex` + `CODEX_HOME=<agent_runtime_home_root>/codex/.codex` backed by disk storage at `<sandbox_state_dir>/codex_home` (permanently masking `$CODEX_HOME/hooks.json` with `/dev/null` and discovering read-only plugins over an isolated `tmpfs` at `<CODEX_HOME>/plugins/cache/<marketplace>/<name>/<version>` with synthesized `config.toml` `trusted_hash` & `trusted_content_hash`), while `<real_HOME>` stays masked and denied.
-- **Strict 3-Category Directory Separation (`plugin_state_dir`)**: Project progress (`docs/exec-plans/active/*.json`), `/verify` signals (`.claude/signals/verify-latest.json` for `agy`, `.codex/signals/verify-latest.json` for `codex`), and metrics (`.claude/metrics/*`, `.codex/metrics/*`) write strictly to authorized `allowed_workdirs`, while hook temporary queues (`TMPDIR`) and `PLUGIN_DATA` / `CLAUDE_PLUGIN_DATA` write strictly to isolated per-session directories under `plugin_state_dir` (default `<sandbox_state_dir>/plugin_state`).
-- **Unified Native Hook Jail (`gateway/hook_jail.py` -> `dots-hook-jail.py`)**: Every native `hooks.json` command handler in staged `agy` and `codex` plugins is validated fail-closed and rewritten to execute inside `dots-hook-jail.py`. Each hook invocation enters a dedicated inner `unshare --user --map-current-user --mount --propagation private` + `pivot_root` jail that:
-  - masks agent credentials (`oauth_creds.json`, `application_default_credentials.json`, `$CODEX_HOME/auth.json`, `~/.config/gh`, `~/.ssh`, `protected_paths`) and scrubs secret environment variables (`OPENAI_API_KEY`, `CODEX_API_KEY`, `GOOGLE_*`, `ANTHROPIC_*`, `GH_TOKEN`, etc.);
-  - mounts `allowed_workdirs` with **`rw,nosuid,nodev,noexec`** (W^X: hooks can inspect files and append project metrics ledgers while kernel `noexec` + path validation block executing untrusted workspace binaries/scripts);
-  - forces `python3 -I` + `PYTHONSAFEPATH=1` + `PYTHONDONTWRITEBYTECODE=1` and injects `GIT_CONFIG_COUNT` overrides neutralizing repo `.git/config` `core.fsmonitor` / `core.sshCommand` / `core.hooksPath` / `diff.external` execution;
-  - masks active workspace hook/config injection paths (`.gemini/settings.json`, `.gemini/antigravity-cli`, `.gemini/config/plugins`, `.codex/hooks.json`, `.codex/config.toml`, `.agents/plugins`, `.git/hooks`) and locks passive Git-tracked Claude config/hook paths (`.claude/settings.json`, `.claude/settings.local.json`, `.claude/hooks`) read-only + `noexec`;
-  - **fails closed** if Linux user + mount namespaces (`unshare`) are disabled or blocked by host kernel/seccomp policy.
-
-| Directory Category | Recommended Host Layout | Access Contract |
-| :--- | :--- | :--- |
-| **1. Plugin Resources (`插件资源`)** | `~/agy-plugins/oh-my-agents` (`gemini` branch)<br>`~/codex-plugins/oh-my-agents` (`codex` branch) | **Read-only (`ro,nosuid,nodev`) + executable scripts**, exposed under `agent_runtime_home_root`. Tasks and hooks cannot modify installed plugin files. |
-| **2. Project Workspaces (`项目工作区`)** | `~/workspaces/<project>` (`allowed_workdirs`) | **Per-task read-write (`rw`)** for the agent (`rw,nosuid,nodev,noexec` W^X inside native hooks; repo-local hook/config injection paths masked). |
-| **3. Runtime State & Credentials (`运行状态与凭据`)** | Secrets: `~/gateway`, `~/.config/dots-gateway`, `~/.config/tunnel-client`<br>Login state: `~/.gemini`, `~/.codex`<br>Sandbox & hook state: `~/.cache/dots-sandbox` (`plugin_state_dir`) | **Independently protected**. Gateway/tunnel keys stay masked in both agents and hooks; agent login tokens are visible only to the outer agent binary and masked inside native hooks. |
-
-**Operator Setup & Instant Rollback Example (`oh-my-agents`):**
+**Operator Setup & Zero-Restart Rollback Example (`oh-my-agents` across all 3 agents):**
 
 ```bash
-# 1a. Clone & enable oh-my-agents (gemini branch) for AGY (zero gateway restart)
+# 1a. Antigravity (`agy`) — `gemini` branch
 mkdir -p ~/agy-plugins
 git clone -b gemini https://github.com/caishize/oh-my-agents.git ~/agy-plugins/oh-my-agents
 chmod -R go-w ~/agy-plugins/oh-my-agents
-dots-gateway agy-plugins add ~/agy-plugins/oh-my-agents --enable
-dots-gateway agy-plugins doctor
+dots-gateway agy-plugins add ~/agy-plugins/oh-my-agents --enable && dots-gateway agy-plugins doctor
 
-# 1b. Clone & enable oh-my-agents (codex branch) for Codex (zero gateway restart)
+# 1b. OpenAI Codex (`codex`) — `codex` branch
 mkdir -p ~/codex-plugins
 git clone -b codex https://github.com/caishize/oh-my-agents.git ~/codex-plugins/oh-my-agents
 chmod -R go-w ~/codex-plugins/oh-my-agents
-dots-gateway codex-plugins add ~/codex-plugins/oh-my-agents --enable
-dots-gateway codex-plugins doctor
+dots-gateway codex-plugins add ~/codex-plugins/oh-my-agents --enable && dots-gateway codex-plugins doctor
 
-# 2. Instant Rollback (zero restart):
-dots-gateway agy-plugins off && dots-gateway codex-plugins off
+# 1c. Anthropic Claude Code (`claude`) — `main` branch
+mkdir -p ~/claude-plugins
+git clone -b main https://github.com/caishize/oh-my-agents.git ~/claude-plugins/oh-my-agents
+chmod -R go-w ~/claude-plugins/oh-my-agents
+dots-gateway claude-plugins add ~/claude-plugins/oh-my-agents --enable && dots-gateway claude-plugins doctor
+
+# Instant Rollback (effective immediately for new sessions, zero restart):
+dots-gateway agy-plugins off
+dots-gateway codex-plugins off
+dots-gateway claude-plugins off
 ```
 
-### Sandbox Docker Access (`dots-gateway docker`)
+### Policy-Filtered Sandbox Docker Access (`dots-gateway docker`)
 
-The host `docker.sock` (root-equivalent) is **always masked** inside the mount-namespace jail. When `dots-gateway docker on` is set, sessions get a gateway-owned filtering proxy socket at `/var/run/docker.sock`:
-- bind mounts (and bind-backed volumes) only inside `allowed_workdirs` (+ `docker_extra_bind_roots`), never in `protected_paths`, `plugin_state_dir`, or registered plugin directories, with symlinks re-checked at `start`, `restart`, and `unpause`;
-- no `--privileged`, `--device`, `--cap-add` (unless in `docker_allowed_capabilities`), `--pid/--ipc/--uts/--userns=host`, custom runtimes, or unconfined security options;
-- only containers/volumes/networks created through the proxy (label `io.dots-gateway.managed=true`) can be inspected, exec'd, attached, or removed — host containers stay invisible;
-- published ports are rewritten to `127.0.0.1` (`docker_force_loopback_ports`); swarm, plugins, and unknown API routes are denied.
-
-> Note: files written by root inside containers to bind-mounted workspaces become root-owned; run containers with `--user "$(id -u):$(id -g)"` when needed.
+Host `/var/run/docker.sock` is **always masked** inside the mount-namespace jail. When `dots-gateway docker on` is enabled, sessions talk to an in-gateway HTTP filtering proxy (`gateway/docker_proxy.py`):
+- Bind mounts (and bind-backed volumes) are restricted to `allowed_workdirs` (+ `docker_extra_bind_roots`), never `protected_paths`, `plugin_state_dir`, or registered plugin directories, with symlink re-verification on `start`/`restart`/`unpause`.
+- Blocks `--privileged`, `--device`, `--cap-add`, `--pid/--ipc/--uts/--userns=host`, custom runtimes, and unconfined security profiles.
+- Isolates visibility strictly to proxy-created resources (`io.dots-gateway.managed=true`) and rewrites published container ports to `127.0.0.1` (`docker_force_loopback_ports`).
 
 ---
 
-## 6. Plugin & Repository Layout
+## 6. Repository Layout
 
-- `plugin.json` & `.codex-plugin/plugin.json` — Portable **Agent Plugins 1.0** + OpenAI `extensions.com.openai` & Codex plugin manifests (`v1.5.24`, `Apache-2.0`)
-- `pyproject.toml` — Zero-dependency Python 3.11+ package metadata (`v1.5.24`), `pytest`, and `ruff` configuration
-- `LICENSE` & `SECURITY.md` — Apache License 2.0 and private vulnerability disclosure / deployment baseline
-- `mcp.json` & `mcp.remote.example.json` — Bundled `stdio` MCP definition (`./dots_mcp.py`) and example `streamable-http` MCP configuration
-- `config.example.json` & `client.example.json` — Reference host gateway & client configuration templates
-- `skills/` (`remote-dev-gateway`, `delegate-to-agy`, `delegate-to-codex`) & `rules/AGENTS.md` — Bundled agent workflow skills and workspace safety rules
+- `plugin.json`, `.codex-plugin/plugin.json`, `.claude-plugin/plugin.json` — Native plugin manifests for Agent Plugins 1.0 / OpenAI `dots`, OpenAI Codex, and Anthropic Claude Code (`v1.5.25`, `Apache-2.0`)
+- `pyproject.toml` — Zero-dependency Python 3.11+ package metadata (`v1.5.25`), `pytest`, and `ruff` config
+- `LICENSE` & `SECURITY.md` — Apache License 2.0 and private vulnerability disclosure / deployment security baseline
+- `mcp.json` & `mcp.remote.example.json` — Bundled `stdio` MCP bridge definition and `streamable-http` template
+- `config.example.json` & `client.example.json` — Reference gateway & client configuration templates
+- `skills/` (`remote-dev-gateway`, `delegate-to-agy`, `delegate-to-codex`, `delegate-to-claude`) & `rules/AGENTS.md` — Agent workflow skills and workspace safety rules
 - `gateway.sh` — Unified operator CLI (`~/.local/bin/dots-gateway`)
-- `dots_mcp.py` & `dots_client.py` — Standalone zero-dependency MCP `stdio` bridge and Python SDK/CLI
-- `main.py` & `deploy/` — Gateway entrypoint, `systemd` user unit templates, and Let's Encrypt IP certificate helper
+- `dots_mcp.py` & `dots_client.py` — Zero-dependency MCP `stdio` bridge and standalone Python SDK/CLI
+- `main.py` & `deploy/` — Gateway entrypoint, `systemd` user service units, and Let's Encrypt IP certificate helper
 - `gateway/` — Core server (`server.py`, `mcp.py`, `auth.py`, `oauth.py`, `policy.py`, `sandbox.py`, `hook_jail.py`, `executor.py`, `docker_proxy.py`, `files.py`, `tls.py`, `protocol.py`, `config.py`)
 
 ---
@@ -242,7 +606,7 @@ The host `docker.sock` (root-equivalent) is **always masked** inside the mount-n
 ## 7. Running Automated & Live Tests
 
 ```bash
-# Full unit, security, Docker proxy, MCP protocol, and plugin/hook isolation test suite
+# Full unit, security, Docker proxy, MCP protocol, and agy/codex/claude sandbox test suite
 pytest -v
 # or via stdlib unittest (zero external test dependencies):
 python3 -m unittest discover -s tests -p "test_*.py" -v
@@ -251,7 +615,7 @@ python3 -m unittest discover -s tests -p "test_*.py" -v
 ruff check .
 bash -n gateway.sh
 
-# Full live end-to-end verification against running dots-gateway.service (HTTPS + WSS + MCP + agy)
+# Live end-to-end verification against running dots-gateway.service (HTTPS + WSS + MCP)
 python3 tests/live_call_test.py
 ```
 

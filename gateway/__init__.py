@@ -1,3 +1,3 @@
-"""Dots <-> Local Dev, Antigravity (agy) & Codex Bidirectional Remote Gateway & MCP Plugin."""
+"""Dots <-> Local Dev, Antigravity (agy), Codex & Claude Code Bidirectional Remote Gateway & MCP Plugin."""
 
-__version__ = "1.5.24"
+__version__ = "1.5.25"

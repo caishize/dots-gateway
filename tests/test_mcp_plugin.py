@@ -73,29 +73,46 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(root_manifest["mcpServers"], "./mcp.json")
         self.assertIn("com.openai", root_manifest.get("extensions", {}))
 
-        # 2. Validate .codex-plugin/plugin.json compatibility manifest
+        # 2. Validate .codex-plugin/plugin.json & .claude-plugin/plugin.json manifests
         codex_manifest = json.loads(
             (GATEWAY_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
         self.assertEqual(codex_manifest["name"], "dots-gateway")
         self.assertEqual(codex_manifest["mcpServers"], "./mcp.json")
 
+        claude_manifest = json.loads(
+            (GATEWAY_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(claude_manifest["name"], "dots-gateway")
+        self.assertEqual(claude_manifest["skills"], "./skills/")
+        self.assertIn("dots-gateway", claude_manifest["mcpServers"])
+        self.assertIn(
+            "${CLAUDE_PLUGIN_ROOT}/dots_mcp.py",
+            claude_manifest["mcpServers"]["dots-gateway"]["args"],
+        )
+
         # 2b. Enforce strict version parity across package, manifests, pyproject.toml, and README
         pyproject_data = tomllib.loads((GATEWAY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         expected_ver = gateway.__version__
-        self.assertEqual(expected_ver, "1.5.24")
+        self.assertEqual(expected_ver, "1.5.25")
         self.assertEqual(root_manifest["version"], expected_ver)
         self.assertEqual(root_manifest.get("license"), "Apache-2.0")
         self.assertEqual(codex_manifest["version"], expected_ver)
         self.assertEqual(codex_manifest.get("license"), "Apache-2.0")
+        self.assertEqual(claude_manifest["version"], expected_ver)
+        self.assertEqual(claude_manifest.get("license"), "Apache-2.0")
         self.assertEqual(pyproject_data["project"]["version"], expected_ver)
         self.assertTrue((GATEWAY_ROOT / "LICENSE").is_file())
         self.assertIn("Apache License", (GATEWAY_ROOT / "LICENSE").read_text(encoding="utf-8"))
         self.assertTrue((GATEWAY_ROOT / "SECURITY.md").is_file())
         readme_text = (GATEWAY_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn(f"v{expected_ver}", readme_text)
-        self.assertEqual(len(TOOL_DEFINITIONS), 16)
+        for doc_section in ("OpenAI", "Anthropic", "Grok", "OpenClaw", "run_claude", "claude-plugins"):
+            self.assertIn(doc_section, readme_text)
+        self.assertEqual(len(TOOL_DEFINITIONS), 17)
         self.assertTrue(callable(getattr(DotsGatewayClient, "list_agy_models", None)))
+        self.assertTrue(callable(getattr(DotsGatewayClient, "run_claude", None)))
+        self.assertTrue(callable(getattr(DotsGatewayClient, "stream_claude", None)))
 
         # 3. Validate mcp.json
         mcp_cfg = json.loads((GATEWAY_ROOT / "mcp.json").read_text(encoding="utf-8"))
@@ -105,7 +122,12 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(os.access(GATEWAY_ROOT / "dots_mcp.py", os.X_OK))
 
         # 4. Validate bundled SKILL.md files
-        for skill_name in ("remote-dev-gateway", "delegate-to-agy", "delegate-to-codex"):
+        for skill_name in (
+            "remote-dev-gateway",
+            "delegate-to-agy",
+            "delegate-to-codex",
+            "delegate-to-claude",
+        ):
             skill_md = GATEWAY_ROOT / "skills" / skill_name / "SKILL.md"
             self.assertTrue(skill_md.is_file(), f"Missing {skill_md}")
             content = skill_md.read_text(encoding="utf-8")
@@ -177,6 +199,7 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
             "exec_command",
             "run_agy",
             "run_codex",
+            "run_claude",
             "session_start",
             "session_poll",
             "session_input",
@@ -2387,6 +2410,454 @@ class MCPAndPluginTests(unittest.IsolatedAsyncioTestCase):
         sub_sessions = ls_sub["result"]["structuredContent"]["sessions"]
         self.assertEqual(len(sub_sessions), 1)
         self.assertEqual(sub_sessions[0]["session_id"], ok_sid)
+
+    async def test_v1525_claude_code_agent_plugins_hooks_and_multi_client_auth(self) -> None:
+        import ssl
+        import subprocess
+        import urllib.error
+        import urllib.request
+        from dots_client import load_client_config_file
+
+        # 1. CLAUDE_PLUGIN_DATA discovery in load_client_config_file()
+        claude_pd = Path(self.tmpdir) / "claude_plugin_data"
+        claude_pd.mkdir(parents=True, exist_ok=True)
+        (claude_pd / "client.json").write_text(
+            json.dumps({"url": self.https_url, "verify_tls": False}),
+            encoding="utf-8",
+        )
+        old_cpd = os.environ.get("CLAUDE_PLUGIN_DATA")
+        old_dgcc = os.environ.get("DOTS_GATEWAY_CLIENT_CONFIG")
+        try:
+            os.environ.pop("DOTS_GATEWAY_CLIENT_CONFIG", None)
+            os.environ["CLAUDE_PLUGIN_DATA"] = str(claude_pd)
+            loaded_pd = load_client_config_file()
+            self.assertEqual(loaded_pd.get("url"), self.https_url)
+        finally:
+            if old_cpd is None:
+                os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+            else:
+                os.environ["CLAUDE_PLUGIN_DATA"] = old_cpd
+            if old_dgcc is not None:
+                os.environ["DOTS_GATEWAY_CLIENT_CONFIG"] = old_dgcc
+
+        # 2. Bare Authorization header (e.g. xAI Grok MCP connector) & duplicate Bearer prefix
+        ssl_ctx = ssl.create_default_context(cafile=self.pki["ca_cert"])
+
+        def _raw_mcp_ping(auth_header_val: str) -> Dict[str, Any]:
+            body = json.dumps({"jsonrpc": "2.0", "id": "bare-1", "method": "ping"}).encode("utf-8")
+            req = urllib.request.Request(
+                url=f"{self.https_url}/mcp",
+                data=body,
+                headers={
+                    "Authorization": auth_header_val,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        bare_ok = await asyncio.to_thread(_raw_mcp_ping, self.cfg.api_tokens[0])
+        self.assertEqual(bare_ok["result"], {})
+        dup_ok = await asyncio.to_thread(_raw_mcp_ping, f"Bearer Bearer {self.cfg.api_tokens[0]}")
+        self.assertEqual(dup_ok["result"], {})
+        with self.assertRaises(urllib.error.HTTPError) as bad_bare:
+            await asyncio.to_thread(_raw_mcp_ping, "wrong-bare-cred")
+        self.assertEqual(bad_bare.exception.code, 401)
+        bad_bare.exception.close()
+
+        # 3. OAuth 2.1 DCR redirect host allowlist includes claude.com & grok.com
+        def _dcr(redirect_uri: str) -> int:
+            body = json.dumps(
+                {"client_name": "test-mcp-connector", "redirect_uris": [redirect_uri]}
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                url=f"{self.https_url}/oauth/register",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
+                    return resp.status
+            except urllib.error.HTTPError as exc:
+                code = exc.code
+                exc.close()
+                return code
+
+        self.assertEqual(
+            await asyncio.to_thread(_dcr, "https://claude.com/api/mcp/auth_callback"), 201
+        )
+        self.assertEqual(
+            await asyncio.to_thread(_dcr, "https://grok.com/oauth/callback"), 201
+        )
+        self.assertEqual(
+            await asyncio.to_thread(_dcr, "https://evil-attacker.example.com/cb"), 400
+        )
+
+        # 4. Dedicated Claude Code sandbox, hot-reload model/env, interactive multi-turn & claude-plugins
+        import uuid
+
+        home_real = Path(os.path.realpath(str(Path.home())))
+        claude_root = home_real / f"dots_claude_suite_{uuid.uuid4().hex[:10]}"
+        claude_root.mkdir(parents=True, exist_ok=True)
+        os.chmod(claude_root, 0o755)
+        try:
+            ws_dir = claude_root / "workspaces" / "demo"
+            ws_dir.mkdir(parents=True, exist_ok=True)
+            bin_dir = claude_root / "bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            cfg_dir = claude_root / "gw_cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            sb_dir = claude_root / "sandbox_store"
+            sb_dir.mkdir(parents=True, exist_ok=True)
+            plugin_dir = claude_root / "claude_plugins" / "oma-claude"
+            (plugin_dir / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+            (plugin_dir / "skills" / "arch-review").mkdir(parents=True, exist_ok=True)
+            (plugin_dir / "hooks").mkdir(parents=True, exist_ok=True)
+
+            (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+                json.dumps(
+                    {
+                        "name": "oma-claude",
+                        "version": "1.0.0",
+                        "description": "Test Claude plugin with native hook",
+                        "skills": "./skills/",
+                        "hooks": "./hooks/hooks.json",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (plugin_dir / "skills" / "arch-review" / "SKILL.md").write_text(
+                "---\nname: arch-review\ndescription: Review architecture\n---\n# arch-review\n",
+                encoding="utf-8",
+            )
+            hook_sh = plugin_dir / "hooks" / "on_start.sh"
+            hook_sh.write_text(
+                "#!/bin/sh\n"
+                "set -eu\n"
+                "printf '%s\\n' \"HOOK_OK:${CLAUDE_PLUGIN_ROOT:-unset}\" > \"${PWD}/.hook_ran\"\n"
+                "printf '{\"continue\":true}\\n'\n",
+                encoding="utf-8",
+            )
+            os.chmod(hook_sh, 0o755)
+            (plugin_dir / "hooks" / "hooks.json").write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "SessionStart": [
+                                {
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/on_start.sh\"",
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            for root_w, dirs_w, files_w in os.walk(plugin_dir):
+                os.chmod(root_w, 0o755)
+                for dw in dirs_w:
+                    os.chmod(os.path.join(root_w, dw), 0o755)
+                for fw in files_w:
+                    fp_w = os.path.join(root_w, fw)
+                    os.chmod(fp_w, 0o755 if fw.endswith(".sh") else 0o644)
+
+            mock_claude = bin_dir / "claude"
+            mock_claude.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, subprocess, sys\n"
+                "argv = sys.argv[1:]\n"
+                "cfg_env = os.environ.get('CLAUDE_CONFIG_DIR', '')\n"
+                f"secret_exposed = os.path.exists({str(cfg_dir / 'claude.env')!r})\n"
+                "plugin_dirs = []\n"
+                "for i, tok in enumerate(argv):\n"
+                "    if tok.startswith('--plugin-dir='):\n"
+                "        plugin_dirs.append(tok.split('=', 1)[1])\n"
+                "    elif tok == '--plugin-dir' and i + 1 < len(argv):\n"
+                "        plugin_dirs.append(argv[i + 1])\n"
+                "hook_rc = None\n"
+                "if plugin_dirs:\n"
+                "    hj = pathlib.Path(plugin_dirs[0]) / 'hooks' / 'hooks.json'\n"
+                "    if hj.is_file():\n"
+                "        hdata = json.loads(hj.read_text(encoding='utf-8'))\n"
+                "        cmd = hdata['hooks']['SessionStart'][0]['hooks'][0]['command']\n"
+                "        proc = subprocess.run(cmd, shell=True, input='{}', text=True, capture_output=True)\n"
+                "        hook_rc = proc.returncode\n"
+                "if '--input-format' in argv and 'stream-json' in argv:\n"
+                "    print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'claude-interactive-77'}), flush=True)\n"
+                "    for idx, raw in enumerate(sys.stdin, 1):\n"
+                "        raw = raw.strip()\n"
+                "        if not raw:\n"
+                "            continue\n"
+                "        msg = json.loads(raw)\n"
+                "        txt = msg['message']['content'][0]['text']\n"
+                "        print(json.dumps({'type': 'result', 'session_id': 'claude-interactive-77', 'turn': idx, 'echo': txt}), flush=True)\n"
+                "    sys.exit(0)\n"
+                "report = {\n"
+                "    'session_id': 'claude-oneshot-42',\n"
+                "    'argv': argv,\n"
+                "    'claude_config_dir': cfg_env,\n"
+                "    'has_base_url': os.environ.get('ANTHROPIC_BASE_URL'),\n"
+                "    'secret_exposed': secret_exposed,\n"
+                "    'plugin_dirs': plugin_dirs,\n"
+                "    'hook_rc': hook_rc,\n"
+                "}\n"
+                "print(json.dumps(report), flush=True)\n",
+                encoding="utf-8",
+            )
+            os.chmod(mock_claude, 0o755)
+
+            secret_file = cfg_dir / "claude.env"
+            env_k = "ANTHROPIC_API_" + "KEY"
+            secret_file.write_text(
+                f"{env_k}=ant-mock-val\nANTHROPIC_BASE_URL=https://api.anthropic.example\n",
+                encoding="utf-8",
+            )
+            os.chmod(secret_file, 0o600)
+
+            model_file = cfg_dir / "claude.model"
+            model_file.write_text("claude-sonnet-4-6\n", encoding="utf-8")
+            os.chmod(model_file, 0o600)
+
+            plugins_file = cfg_dir / "claude-plugins.json"
+            cfg_json_path = cfg_dir / "config.json"
+
+            claude_cfg = GatewayConfig(
+                host="127.0.0.1",
+                port=0,
+                api_tokens=["claude-suite-tok"],
+                hmac_secret="claude-suite-hmac",
+                allowed_workdirs=[str(claude_root / "workspaces")],
+                default_workdir=str(ws_dir),
+                protected_paths=[str(cfg_dir)],
+                allowed_commands=["python3", "bash", "sh", "claude", str(mock_claude)],
+                isolate_mount_namespace=can_use_mount_namespace(),
+                sandbox_state_dir=str(sb_dir),
+                claude_binary=str(mock_claude),
+                claude_env_file=str(secret_file),
+                claude_model_file=str(model_file),
+                claude_plugins_file=str(plugins_file),
+                docker_proxy_socket=str(claude_root / "docker-proxy.sock"),
+                tls_certfile=self.pki["server_cert"],
+                tls_keyfile=self.pki["server_key"],
+                tls_ca_file=self.pki["ca_cert"],
+            )
+            claude_cfg.save(cfg_json_path)
+
+            claude_srv = GatewayServer(claude_cfg)
+            chost, cport = await claude_srv.start()
+            try:
+                cclient = DotsGatewayClient(
+                    base_url=f"https://{chost}:{cport}",
+                    token="claude-suite-tok",
+                    tls_fingerprint=self.pki["server_fingerprint_sha256"],
+                )
+
+                # 4a. Direct `claude` invocation in `exec_command` MUST be rejected
+                direct_err, _ = await asyncio.to_thread(
+                    cclient.mcp_request,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "c-direct",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exec_command",
+                            "arguments": {"command": "claude -p hi", "cwd": str(ws_dir)},
+                        },
+                    },
+                )
+                self.assertTrue(direct_err["result"]["isError"])
+
+                # 4b. Task-level plugin/mcp override MUST be rejected
+                override_err, _ = await asyncio.to_thread(
+                    cclient.mcp_request,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "c-override",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "run_claude",
+                            "arguments": {
+                                "prompt": "hi",
+                                "cwd": str(ws_dir),
+                                "args": ["--mcp-config", "/etc/passwd"],
+                            },
+                        },
+                    },
+                )
+                self.assertTrue(override_err["result"]["isError"])
+
+                # 4c. Single-shot `run_claude` with default model hot-reload & permission_mode='plan'
+                run_resp, _ = await asyncio.to_thread(
+                    cclient.mcp_request,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "c-run-1",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "run_claude",
+                            "arguments": {
+                                "prompt": "Audit architecture",
+                                "cwd": str(ws_dir),
+                                "skip_permissions": False,
+                                "permission_mode": "plan",
+                                "output_format": "json",
+                            },
+                        },
+                    },
+                )
+                self.assertFalse(run_resp["result"]["isError"], run_resp)
+                sc = run_resp["result"]["structuredContent"]
+                self.assertEqual(sc["agent_conversation_id"], "claude-oneshot-42")
+                report = json.loads(sc["stdout"].strip())
+                self.assertIn("--setting-sources=user", report["argv"])
+                self.assertIn("--strict-mcp-config", report["argv"])
+                self.assertIn("--permission-mode", report["argv"])
+                self.assertIn("plan", report["argv"])
+                self.assertIn("--model", report["argv"])
+                self.assertIn("claude-sonnet-4-6", report["argv"])
+                self.assertEqual(report["has_base_url"], "https://api.anthropic.example")
+                self.assertEqual(report["plugin_dirs"], [])
+                if can_use_mount_namespace():
+                    self.assertFalse(report["secret_exposed"])
+                    self.assertEqual(report["claude_config_dir"], "")
+
+                # 4d. Enable trusted Claude plugin via `gateway.sh claude-plugins` CLI & run doctor
+                gw_env = dict(os.environ)
+                gw_env["GATEWAY_CONFIG_FILE"] = str(cfg_json_path)
+                gw_env["GATEWAY_CLIENT_CONFIG_DIR"] = str(cfg_dir)
+                gw_env["GATEWAY_CLAUDE_PLUGINS_FILE"] = str(plugins_file)
+                add_proc = subprocess.run(
+                    [
+                        "bash",
+                        str(GATEWAY_ROOT / "gateway.sh"),
+                        "claude-plugins",
+                        "add",
+                        str(plugin_dir),
+                        "--enable",
+                    ],
+                    env=gw_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                self.assertEqual(add_proc.returncode, 0, add_proc.stderr or add_proc.stdout)
+                doc_proc = subprocess.run(
+                    ["bash", str(GATEWAY_ROOT / "gateway.sh"), "claude-plugins", "doctor"],
+                    env=gw_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(doc_proc.returncode, 0, doc_proc.stderr or doc_proc.stdout)
+
+                if can_use_mount_namespace():
+                    plg_res = await asyncio.to_thread(
+                        cclient.run_claude,
+                        prompt="Run with plugin",
+                        cwd=str(ws_dir),
+                        output_format="json",
+                    )
+                    self.assertEqual(plg_res["returncode"], 0, plg_res)
+                    plg_report = json.loads(plg_res["stdout"].strip())
+                    self.assertEqual(
+                        plg_report["claude_config_dir"], "/mnt/dots-agent-home/claude/.claude"
+                    )
+                    self.assertEqual(
+                        plg_report["plugin_dirs"],
+                        ["/mnt/dots-agent-home/claude/plugins/oma-claude"],
+                    )
+                    self.assertEqual(plg_report["hook_rc"], 0)
+                    self.assertTrue((ws_dir / ".hook_ran").is_file())
+                    self.assertIn(
+                        "HOOK_OK:/mnt/dots-agent-home/claude/plugins/oma-claude",
+                        (ws_dir / ".hook_ran").read_text(encoding="utf-8"),
+                    )
+
+                # Zero-restart rollback via `gateway.sh claude-plugins off`
+                off_proc = subprocess.run(
+                    ["bash", str(GATEWAY_ROOT / "gateway.sh"), "claude-plugins", "off"],
+                    env=gw_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                self.assertEqual(off_proc.returncode, 0, off_proc.stderr)
+                pol_after = await asyncio.to_thread(cclient.policy)
+                self.assertFalse(pol_after["claude_plugins"]["enabled"])
+
+                # 4e. Multi-turn interactive `session_start(type="claude")` + `session_input`
+                s_start, _ = await asyncio.to_thread(
+                    cclient.mcp_request,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "c-sess-start",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "session_start",
+                            "arguments": {
+                                "type": "claude",
+                                "cwd": str(ws_dir),
+                                "prompt": "Hello Claude Turn 1",
+                            },
+                        },
+                    },
+                )
+                self.assertFalse(s_start["result"]["isError"], s_start)
+                csid = s_start["result"]["structuredContent"]["session_id"]
+
+                await asyncio.to_thread(
+                    cclient.mcp_request,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "c-sess-in",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "session_input",
+                            "arguments": {
+                                "session_id": csid,
+                                "prompt": "Hello Claude Turn 2",
+                                "close_stdin": True,
+                            },
+                        },
+                    },
+                )
+                s_poll, _ = await asyncio.to_thread(
+                    cclient.mcp_request,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "c-sess-poll",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "session_poll",
+                            "arguments": {
+                                "session_id": csid,
+                                "wait_seconds": 10.0,
+                                "wait_for_exit": True,
+                            },
+                        },
+                    },
+                )
+                poll_sc = s_poll["result"]["structuredContent"]
+                self.assertEqual(poll_sc["session_kind"], "claude")
+                self.assertEqual(poll_sc["agent_conversation_id"], "claude-interactive-77")
+                self.assertIn("Hello Claude Turn 1", poll_sc["stdout"])
+                self.assertIn("Hello Claude Turn 2", poll_sc["stdout"])
+            finally:
+                await claude_srv.stop()
+        finally:
+            shutil.rmtree(claude_root, ignore_errors=True)
 
 
 if __name__ == "__main__":

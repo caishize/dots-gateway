@@ -20,7 +20,7 @@ Instead, report vulnerabilities privately through **GitHub Private Vulnerability
 
 ## Deployment Security Baseline
 
-Because `dots-gateway` mediates remote command execution and autonomous coding agents (`agy` and `codex`), operators deploying it MUST adhere to the following baseline:
+Because `dots-gateway` mediates remote command execution and autonomous coding agents (`agy`, `codex`, and `claude`), operators deploying it MUST adhere to the following baseline:
 
 1. **Outbound Tunnel Preferred**: Prefer OpenAI Secure MCP Tunnel (`dots-gateway tunnel-setup` -> loopback `127.0.0.1:18765/mcp`) so no inbound TCP ports need to be exposed to the public internet.
 2. **Never Disable TLS on Non-Loopback Interfaces**: Only pass `--no-tls` when binding strictly to `127.0.0.1` or an encrypted private overlay tunnel. Direct public listeners must use TLS 1.2/1.3 (with SHA-256 certificate pinning, Let's Encrypt, or `tls_require_client_cert: true` mTLS) and optional `allowed_client_ips` CIDR restrictions.

@@ -33,6 +33,7 @@ from .hook_jail import (
     PreparedAgentPluginRuntime,
     StagedPluginHookBundle,
     sanitize_host_agy_settings_file,
+    sanitize_host_claude_settings_file,
 )
 
 SHARED_SANDBOX_PUB_CACHE_VFS = "/mnt/dots-pub-cache"
@@ -50,6 +51,7 @@ SANDBOX_SUBDIRS: Tuple[str, ...] = (
     "plugin_bundles",
     "plugin_state",
     "codex_home",
+    "claude_home",
 )
 SANDBOX_MANAGED_SUBDIRS: Tuple[str, ...] = (
     "tmp",
@@ -912,6 +914,243 @@ def _codex_isolated_runtime_mount_lines(
     return out
 
 
+def _prepare_isolated_claude_home_backing_dir(sandbox_state: Path) -> Path:
+    """Prepare and sanitize `<sandbox_state>/claude_home` as disk backing for isolated `CLAUDE_CONFIG_DIR`."""
+    backing = sandbox_state / "claude_home"
+    if os.path.islink(backing):
+        raise SandboxStorageError(
+            f"Isolated Claude backing directory '{redact_diagnostic_text(str(backing))}' must not be a symlink"
+        )
+    newly_created = not os.path.lexists(backing)
+    backing.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if newly_created:
+        os.chmod(backing, 0o700)
+    st_b = os.lstat(backing)
+    if stat.S_ISLNK(st_b.st_mode) or not stat.S_ISDIR(st_b.st_mode):
+        raise SandboxStorageError(
+            f"Isolated Claude backing path '{redact_diagnostic_text(str(backing))}' is not a regular directory"
+        )
+    if st_b.st_mode & 0o002:
+        raise SandboxStorageError(
+            f"Isolated Claude backing directory '{redact_diagnostic_text(str(backing))}' must not be world-writable"
+        )
+
+    open_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    for file_mp in (".credentials.json", ".claude.json", "settings.json", "settings.local.json"):
+        mp_f = backing / file_mp
+        if os.path.islink(mp_f):
+            raise SandboxStorageError(
+                f"Symlinked mountpoint '{redact_diagnostic_text(str(mp_f))}' in isolated Claude backing directory is forbidden"
+            )
+        if os.path.lexists(mp_f):
+            st_f = os.lstat(mp_f)
+            if stat.S_ISLNK(st_f.st_mode) or not stat.S_ISREG(st_f.st_mode):
+                raise SandboxStorageError(
+                    f"Non-regular mountpoint '{redact_diagnostic_text(str(mp_f))}' in isolated Claude backing directory is forbidden"
+                )
+            if st_f.st_size > 0:
+                fd_trunc = os.open(
+                    str(mp_f), os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600
+                )
+                os.close(fd_trunc)
+        else:
+            fd_new = os.open(str(mp_f), open_flags, 0o600)
+            os.close(fd_new)
+
+    for dir_mp in ("projects", "plugins"):
+        mp_d = backing / dir_mp
+        if os.path.islink(mp_d):
+            raise SandboxStorageError(
+                f"Symlinked directory mountpoint '{redact_diagnostic_text(str(mp_d))}' in isolated Claude backing directory is forbidden"
+            )
+        if os.path.lexists(mp_d):
+            st_d = os.lstat(mp_d)
+            if stat.S_ISLNK(st_d.st_mode) or not stat.S_ISDIR(st_d.st_mode):
+                raise SandboxStorageError(
+                    f"Non-directory mountpoint '{redact_diagnostic_text(str(mp_d))}' in isolated Claude backing directory is forbidden"
+                )
+        else:
+            mp_d.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    return backing
+
+
+def _claude_isolated_runtime_mount_lines(
+    stage_dir: str,
+    host_home_dir: str,
+    q_mount: str,
+    runtime: PreparedAgentPluginRuntime,
+    sandbox_state: Optional[Path] = None,
+) -> List[str]:
+    """Build fail-closed shell lines populating isolated `CLAUDE_CONFIG_DIR` and read-only plugin bundles."""
+    if not runtime.vfs_claude_config_dir or not runtime.host_sanitized_claude_json:
+        raise SandboxStorageError("Incomplete PreparedAgentPluginRuntime for Claude")
+    vfs_claude_cfg = runtime.vfs_claude_config_dir
+    iso_claude_home = runtime.isolated_home_dir
+    host_claude_dir = os.path.join(host_home_dir, ".claude")
+    q_vcc = shlex.quote(f"{stage_dir}{vfs_claude_cfg}")
+    out: List[str] = [f"mkdir -p {q_vcc}"]
+
+    if sandbox_state is not None:
+        claude_backing = _prepare_isolated_claude_home_backing_dir(sandbox_state)
+        q_backing = shlex.quote(str(claude_backing))
+        out.extend(
+            [
+                f"[ ! -L {q_backing} ] && [ -d {q_backing} ]",
+                f"{q_mount} --rbind {q_backing} {q_vcc}",
+            ]
+        )
+
+    # Permanently mask `settings.local.json` with `/dev/null`
+    q_local_null_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_claude_cfg, 'settings.local.json')}")
+    out.extend(
+        [
+            f"[ ! -L {q_local_null_dst} ]",
+            f"[ -e {q_local_null_dst} ] || touch {q_local_null_dst}",
+            f"{q_mount} --bind /dev/null {q_local_null_dst}",
+        ]
+    )
+
+    # Mount `.credentials.json` read-only into outer VFS so Claude CLI can authenticate without mutating auth,
+    # while `dots-hook-jail.py` never mounts `vfs_claude_cfg`, keeping `.credentials.json` 100% invisible to hooks.
+    q_creds_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_claude_cfg, '.credentials.json')}")
+    host_creds = os.path.join(host_claude_dir, ".credentials.json")
+    if os.path.isfile(host_creds) and not os.path.islink(host_creds):
+        q_creds_src = shlex.quote(os.path.realpath(host_creds))
+        out.extend(
+            [
+                f"[ ! -L {q_creds_dst} ]",
+                f"[ -e {q_creds_dst} ] || touch {q_creds_dst}",
+                f"{q_mount} --bind {q_creds_src} {q_creds_dst}",
+                _remount_ro_cmd(q_mount, q_creds_dst, noexec=True),
+            ]
+        )
+    elif sandbox_state is not None:
+        out.extend(
+            [
+                f"[ ! -L {q_creds_dst} ]",
+                f"[ -e {q_creds_dst} ] || touch {q_creds_dst}",
+                f"{q_mount} --bind /dev/null {q_creds_dst}",
+            ]
+        )
+
+    host_projects = Path(host_claude_dir) / "projects"
+    if host_projects.is_symlink():
+        raise SandboxStorageError("Symlinked '~/.claude/projects' is forbidden")
+    host_projects.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(host_projects, 0o700)
+    except OSError:
+        pass
+    if host_projects.is_dir() and not host_projects.is_symlink():
+        q_proj_src = shlex.quote(str(host_projects.resolve()))
+        q_proj_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_claude_cfg, 'projects')}")
+        out.extend(
+            [
+                f"[ ! -L {q_proj_dst} ]",
+                f"mkdir -p {q_proj_dst}",
+                f"{q_mount} --rbind {q_proj_src} {q_proj_dst}",
+            ]
+        )
+
+    if runtime.host_sanitized_claude_settings:
+        q_set_src = shlex.quote(runtime.host_sanitized_claude_settings)
+        q_set_dst = shlex.quote(f"{stage_dir}{os.path.join(vfs_claude_cfg, 'settings.json')}")
+        out.extend(
+            [
+                f"[ ! -L {q_set_src} ] && [ -f {q_set_src} ] && [ ! -L {q_set_dst} ]",
+                f"[ -e {q_set_dst} ] || touch {q_set_dst}",
+                f"{q_mount} --bind {q_set_src} {q_set_dst}",
+                _remount_ro_cmd(q_mount, q_set_dst, noexec=True),
+            ]
+        )
+    else:
+        q_set_empty = shlex.quote(f"{stage_dir}{os.path.join(vfs_claude_cfg, 'settings.json')}")
+        out.extend(
+            [
+                f"[ ! -L {q_set_empty} ]",
+                f"printf '{{}}' > {q_set_empty}",
+            ]
+        )
+
+    q_cj_src = shlex.quote(runtime.host_sanitized_claude_json)
+    for cj_dst_raw in (
+        os.path.join(vfs_claude_cfg, ".claude.json"),
+        os.path.join(iso_claude_home, ".claude.json"),
+    ):
+        q_cj_dst = shlex.quote(f"{stage_dir}{cj_dst_raw}")
+        out.extend(
+            [
+                f"[ ! -L {q_cj_src} ] && [ -f {q_cj_src} ] && [ ! -L {q_cj_dst} ]",
+                f"[ -e {q_cj_dst} ] || touch {q_cj_dst}",
+                f"{q_mount} --bind {q_cj_src} {q_cj_dst}",
+                _remount_ro_cmd(q_mount, q_cj_dst, noexec=True),
+            ]
+        )
+
+    plugins_vfs_root = os.path.join(iso_claude_home, "plugins")
+    q_plugins_root = shlex.quote(f"{stage_dir}{plugins_vfs_root}")
+    out.extend(
+        [
+            f"[ ! -L {q_plugins_root} ]",
+            f"mkdir -p {q_plugins_root}",
+            f"{q_mount} -t tmpfs -o size=8m,mode=0755,nosuid,nodev tmpfs {q_plugins_root}",
+        ]
+    )
+
+    for bundle in runtime.bundles:
+        q_src = shlex.quote(bundle.source_dir)
+        canon_mp = f"{stage_dir}{bundle.source_dir}"
+        disc_mp = f"{stage_dir}{bundle.vfs_discovery_dir}"
+        q_canon = shlex.quote(canon_mp)
+        q_disc = shlex.quote(disc_mp)
+
+        out.extend(
+            [
+                f"[ ! -L {q_src} ] && [ -d {q_src} ]",
+                f"[ ! -L {q_canon} ]",
+                f"[ -d {q_canon} ] || mkdir -p {q_canon}",
+                f"[ ! -L {q_canon} ] && [ -d {q_canon} ]",
+                f"{q_mount} --bind {q_src} {q_canon}",
+            ]
+        )
+        if bundle.host_rewritten_hooks_file and bundle.hooks_relpath:
+            q_rw_h = shlex.quote(bundle.host_rewritten_hooks_file)
+            q_canon_h = shlex.quote(os.path.join(canon_mp, bundle.hooks_relpath))
+            out.extend(
+                [
+                    f"[ ! -L {q_rw_h} ] && [ -f {q_rw_h} ] && [ ! -L {q_canon_h} ] && [ -f {q_canon_h} ]",
+                    f"{q_mount} --bind {q_rw_h} {q_canon_h}",
+                    _remount_ro_cmd(q_mount, q_canon_h, noexec=True),
+                ]
+            )
+        out.append(_remount_ro_cmd(q_mount, q_canon))
+
+        out.extend(
+            [
+                f"mkdir -p {q_disc}",
+                f"{q_mount} --bind {q_src} {q_disc}",
+            ]
+        )
+        if bundle.host_rewritten_hooks_file and bundle.hooks_relpath:
+            q_rw_h = shlex.quote(bundle.host_rewritten_hooks_file)
+            q_disc_h = shlex.quote(os.path.join(disc_mp, bundle.hooks_relpath))
+            out.extend(
+                [
+                    f"[ ! -L {q_rw_h} ] && [ -f {q_rw_h} ] && [ ! -L {q_disc_h} ] && [ -f {q_disc_h} ]",
+                    f"{q_mount} --bind {q_rw_h} {q_disc_h}",
+                    _remount_ro_cmd(q_mount, q_disc_h, noexec=True),
+                ]
+            )
+        out.append(_remount_ro_cmd(q_mount, q_disc))
+
+    out.append(
+        f"{q_mount} -o remount,ro,nosuid,nodev {q_plugins_root} 2>/dev/null || {q_mount} -o remount,ro {q_plugins_root} 2>/dev/null || {q_mount} -o bind,remount,ro {q_plugins_root}"
+    )
+    out.extend(_plugin_runtime_jail_mount_lines(stage_dir, q_mount, runtime))
+    return out
+
+
 def _mask_protected_and_workspace_hook_lines(
     stage_dir: str,
     q_mount: str,
@@ -921,6 +1160,7 @@ def _mask_protected_and_workspace_hook_lines(
     protected_paths: Sequence[str],
     is_agy: bool,
     is_codex: bool,
+    is_claude: bool = False,
     preserve_readonly_exec_file: Optional[str] = None,
     resolved_cwd: Optional[str] = None,
     session_workdirs: Optional[Sequence[str]] = None,
@@ -930,6 +1170,7 @@ def _mask_protected_and_workspace_hook_lines(
     mount_gcloud_adc: bool = False,
     use_isolated_agy_home: bool = False,
     use_isolated_codex_home: bool = False,
+    use_isolated_claude_home: bool = False,
 ) -> List[str]:
     """Mask `protected_paths`, gateway staging/state dirs, and workspace hook-injection subpaths."""
     out: List[str] = []
@@ -987,10 +1228,10 @@ def _mask_protected_and_workspace_hook_lines(
     skip_dot_umbrellas: set[str] = set()
     if not home_covered:
         skip_dot_umbrellas.update(dot_local_variants)
-        if not use_isolated_agy_home and not use_isolated_codex_home:
+        if not use_isolated_agy_home and not use_isolated_codex_home and not use_isolated_claude_home:
             skip_dot_umbrellas.update(dot_config_variants)
     else:
-        if not use_isolated_agy_home and not use_isolated_codex_home:
+        if not use_isolated_agy_home and not use_isolated_codex_home and not use_isolated_claude_home:
             skip_dot_umbrellas.update(dot_local_variants)
         if is_agy and not use_isolated_agy_home:
             skip_dot_umbrellas.update(dot_config_variants)
@@ -998,6 +1239,9 @@ def _mask_protected_and_workspace_hook_lines(
         skip_dot_umbrellas.update(_home_dot_variants(".gemini"))
     if is_codex and not use_isolated_codex_home:
         skip_dot_umbrellas.update(_home_dot_variants(".codex"))
+    if is_claude and not use_isolated_claude_home:
+        skip_dot_umbrellas.update(_home_dot_variants(".claude"))
+        skip_dot_umbrellas.update(_home_dot_variants(".claude.json"))
 
     resolved_prots: List[str] = []
     for raw_prot in protected_paths:
@@ -1037,7 +1281,7 @@ def _mask_protected_and_workspace_hook_lines(
 
     preserve_lex: Optional[str] = None
     preserve_real: Optional[str] = None
-    if (is_agy or is_codex) and preserve_readonly_exec_file:
+    if (is_agy or is_codex or is_claude) and preserve_readonly_exec_file:
         try:
             cand_exp = os.path.expanduser(str(preserve_readonly_exec_file).strip())
             if cand_exp.startswith("/"):
@@ -1100,6 +1344,7 @@ def _mask_protected_and_workspace_hook_lines(
                 and prot in dot_config_variants
                 and not use_isolated_agy_home
                 and not use_isolated_codex_home
+                and not use_isolated_claude_home
             ):
                 cfg_lex = os.path.join(home_dir, ".config")
                 gh_lex = os.path.join(cfg_lex, "gh")
@@ -1168,7 +1413,7 @@ def _mask_protected_and_workspace_hook_lines(
             elif (
                 home_covered
                 and prot in dot_local_variants
-                and (use_isolated_agy_home or use_isolated_codex_home)
+                and (use_isolated_agy_home or use_isolated_codex_home or use_isolated_claude_home)
             ):
                 loc_lex = os.path.join(home_dir, ".local")
                 lb_lex = os.path.join(loc_lex, "bin")
@@ -1271,12 +1516,14 @@ def _mask_protected_and_workspace_hook_lines(
         internal_host_dirs.append(os.path.abspath(str(sandbox_state / "plugin_bundles")))
         internal_host_dirs.append(os.path.abspath(str(sandbox_state / "plugin_state")))
         internal_host_dirs.append(os.path.abspath(str(sandbox_state / "codex_home")))
+        internal_host_dirs.append(os.path.abspath(str(sandbox_state / "claude_home")))
     if sandbox_state_dir_raw:
         try:
             sb_lex = os.path.abspath(os.path.expanduser(str(sandbox_state_dir_raw).strip()))
             internal_host_dirs.append(os.path.join(sb_lex, "plugin_bundles"))
             internal_host_dirs.append(os.path.join(sb_lex, "plugin_state"))
             internal_host_dirs.append(os.path.join(sb_lex, "codex_home"))
+            internal_host_dirs.append(os.path.join(sb_lex, "claude_home"))
         except OSError:
             pass
     if plugin_state_dir:
@@ -1306,7 +1553,7 @@ def _mask_protected_and_workspace_hook_lines(
             f"if [ -d {q_int_dst} ]; then {q_mount} -t tmpfs -o size=4k,mode=0555,ro,nosuid,nodev,noexec tmpfs {q_int_dst}; fi"
         )
 
-    if is_agy or is_codex:
+    if is_agy or is_codex or is_claude:
         ws_targets: List[str] = []
         seeds: List[str] = []
         if resolved_cwd:
@@ -1375,6 +1622,7 @@ def build_mount_ns_argv(
     protected_paths: Sequence[str],
     is_agy: bool = False,
     is_codex: bool = False,
+    is_claude: bool = False,
     readonly_subpaths: Optional[Sequence[str]] = None,
     sandbox_state_dir: Optional[str] = None,
     docker_mask_paths: Optional[Sequence[str]] = None,
@@ -1384,6 +1632,8 @@ def build_mount_ns_argv(
     agy_plugin_mounts: Optional[Sequence[Tuple[str, str]]] = None,
     codex_plugins_enabled: bool = False,
     codex_plugin_mounts: Optional[Sequence[Tuple[str, str]]] = None,
+    claude_plugins_enabled: bool = False,
+    claude_plugin_mounts: Optional[Sequence[Tuple[str, str]]] = None,
     prepared_plugin_runtime: Optional[PreparedAgentPluginRuntime] = None,
     agent_runtime_home_root: str = "/mnt/dots-agent-home",
     masked_plugin_paths: Optional[Sequence[str]] = None,
@@ -1407,6 +1657,7 @@ def build_mount_ns_argv(
 
     validated_plugin_mounts: List[Tuple[str, str]] = []
     validated_codex_mounts: List[Tuple[str, str]] = []
+    validated_claude_mounts: List[Tuple[str, str]] = []
     if is_agy and agy_plugins_enabled:
         validated_plugin_mounts = _validate_plugin_mounts_for_vfs(agy_plugin_mounts)
     if is_codex and codex_plugins_enabled:
@@ -1424,10 +1675,26 @@ def build_mount_ns_argv(
             raise SandboxStorageError(
                 "Codex plugins require a PreparedAgentPluginRuntime for isolated CODEX_HOME staging"
             )
+    if is_claude and claude_plugins_enabled:
+        if claude_plugin_mounts:
+            validated_claude_mounts = _validate_plugin_mounts_for_vfs(claude_plugin_mounts)
+        elif prepared_plugin_runtime and prepared_plugin_runtime.bundles:
+            validated_claude_mounts = _validate_plugin_mounts_for_vfs(
+                [(b.name, b.source_dir) for b in prepared_plugin_runtime.bundles]
+            )
+        else:
+            raise SandboxStorageError(
+                "Claude plugins are enabled, but no validated plugin mounts were provided to VFS sandbox"
+            )
+        if prepared_plugin_runtime is None:
+            raise SandboxStorageError(
+                "Claude plugins require a PreparedAgentPluginRuntime for isolated CLAUDE_CONFIG_DIR staging"
+            )
 
     active_plugin_srcs = {
         *(src for _, src in validated_plugin_mounts),
         *(src for _, src in validated_codex_mounts),
+        *(src for _, src in validated_claude_mounts),
     }
 
     unshare_bin = _find_sys_bin("unshare") or "/usr/bin/unshare"
@@ -1459,6 +1726,11 @@ def build_mount_ns_argv(
         prepared_plugin_runtime.isolated_home_dir
         if (is_codex and codex_plugins_enabled and prepared_plugin_runtime is not None)
         else os.path.join(norm_runtime_root, "codex")
+    )
+    isolated_claude_home = (
+        prepared_plugin_runtime.isolated_home_dir
+        if (is_claude and claude_plugins_enabled and prepared_plugin_runtime is not None)
+        else os.path.join(norm_runtime_root, "claude")
     )
 
     raw_sb_target = (
@@ -1505,10 +1777,17 @@ def build_mount_ns_argv(
                 os.chmod(codex_dir_p, 0o700)
             except OSError:
                 pass
+        if is_claude:
+            claude_dir_p = Path(home_dir) / ".claude"
+            claude_dir_p.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(claude_dir_p, 0o700)
+            except OSError:
+                pass
     else:
         if prevalidated_sandbox_state is not None:
             sandbox_state = prevalidated_sandbox_state
-        elif is_agy or is_codex:
+        elif is_agy or is_codex or is_claude:
             sandbox_state = prepare_sandbox_runtime_state(
                 raw_sb_target,
                 lock_timeout_seconds=sandbox_lock_timeout_seconds,
@@ -1521,12 +1800,17 @@ def build_mount_ns_argv(
             if not os.path.islink(str(gh_cfg_dir)):
                 gh_cfg_dir.mkdir(parents=True, exist_ok=True)
             fl_cfg_dir = Path(home_dir) / ".config" / "flutter"
-            if not (is_agy and agy_plugins_enabled) and not (
-                is_codex and codex_plugins_enabled
-            ) and not os.path.islink(str(fl_cfg_dir)):
+            if (
+                not (is_agy and agy_plugins_enabled)
+                and not (is_codex and codex_plugins_enabled)
+                and not (is_claude and claude_plugins_enabled)
+                and not os.path.islink(str(fl_cfg_dir))
+            ):
                 fl_cfg_dir.mkdir(parents=True, exist_ok=True)
-        if not (is_agy and agy_plugins_enabled) and not (
-            is_codex and codex_plugins_enabled
+        if (
+            not (is_agy and agy_plugins_enabled)
+            and not (is_codex and codex_plugins_enabled)
+            and not (is_claude and claude_plugins_enabled)
         ):
             hc_local_share_dir = Path(home_dir) / ".local" / "share"
             if not os.path.islink(os.path.join(home_dir, ".local")) and not os.path.islink(
@@ -1545,7 +1829,7 @@ def build_mount_ns_argv(
         SHARED_SANDBOX_PUB_CACHE_VFS,
         *sorted(active_plugin_srcs),
     ]
-    if (is_agy or is_codex) and target_argv and str(target_argv[0]).startswith("/"):
+    if (is_agy or is_codex or is_claude) and target_argv and str(target_argv[0]).startswith("/"):
         try:
             stage_sources.append(os.path.realpath(str(target_argv[0])))
         except OSError:
@@ -1562,6 +1846,8 @@ def build_mount_ns_argv(
         os.path.join(".config", "antigravity"),
         os.path.join(".config", "gcloud"),
         ".codex",
+        ".claude",
+        ".claude.json",
     ):
         dot_cand = os.path.join(home_dir, dot_rel)
         if os.path.exists(dot_cand):
@@ -1719,6 +2005,7 @@ def build_mount_ns_argv(
 
     use_isolated_agy_home = bool(is_agy and agy_plugins_enabled)
     use_isolated_codex_home = bool(is_codex and codex_plugins_enabled)
+    use_isolated_claude_home = bool(is_claude and claude_plugins_enabled)
 
     plain_agy_sanitized_settings: Optional[str] = None
     if is_agy and not use_isolated_agy_home:
@@ -1751,22 +2038,36 @@ def build_mount_ns_argv(
                 f"Symlinked Codex hooks file '{unmanaged_cx_hooks_check}' is forbidden by security policy"
             )
 
+    plain_claude_sanitized_settings: Optional[str] = None
+    if is_claude and not use_isolated_claude_home:
+        if home_covered and os.path.islink(os.path.join(home_dir, ".claude")):
+            raise SandboxStorageError(
+                "Symlinked ~/.claude is forbidden by security policy when HOME is covered by allowed_workdirs"
+            )
+        if os.path.islink(os.path.join(home_dir, ".claude.json")):
+            raise SandboxStorageError("Symlinked ~/.claude.json is forbidden by security policy")
+        unmanaged_cl_local_check = os.path.join(home_dir, ".claude", "settings.local.json")
+        if os.path.islink(unmanaged_cl_local_check):
+            raise PermissionError(
+                f"Symlinked Claude settings.local.json '{unmanaged_cl_local_check}' is forbidden by security policy"
+            )
+        plain_cl_out = (
+            sandbox_state
+            / "plugin_bundles"
+            / "_plain_claude"
+            / "_sanitized_settings.json"
+        )
+        plain_claude_sanitized_settings = sanitize_host_claude_settings_file(
+            None,
+            plain_cl_out,
+            only_if_hooks_present=True,
+            content_addressed=True,
+        )
+
     if not home_covered:
-        if use_isolated_agy_home:
-            # Keep read-only ~/.local/bin at host path so `agy_binary` under ~/.local/bin stays executable,
-            # while moving `$HOME` and `.gemini` to `isolated_agy_home` completely outside protected `HOME`.
-            local_bin_host = os.path.join(home_dir, ".local", "bin")
-            if os.path.isdir(local_bin_host):
-                q_lb_h = shlex.quote(os.path.realpath(local_bin_host))
-                q_dst_lb_h = shlex.quote(f"{stage_dir}{local_bin_host}")
-                lines.extend(
-                    [
-                        f"mkdir -p {q_dst_lb_h}",
-                        f"{q_mount} --bind {q_lb_h} {q_dst_lb_h}",
-                        _remount_ro_cmd(q_mount, q_dst_lb_h),
-                    ]
-                )
-        elif use_isolated_codex_home:
+        if use_isolated_agy_home or use_isolated_codex_home or use_isolated_claude_home:
+            # Keep read-only ~/.local/bin at host path so agent binaries under ~/.local/bin stay executable,
+            # while moving `$HOME` and agent config to isolated `agent_runtime_home_root` outside protected `HOME`.
             local_bin_host = os.path.join(home_dir, ".local", "bin")
             if os.path.isdir(local_bin_host):
                 q_lb_h = shlex.quote(os.path.realpath(local_bin_host))
@@ -1856,6 +2157,47 @@ def build_mount_ns_argv(
                         lines.append(
                             f"if [ -f {q_ucxh} ]; then {q_mount} --bind /dev/null {q_ucxh}; fi"
                         )
+
+            if is_claude:
+                claude_dir = os.path.join(home_dir, ".claude")
+                if os.path.isdir(claude_dir):
+                    q_cl = shlex.quote(os.path.realpath(claude_dir))
+                    q_dst_cl = shlex.quote(f"{stage_dir}{claude_dir}")
+                    lines.extend(
+                        [
+                            f"mkdir -p {q_dst_cl}",
+                            f"{q_mount} --rbind {q_cl} {q_dst_cl}",
+                        ]
+                    )
+                    if plain_claude_sanitized_settings:
+                        q_pcs_src = shlex.quote(plain_claude_sanitized_settings)
+                        q_pcs_dst = shlex.quote(
+                            f"{stage_dir}{os.path.join(claude_dir, 'settings.json')}"
+                        )
+                        lines.extend(
+                            [
+                                f"[ ! -L {q_pcs_src} ] && [ -f {q_pcs_src} ] && [ -f {q_pcs_dst} ]",
+                                f"{q_mount} --bind {q_pcs_src} {q_pcs_dst}",
+                                _remount_ro_cmd(q_mount, q_pcs_dst, noexec=True),
+                            ]
+                        )
+                    unmanaged_cl_local = os.path.join(claude_dir, "settings.local.json")
+                    if os.path.isfile(unmanaged_cl_local):
+                        q_ucll = shlex.quote(f"{stage_dir}{unmanaged_cl_local}")
+                        lines.append(
+                            f"if [ -f {q_ucll} ]; then {q_mount} --bind /dev/null {q_ucll}; fi"
+                        )
+                claude_json_host = os.path.join(home_dir, ".claude.json")
+                if os.path.isfile(claude_json_host) and not os.path.islink(claude_json_host):
+                    q_cjh = shlex.quote(os.path.realpath(claude_json_host))
+                    q_dst_cjh = shlex.quote(f"{stage_dir}{claude_json_host}")
+                    lines.extend(
+                        [
+                            f"touch {q_dst_cjh}",
+                            f"{q_mount} --bind {q_cjh} {q_dst_cjh}",
+                            _remount_ro_cmd(q_mount, q_dst_cjh, noexec=True),
+                        ]
+                    )
     else:
         hc_local_dir = os.path.join(home_dir, ".local")
         hc_local_bin = os.path.join(hc_local_dir, "bin")
@@ -1865,7 +2207,12 @@ def build_mount_ns_argv(
                 "Symlinked ~/.local, ~/.local/bin, or ~/.gitconfig is forbidden by security policy "
                 "when HOME is covered by allowed_workdirs"
             )
-        if not use_isolated_agy_home and not use_isolated_codex_home and os.path.isdir(hc_local_bin):
+        if (
+            not use_isolated_agy_home
+            and not use_isolated_codex_home
+            and not use_isolated_claude_home
+            and os.path.isdir(hc_local_bin)
+        ):
             q_hc_lb = shlex.quote(os.path.realpath(hc_local_bin))
             q_dst_hc_lb = shlex.quote(f"{stage_dir}{hc_local_bin}")
             lines.extend(
@@ -1915,6 +2262,36 @@ def build_mount_ns_argv(
                 q_ucxh = shlex.quote(f"{stage_dir}{unmanaged_cx_hooks}")
                 lines.append(
                     f"if [ -f {q_ucxh} ]; then {q_mount} --bind /dev/null {q_ucxh}; fi"
+                )
+        if is_claude and not use_isolated_claude_home:
+            if plain_claude_sanitized_settings:
+                q_pcs_src = shlex.quote(plain_claude_sanitized_settings)
+                q_pcs_dst = shlex.quote(
+                    f"{stage_dir}{os.path.join(home_dir, '.claude', 'settings.json')}"
+                )
+                lines.extend(
+                    [
+                        f"[ ! -L {q_pcs_src} ] && [ -f {q_pcs_src} ] && [ -f {q_pcs_dst} ]",
+                        f"{q_mount} --bind {q_pcs_src} {q_pcs_dst}",
+                        _remount_ro_cmd(q_mount, q_pcs_dst, noexec=True),
+                    ]
+                )
+            unmanaged_cl_local = os.path.join(home_dir, ".claude", "settings.local.json")
+            if os.path.isfile(unmanaged_cl_local):
+                q_ucll = shlex.quote(f"{stage_dir}{unmanaged_cl_local}")
+                lines.append(
+                    f"if [ -f {q_ucll} ]; then {q_mount} --bind /dev/null {q_ucll}; fi"
+                )
+            hc_cjson = os.path.join(home_dir, ".claude.json")
+            if os.path.isfile(hc_cjson) and not os.path.islink(hc_cjson):
+                q_hc_cj = shlex.quote(os.path.realpath(hc_cjson))
+                q_dst_hc_cj = shlex.quote(f"{stage_dir}{hc_cjson}")
+                lines.extend(
+                    [
+                        f"[ ! -L {shlex.quote(hc_cjson)} ] && [ -f {q_dst_hc_cj} ]",
+                        f"{q_mount} --bind {q_hc_cj} {q_dst_hc_cj}",
+                        _remount_ro_cmd(q_mount, q_dst_hc_cj, noexec=True),
+                    ]
                 )
         for raw_mp in masked_plugin_paths or ():
             try:
@@ -2017,6 +2394,22 @@ def build_mount_ns_argv(
             )
         )
 
+    if use_isolated_claude_home and prepared_plugin_runtime is not None:
+        lines.extend(
+            _mount_user_home_skeleton_lines(
+                stage_dir, isolated_claude_home, home_dir, sandbox_state, gh_cfg_dir, q_mount
+            )
+        )
+        lines.extend(
+            _claude_isolated_runtime_mount_lines(
+                stage_dir,
+                home_dir,
+                q_mount,
+                prepared_plugin_runtime,
+                sandbox_state=sandbox_state,
+            )
+        )
+
     lines.extend(
         _mask_protected_and_workspace_hook_lines(
             stage_dir,
@@ -2026,6 +2419,7 @@ def build_mount_ns_argv(
             protected_paths=protected_paths,
             is_agy=is_agy,
             is_codex=is_codex,
+            is_claude=is_claude,
             preserve_readonly_exec_file=(str(target_argv[0]) if target_argv else None),
             resolved_cwd=resolved_cwd,
             session_workdirs=session_workdirs,
@@ -2035,6 +2429,7 @@ def build_mount_ns_argv(
             mount_gcloud_adc=mount_gcloud_adc,
             use_isolated_agy_home=use_isolated_agy_home,
             use_isolated_codex_home=use_isolated_codex_home,
+            use_isolated_claude_home=use_isolated_claude_home,
         )
     )
 
@@ -2056,8 +2451,12 @@ def build_mount_ns_argv(
         lines.append(
             f"export HOME={shlex.quote(isolated_codex_home)} CODEX_HOME={shlex.quote(prepared_plugin_runtime.vfs_codex_home_dir)}"
         )
+    elif use_isolated_claude_home and prepared_plugin_runtime is not None and prepared_plugin_runtime.vfs_claude_config_dir:
+        lines.append(
+            f"export HOME={shlex.quote(isolated_claude_home)} CLAUDE_CONFIG_DIR={shlex.quote(prepared_plugin_runtime.vfs_claude_config_dir)}"
+        )
 
-    if is_agy or is_codex:
+    if is_agy or is_codex or is_claude:
         # Clear effective/permitted/ambient caps (CapEff=0 -> cannot unmount), while keeping
         # unprivileged nested userns capability available for `agy --sandbox`, `codex-linux-sandbox`, and `dots-hook-jail`.
         lines.append(f'exec {q_setpriv} --inh-caps=-all --ambient-caps=-all -- "$@"')
@@ -2390,6 +2789,21 @@ def _collect_sandbox_candidates(
                 with os.scandir(cx_sub_dir) as cx_it:
                     for cx_entry in cx_it:
                         _add_candidate(Path(cx_entry.path), "codex_home")
+            except OSError:
+                pass
+
+    for cl_ephemeral in ("debug", "shell-snapshots", "todos"):
+        cl_sub_dir = sandbox_root / "claude_home" / cl_ephemeral
+        if (
+            (cancel_event is None or not cancel_event.is_set())
+            and not (sandbox_root / "claude_home").is_symlink()
+            and not cl_sub_dir.is_symlink()
+            and cl_sub_dir.is_dir()
+        ):
+            try:
+                with os.scandir(cl_sub_dir) as cl_it:
+                    for cl_entry in cl_it:
+                        _add_candidate(Path(cl_entry.path), "claude_home")
             except OSError:
                 pass
 

@@ -18,6 +18,11 @@ HOME_DIR: str = str(Path.home())
 DEFAULT_WORKSPACE_DIR: str = str(Path.home() / "workspaces")
 DEFAULT_AGY_BIN: str = shutil.which("agy") or str(Path.home() / ".local" / "bin" / "agy")
 DEFAULT_CODEX_BIN: str = shutil.which("codex") or "/usr/local/bin/codex"
+DEFAULT_CLAUDE_BIN: str = shutil.which("claude") or (
+    str(Path.home() / ".local" / "bin" / "claude")
+    if os.path.exists(str(Path.home() / ".local" / "bin" / "claude"))
+    else "/usr/local/bin/claude"
+)
 DEFAULT_BWRAP_BIN: str = shutil.which("bwrap") or (
     "/usr/local/bin/bwrap"
     if os.path.exists("/usr/local/bin/bwrap")
@@ -30,11 +35,13 @@ DEFAULT_BWRAP_BIN: str = shutil.which("bwrap") or (
 
 
 DEFAULT_ALLOWED_COMMANDS: List[str] = [
-    # Local autonomous coding agents (Antigravity CLI & OpenAI Codex CLI) & nested sandbox runner
+    # Local autonomous coding agents (Antigravity CLI, OpenAI Codex CLI & Anthropic Claude Code CLI) & nested sandbox runner
     "agy",
     DEFAULT_AGY_BIN,
     "codex",
     DEFAULT_CODEX_BIN,
+    "claude",
+    DEFAULT_CLAUDE_BIN,
     "bwrap",
     DEFAULT_BWRAP_BIN,
     # Shell & builtins
@@ -273,6 +280,8 @@ DEFAULT_PROTECTED_PATHS: List[str] = [
     str(Path.home() / ".config"),
     str(Path.home() / ".gemini"),
     str(Path.home() / ".codex"),
+    str(Path.home() / ".claude"),
+    str(Path.home() / ".claude.json"),
     str(Path.home() / ".ssh"),
     str(Path.home() / ".gnupg"),
     str(Path.home() / ".local"),
@@ -296,6 +305,14 @@ DEFAULT_OAUTH_ALLOWED_REDIRECT_HOSTS: List[str] = [
     "*.openai.com",
     "claude.ai",
     "*.claude.ai",
+    "claude.com",
+    "*.claude.com",
+    "anthropic.com",
+    "*.anthropic.com",
+    "x.ai",
+    "*.x.ai",
+    "grok.com",
+    "*.grok.com",
     "localhost",
     "127.0.0.1",
     "::1",
@@ -472,7 +489,34 @@ class GatewayConfig:
             or str(Path.home() / ".config" / "dots-gateway" / "codex-plugins.json")
         ).strip()
     )
-    # Policy-filtered Docker access for sandboxed sessions (exec_command / run_agy / run_codex).
+    # Anthropic Claude Code (`claude`) agent settings & hot-reloadable plugin registry (default OFF)
+    claude_binary: str = DEFAULT_CLAUDE_BIN
+    claude_default_skip_permissions: bool = True
+    claude_default_permission_mode: str = "bypassPermissions"
+    claude_env_file: str = field(
+        default_factory=lambda: (
+            os.environ.get("GATEWAY_CLAUDE_ENV_FILE")
+            or str(Path.home() / ".config" / "dots-gateway" / "claude.env")
+        ).strip()
+    )
+    claude_default_model: Optional[str] = field(
+        default_factory=lambda: (os.environ.get("GATEWAY_CLAUDE_DEFAULT_MODEL") or "").strip() or None
+    )
+    claude_model_file: str = field(
+        default_factory=lambda: (
+            os.environ.get("GATEWAY_CLAUDE_MODEL_FILE")
+            or str(Path.home() / ".config" / "dots-gateway" / "claude.model")
+        ).strip()
+    )
+    claude_plugins_enabled: bool = False
+    claude_plugin_dirs: List[str] = field(default_factory=list)
+    claude_plugins_file: str = field(
+        default_factory=lambda: (
+            os.environ.get("GATEWAY_CLAUDE_PLUGINS_FILE")
+            or str(Path.home() / ".config" / "dots-gateway" / "claude-plugins.json")
+        ).strip()
+    )
+    # Policy-filtered Docker access for sandboxed sessions (exec_command / run_agy / run_codex / run_claude).
     # The real daemon socket is ALWAYS masked inside the mount-namespace jail; when enabled, a
     # gateway-owned filtering proxy socket is bind-mounted at `/run/docker.sock` instead.
     # Precedence: hot-reload `docker_mode_file` ("on"/"off") > `docker_enabled`.
@@ -495,6 +539,7 @@ class GatewayConfig:
     docker_extra_bind_roots: List[str] = field(default_factory=list)
     max_concurrent_agy: int = field(default_factory=detect_recommended_max_agy)
     max_concurrent_codex: int = 6
+    max_concurrent_claude: int = 4
     agy_queue_timeout_seconds: float = 28800.0
     # Isolated sandbox storage location & LRU lifecycle retention policy
     sandbox_state_dir: str = field(default_factory=detect_default_sandbox_state_dir)
@@ -697,10 +742,35 @@ class GatewayConfig:
             ]
         if os.environ.get("GATEWAY_CODEX_PLUGINS_FILE"):
             cfg.codex_plugins_file = os.environ["GATEWAY_CODEX_PLUGINS_FILE"].strip()
+        if os.environ.get("GATEWAY_CLAUDE_BIN"):
+            cfg.claude_binary = os.environ["GATEWAY_CLAUDE_BIN"]
+        if os.environ.get("GATEWAY_CLAUDE_PERMISSION_MODE"):
+            cfg.claude_default_permission_mode = os.environ["GATEWAY_CLAUDE_PERMISSION_MODE"].strip()
+        if os.environ.get("GATEWAY_CLAUDE_ENV_FILE"):
+            cfg.claude_env_file = os.environ["GATEWAY_CLAUDE_ENV_FILE"].strip()
+        if os.environ.get("GATEWAY_CLAUDE_DEFAULT_MODEL"):
+            cfg.claude_default_model = os.environ["GATEWAY_CLAUDE_DEFAULT_MODEL"].strip() or None
+        if os.environ.get("GATEWAY_CLAUDE_MODEL_FILE"):
+            cfg.claude_model_file = os.environ["GATEWAY_CLAUDE_MODEL_FILE"].strip()
+        if os.environ.get("GATEWAY_CLAUDE_PLUGINS_ENABLED"):
+            cfg.claude_plugins_enabled = (
+                os.environ["GATEWAY_CLAUDE_PLUGINS_ENABLED"].strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+        if os.environ.get("GATEWAY_CLAUDE_PLUGIN_DIRS"):
+            cfg.claude_plugin_dirs = [
+                x.strip()
+                for x in os.environ["GATEWAY_CLAUDE_PLUGIN_DIRS"].split(",")
+                if x.strip()
+            ]
+        if os.environ.get("GATEWAY_CLAUDE_PLUGINS_FILE"):
+            cfg.claude_plugins_file = os.environ["GATEWAY_CLAUDE_PLUGINS_FILE"].strip()
         if os.environ.get("GATEWAY_MAX_AGY"):
             cfg.max_concurrent_agy = max(1, int(os.environ["GATEWAY_MAX_AGY"]))
         if os.environ.get("GATEWAY_MAX_CODEX"):
             cfg.max_concurrent_codex = max(1, int(os.environ["GATEWAY_MAX_CODEX"]))
+        if os.environ.get("GATEWAY_MAX_CLAUDE"):
+            cfg.max_concurrent_claude = max(1, int(os.environ["GATEWAY_MAX_CLAUDE"]))
         if os.environ.get("GATEWAY_SANDBOX_DIR") or os.environ.get("GATEWAY_SANDBOX_STATE_DIR"):
             cfg.sandbox_state_dir = (
                 os.environ.get("GATEWAY_SANDBOX_STATE_DIR") or os.environ["GATEWAY_SANDBOX_DIR"]
@@ -777,6 +847,7 @@ class GatewayConfig:
             ),
         )
         cfg.max_concurrent_codex = max(1, int(cfg.max_concurrent_codex or 6))
+        cfg.max_concurrent_claude = max(1, int(cfg.max_concurrent_claude or 4))
         if not cfg.sandbox_state_dir:
             cfg.sandbox_state_dir = detect_default_sandbox_state_dir()
         cfg.sandbox_min_retention_days = max(
@@ -812,6 +883,9 @@ class GatewayConfig:
         codex_home_str = str(Path.home() / ".codex")
         if cfg.protected_paths and codex_home_str not in cfg.protected_paths:
             cfg.protected_paths.append(codex_home_str)
+        for claude_prot in (str(Path.home() / ".claude"), str(Path.home() / ".claude.json")):
+            if cfg.protected_paths and claude_prot not in cfg.protected_paths:
+                cfg.protected_paths.append(claude_prot)
         for b_cmd in DEFAULT_BLOCKED_COMMANDS:
             if b_cmd not in cfg.blocked_commands and b_cmd not in cfg.allowed_commands:
                 cfg.blocked_commands.append(b_cmd)
@@ -840,7 +914,7 @@ class GatewayConfig:
                 ):
                     cfg.allowed_commands.append(sh_builtin)
         if "agy" in cfg.allowed_commands:
-            for c_cmd in ("codex", cfg.codex_binary):
+            for c_cmd in ("codex", cfg.codex_binary, "claude", cfg.claude_binary):
                 if c_cmd and c_cmd not in cfg.allowed_commands and c_cmd not in cfg.blocked_commands:
                     cfg.allowed_commands.append(c_cmd)
         if "agy" in cfg.allowed_commands or "git" in cfg.allowed_commands:
@@ -945,7 +1019,7 @@ _DIAGNOSTIC_SECRET_PATTERNS = (
         r"(\s*[:=]\s*['\"]?)([^'\"\s,;]+)"
     ),
     re.compile(r"\bdots_gw_(?:tok|token|secret|key)[A-Za-z0-9_-]{6,}\b"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\b(?:sk|xai)-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{16,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -1171,6 +1245,24 @@ def codex_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
         enabled_attr="codex_plugins_enabled",
         dirs_attr="codex_plugin_dirs",
         config_source_label="config.codex_plugins",
+    )
+
+
+def claude_plugins_config_state(cfg: "GatewayConfig") -> Dict[str, Any]:
+    """Return hot-reloaded Anthropic Claude Code plugin registration config state.
+
+    Precedence: `claude_plugins_file` (JSON `{"enabled": bool, "plugin_dirs": [...]}` managed by
+    `dots-gateway claude-plugins`, mode 0600) > `cfg.claude_plugins_enabled` + `cfg.claude_plugin_dirs`.
+    Defaults to disabled (`enabled=False`) when neither is configured. Any corrupted, symlinked,
+    or world-writable `claude_plugins_file` returns `enabled=True` with `config_error` so Claude
+    sessions fail closed rather than silently bypassing operator policy.
+    """
+    return _load_plugins_registry_state(
+        cfg,
+        file_attr="claude_plugins_file",
+        enabled_attr="claude_plugins_enabled",
+        dirs_attr="claude_plugin_dirs",
+        config_source_label="config.claude_plugins",
     )
 
 

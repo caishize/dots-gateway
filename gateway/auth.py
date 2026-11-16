@@ -237,11 +237,13 @@ class Authenticator:
             self._record_failure(effective_ip, now)
             return AuthResult(False, error="Invalid X-API-Token", status_code=401)
 
-        # 2. Check Authorization header (Bearer or Basic)
+        # 2. Check Authorization header (Bearer, Basic, or raw token for SDKs such as xAI Grok)
         auth_header = hdrs.get("authorization", "").strip()
         if auth_header:
             if auth_header.lower().startswith("bearer "):
                 token = auth_header[7:].strip()
+                if token.lower().startswith("bearer "):
+                    token = token[7:].strip()
                 if self.verify_token(token):
                     return AuthResult(True, principal="bearer-client", method="bearer")
                 self._record_failure(effective_ip, now)
@@ -261,6 +263,12 @@ class Authenticator:
                     return AuthResult(True, principal=f"user:{username}", method="basic")
                 self._record_failure(effective_ip, now)
                 return AuthResult(False, error="Invalid username or password", status_code=401)
+
+            if " " not in auth_header:
+                if self.verify_token(auth_header):
+                    return AuthResult(True, principal="bearer-client", method="authorization-token")
+                self._record_failure(effective_ip, now)
+                return AuthResult(False, error="Invalid Authorization token", status_code=401)
 
         # 3. Check HMAC-SHA256 headers
         sig = hdrs.get("x-signature", "").strip()
