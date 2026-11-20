@@ -42,6 +42,7 @@ from .config import (
     docker_access_state,
     effective_plugin_state_dir,
     redact_diagnostic_text,
+    stream_mode_state,
 )
 from .hook_jail import (
     PreparedAgentPluginRuntime,
@@ -51,6 +52,7 @@ from .hook_jail import (
     prepare_codex_plugin_runtime,
 )
 from .policy import CommandPolicy
+from .progress import SessionProgressTracker, extract_final_output_from_text
 from .sandbox import (
     SHARED_SANDBOX_PUB_CACHE_VFS,
     build_mount_ns_argv,
@@ -379,6 +381,7 @@ class ExecutionSession:
         is_agy: bool = False,
         is_codex: bool = False,
         is_claude: bool = False,
+        stream_mode: str = "summary",
         spawn_argv: Optional[List[str]] = None,
         on_persist: Optional[Callable[["ExecutionSession", bool], None]] = None,
         pre_spawn_check: Optional[Callable[[], None]] = None,
@@ -394,6 +397,7 @@ class ExecutionSession:
         self.env = env
         self.use_pty = use_pty
         self.stream_json = stream_json
+        self.stream_mode = stream_mode
         self.timeout = timeout
         self.max_buffer_events = max_buffer_events
         self.max_output_bytes = max_output_bytes
@@ -436,6 +440,15 @@ class ExecutionSession:
         self._subscribers: List[asyncio.Queue[Optional[SessionEvent]]] = []
         self._done_event = asyncio.Event()
         self._watch_tasks: List[asyncio.Task[Any]] = []
+        session_kind = (
+            "agy"
+            if is_agy
+            else ("codex" if is_codex else ("claude" if is_claude else "exec"))
+        )
+        self._progress = SessionProgressTracker(
+            session_kind=session_kind,
+            stream_json=stream_json,
+        )
 
     def _run_cleanup(self) -> None:
         if self._cleanup_done:
@@ -495,6 +508,7 @@ class ExecutionSession:
             data=data,
         )
         self._events.append(ev)
+        self._progress.on_event(ev)
 
         for q in list(self._subscribers):
             try:
@@ -987,6 +1001,77 @@ class ExecutionSession:
             if ev is not None:
                 yield ev
 
+    def get_final_output(self) -> str:
+        """Return cleanly extracted final assistant output when structured agent events exist, else raw stdout."""
+        raw_stdout = "".join(t for _, t in self._stdout_chunks)
+        return self._progress.get_final_output(raw_stdout)
+
+    @staticmethod
+    def _tail_from_chunks(chunks: Deque[Tuple[int, str]], max_chars: int) -> str:
+        if max_chars <= 0:
+            return ""
+        parts: List[str] = []
+        collected = 0
+        for _, text in reversed(chunks):
+            parts.append(text)
+            collected += len(text)
+            if collected >= max_chars:
+                break
+        if not parts:
+            return ""
+        parts.reverse()
+        joined = "".join(parts)
+        return joined[-max_chars:] if len(joined) > max_chars else joined
+
+    def get_stdout_tail(self, max_chars: int = 2000) -> str:
+        return self._tail_from_chunks(self._stdout_chunks, max_chars)
+
+    def get_stderr_tail(self, max_chars: int = 1000) -> str:
+        return self._tail_from_chunks(self._stderr_chunks, max_chars)
+
+    def get_events(self, after_seq: int = 0) -> List[Dict[str, Any]]:
+        """Return serialized buffered events with `seq > after_seq`."""
+        return [ev.to_dict() for ev in self._events if ev.seq > after_seq]
+
+    def get_delta_output(self, after_seq: int = 0) -> Tuple[str, str]:
+        """Return incremental `(stdout_delta, stderr_delta)` from buffered events with `seq > after_seq`."""
+        out_parts: List[str] = []
+        err_parts: List[str] = []
+        for ev in self._events:
+            if ev.seq <= after_seq:
+                continue
+            if ev.type == "stdout":
+                out_parts.append(str(ev.data or ""))
+            elif ev.type == "stderr":
+                err_parts.append(str(ev.data or ""))
+        return "".join(out_parts), "".join(err_parts)
+
+    def format_progress_event(self, ev: SessionEvent) -> Optional[Tuple[str, bool]]:
+        """Return cached `(readable_summary, is_milestone)` for `ev`, or `None` if suppressed."""
+        return self._progress.get_summary_for_event(ev)
+
+    def get_progress(self, after_seq: int = 0) -> Dict[str, Any]:
+        """Return lightweight structured progress snapshot for real-time tracking."""
+        proc_alive = bool(
+            self._proc is not None
+            and self._proc.returncode is None
+            and self.status == "running"
+        )
+        return self._progress.to_dict(
+            session_id=self.session_id,
+            status=self.status,
+            process_alive=proc_alive,
+            stream_mode=self.stream_mode,
+            started_at=self.started_at,
+            ended_at=self.ended_at,
+            stdout_bytes=self._stdout_bytes,
+            stderr_bytes=self._stderr_bytes,
+            last_seq=self._seq,
+            agent_conversation_id=self.agent_conversation_id,
+            returncode=self.returncode,
+            after_seq=after_seq,
+        )
+
     def to_summary(self, include_output: bool = True, after_seq: int = 0) -> Dict[str, Any]:
         if self.is_codex and not self.agent_conversation_id and self.pid is not None:
             self.agent_conversation_id = _discover_codex_rollout_id(self.cwd, self.started_at)
@@ -1004,6 +1089,7 @@ class ExecutionSession:
             ),
             "status": self.status,
             "process_alive": proc_alive,
+            "stream_mode": self.stream_mode,
             "reconciled_after_restart": False,
             "agent_conversation_id": self.agent_conversation_id,
             "pid": self.pid,
@@ -1017,15 +1103,19 @@ class ExecutionSession:
                 round((self.ended_at or time.time()) - self.started_at, 4)
             ),
             "last_seq": self._seq,
+            "steps_completed": self._progress.steps_completed,
+            "current_activity": self._progress.current_activity,
             "stdout_truncated": self.stdout_truncated,
             "stderr_truncated": self.stderr_truncated,
         }
         if include_output:
-            res["stdout"] = "".join(t for _, t in self._stdout_chunks)
+            raw_stdout = "".join(t for _, t in self._stdout_chunks)
+            res["stdout"] = raw_stdout
             res["stderr"] = "".join(t for _, t in self._stderr_chunks)
-            res["events"] = [
-                ev.to_dict() for ev in self._events if ev.seq > after_seq
-            ]
+            if self._progress.recognized_structured_events:
+                res["final_output"] = self._progress.get_final_output(raw_stdout)
+            res["progress"] = self.get_progress(after_seq=after_seq)
+            res["events"] = self.get_events(after_seq=after_seq)
         return res
 
     def to_persisted_dict(self, max_tail_chars: int = _PERSISTED_TAIL_CHARS) -> Dict[str, Any]:
@@ -1045,6 +1135,7 @@ class ExecutionSession:
             "is_agy": self.is_agy,
             "is_codex": self.is_codex,
             "is_claude": self.is_claude,
+            "stream_mode": self.stream_mode,
             "status": self.status,
             "pid": self.pid,
             "boot_id": self.boot_id,
@@ -1081,6 +1172,7 @@ class PersistedSession:
         self.is_claude: bool = bool(
             record.get("is_claude") or record.get("session_kind") == "claude"
         )
+        self.stream_mode: str = str(record.get("stream_mode") or "summary")
         self.status: str = str(record.get("status") or "completed")
         raw_pid = record.get("pid")
         self.pid: Optional[int] = int(raw_pid) if raw_pid is not None else None
@@ -1111,6 +1203,76 @@ class PersistedSession:
             record.get("reconciled_after_restart", True)
         )
         self._on_update = on_update
+
+    def _session_kind(self) -> str:
+        return (
+            "agy"
+            if self.is_agy
+            else ("codex" if self.is_codex else ("claude" if self.is_claude else "exec"))
+        )
+
+    def get_final_output(self) -> str:
+        extracted, recognized = extract_final_output_from_text(self._session_kind(), self.stdout)
+        return extracted if (recognized and extracted is not None) else self.stdout
+
+    def get_stdout_tail(self, max_chars: int = 2000) -> str:
+        if max_chars <= 0:
+            return ""
+        if len(self.stdout) <= max_chars:
+            return self.stdout
+        return self.stdout[-max_chars:]
+
+    def get_stderr_tail(self, max_chars: int = 1000) -> str:
+        if max_chars <= 0:
+            return ""
+        if len(self.stderr) <= max_chars:
+            return self.stderr
+        return self.stderr[-max_chars:]
+
+    def get_events(self, after_seq: int = 0) -> List[Dict[str, Any]]:
+        return self._build_events(after_seq=after_seq)
+
+    def get_delta_output(self, after_seq: int = 0) -> Tuple[str, str]:
+        if self._seq > after_seq:
+            return self.stdout, self.stderr
+        return "", ""
+
+    def format_progress_event(self, ev: SessionEvent) -> Optional[Tuple[str, bool]]:
+        if ev.type == "exit":
+            return f"[exit] Finished ({self.status}, exit={self.returncode})", True
+        if ev.type == "reconciled":
+            return f"[reconciled] Reconciled after restart ({self.status})", True
+        return None
+
+    def get_progress(self, after_seq: int = 0) -> Dict[str, Any]:
+        alive = self.is_alive()
+        last_line = ""
+        for ln in reversed(self.stdout.splitlines()):
+            if ln.strip():
+                last_line = ln.strip()[:220]
+                break
+        return {
+            "session_id": self.session_id,
+            "session_kind": self._session_kind(),
+            "status": self.status,
+            "phase": self.status,
+            "process_alive": alive,
+            "stream_mode": self.stream_mode,
+            "elapsed_seconds": round((self.ended_at or time.time()) - self.started_at, 2),
+            "steps_completed": 0,
+            "current_activity": f"Persisted session ({self.status})",
+            "recent_activities": [],
+            "new_activities": [],
+            "last_output_line": last_line,
+            "output_bytes": {
+                "stdout": len(self.stdout.encode("utf-8", errors="replace")),
+                "stderr": len(self.stderr.encode("utf-8", errors="replace")),
+            },
+            "last_event_at": self.ended_at or self.started_at,
+            "last_seq": self._seq,
+            "agent_conversation_id": self.agent_conversation_id,
+            "returncode": self.returncode,
+        }
 
     def is_alive(self) -> bool:
         """Check kernel `(boot_id, pid, proc_start_ticks)` identity and auto-transition if exited."""
@@ -1164,13 +1326,10 @@ class PersistedSession:
             self.agent_conversation_id = _discover_codex_rollout_id(self.cwd, self.started_at)
         res: Dict[str, Any] = {
             "session_id": self.session_id,
-            "session_kind": (
-                "agy"
-                if self.is_agy
-                else ("codex" if self.is_codex else ("claude" if self.is_claude else "exec"))
-            ),
+            "session_kind": self._session_kind(),
             "status": self.status,
             "process_alive": alive,
+            "stream_mode": self.stream_mode,
             "reconciled_after_restart": self.reconciled_after_restart,
             "agent_conversation_id": self.agent_conversation_id,
             "pid": self.pid,
@@ -1184,27 +1343,30 @@ class PersistedSession:
                 round((self.ended_at or time.time()) - self.started_at, 4)
             ),
             "last_seq": self._seq,
+            "steps_completed": 0,
+            "current_activity": f"Persisted session ({self.status})",
             "stdout_truncated": self.stdout_truncated,
             "stderr_truncated": self.stderr_truncated,
         }
         if include_output:
             res["stdout"] = self.stdout
             res["stderr"] = self.stderr
-            res["events"] = self._build_events(after_seq=after_seq)
+            extracted, recognized = extract_final_output_from_text(self._session_kind(), self.stdout)
+            if recognized and extracted is not None:
+                res["final_output"] = extracted
+            res["progress"] = self.get_progress(after_seq=after_seq)
+            res["events"] = self.get_events(after_seq=after_seq)
         return res
 
     def to_persisted_dict(self) -> Dict[str, Any]:
         return {
             "schema_version": 1,
             "session_id": self.session_id,
-            "session_kind": (
-                "agy"
-                if self.is_agy
-                else ("codex" if self.is_codex else ("claude" if self.is_claude else "exec"))
-            ),
+            "session_kind": self._session_kind(),
             "is_agy": self.is_agy,
             "is_codex": self.is_codex,
             "is_claude": self.is_claude,
+            "stream_mode": self.stream_mode,
             "status": self.status,
             "pid": self.pid,
             "boot_id": self.boot_id,
@@ -1811,6 +1973,17 @@ class SessionManager:
             return None
         return str(getattr(proxy, "socket_path", "") or "") or None
 
+    def get_stream_info(self) -> Dict[str, Any]:
+        """Return hot-reloaded streaming mode & progress configuration state."""
+        state = stream_mode_state(self.config)
+        return {
+            "mode": state["mode"],
+            "enabled": bool(state["enabled"]),
+            "source": redact_diagnostic_text(str(state["source"]), self.config),
+            "progress_interval_seconds": state["progress_interval_seconds"],
+            "default_detach_after_seconds": state["default_detach_after_seconds"],
+        }
+
     def get_docker_info(self) -> Dict[str, Any]:
         """Return live Docker access state for status endpoints."""
         state = docker_access_state(self.config)
@@ -2191,6 +2364,7 @@ class SessionManager:
         on_cleanup: Optional[Callable[[], None]] = None,
         session_id_override: Optional[str] = None,
         session_workdirs: Optional[Sequence[str]] = None,
+        stream_mode: Optional[str] = None,
     ) -> ExecutionSession:
         """Validate command against security policy and start an ExecutionSession."""
         if self.active_count() >= self.config.max_concurrent_sessions:
@@ -2323,6 +2497,7 @@ class SessionManager:
 
         self._cleanup_old_sessions()
         session_id = session_id_override or f"sess_{uuid.uuid4().hex[:16]}"
+        eff_stream_mode = stream_mode or str(stream_mode_state(self.config)["mode"])
         session = ExecutionSession(
             session_id=session_id,
             argv=decision.normalized_argv,
@@ -2343,6 +2518,7 @@ class SessionManager:
             is_agy=is_agy,
             is_codex=is_codex,
             is_claude=is_claude,
+            stream_mode=eff_stream_mode,
             spawn_argv=spawn_argv,
             on_persist=(
                 self._on_live_session_persist if self._state_dir is not None else None
@@ -2384,6 +2560,7 @@ class SessionManager:
         timeout: Optional[float] = None,
         initial_stdin: Optional[str] = None,
         close_stdin: bool = True,
+        stream_mode: Optional[str] = None,
     ) -> ExecutionSession:
         """Create a dedicated `agy` session with `--dangerously-skip-permissions` enabled by default."""
         eff_model = model
@@ -2584,7 +2761,14 @@ class SessionManager:
             runtime_holder[0] = refreshed
             return refreshed
 
-        is_stream_json = output_format == "stream-json" or "--output-format=stream-json" in argv
+        is_stream_json = (
+            output_format == "stream-json"
+            or "--output-format=stream-json" in argv
+            or any(
+                argv[i] == "--output-format" and i + 1 < len(argv) and argv[i + 1] == "stream-json"
+                for i in range(len(argv))
+            )
+        )
         eff_timeout = self._resolve_timeout(
             timeout, self.config.agent_default_timeout_seconds
         )
@@ -2614,6 +2798,7 @@ class SessionManager:
                 on_cleanup=lambda: cleanup_prepared_plugin_runtime(runtime_holder[0]),
                 session_id_override=session_id,
                 session_workdirs=session_ws_agy,
+                stream_mode=stream_mode,
             )
         except BaseException:
             cleanup_prepared_plugin_runtime(runtime_holder[0])
@@ -2641,6 +2826,7 @@ class SessionManager:
         timeout: Optional[float] = None,
         initial_stdin: Optional[str] = None,
         close_stdin: bool = True,
+        stream_mode: Optional[str] = None,
     ) -> ExecutionSession:
         """Create a dedicated `codex exec` session jailed to allowed_workdirs + isolated runtime."""
         def _validate_and_build_codex_inputs() -> Tuple[
@@ -2863,6 +3049,7 @@ class SessionManager:
                 on_cleanup=lambda: cleanup_prepared_plugin_runtime(codex_runtime_holder[0]),
                 session_id_override=gw_session_id,
                 session_workdirs=[resolved_cwd_codex, *validated_add_dirs_codex],
+                stream_mode=stream_mode,
             )
         except BaseException:
             cleanup_prepared_plugin_runtime(codex_runtime_holder[0])
@@ -2888,6 +3075,7 @@ class SessionManager:
         timeout: Optional[float] = None,
         initial_stdin: Optional[str] = None,
         close_stdin: bool = True,
+        stream_mode: Optional[str] = None,
     ) -> ExecutionSession:
         """Create a dedicated `claude` (Claude Code CLI) session jailed to allowed_workdirs + isolated runtime."""
         eff_model = model
@@ -3074,7 +3262,14 @@ class SessionManager:
             return refreshed
 
         caller_env = {str(k): str(v) for k, v in env.items()} if env else {}
-        is_stream_json = output_format == "stream-json" or "--output-format=stream-json" in argv
+        is_stream_json = (
+            output_format == "stream-json"
+            or "--output-format=stream-json" in argv
+            or any(
+                argv[i] == "--output-format" and i + 1 < len(argv) and argv[i + 1] == "stream-json"
+                for i in range(len(argv))
+            )
+        )
         eff_timeout = self._resolve_timeout(
             timeout, self.config.agent_default_timeout_seconds
         )
@@ -3104,6 +3299,7 @@ class SessionManager:
                 on_cleanup=lambda: cleanup_prepared_plugin_runtime(claude_runtime_holder[0]),
                 session_id_override=gw_session_id,
                 session_workdirs=[resolved_cwd_claude, *session_ws_claude],
+                stream_mode=stream_mode,
             )
         except BaseException:
             cleanup_prepared_plugin_runtime(claude_runtime_holder[0])

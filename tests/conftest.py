@@ -31,3 +31,7 @@ os.environ.setdefault("GATEWAY_CODEX_ENV_FILE", os.path.join(_TEST_ISOLATION_DIR
 os.environ.setdefault(
     "GATEWAY_CODEX_PLUGINS_FILE", os.path.join(_TEST_ISOLATION_DIR, "codex-plugins.json")
 )
+os.environ.setdefault(
+    "GATEWAY_STREAM_MODE_FILE", os.path.join(_TEST_ISOLATION_DIR, "stream.mode")
+)
+

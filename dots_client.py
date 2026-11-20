@@ -299,7 +299,10 @@ class DotsGatewayClient:
                         raw_data = "\n".join(data_lines)
                         data_lines.clear()
                         try:
-                            yield json.loads(raw_data)
+                            parsed_ev = json.loads(raw_data)
+                            if isinstance(parsed_ev, dict) and "type" not in parsed_ev:
+                                parsed_ev["type"] = event_type
+                            yield parsed_ev
                         except json.JSONDecodeError:
                             yield {"type": event_type, "data": raw_data}
                     event_type = "message"
@@ -409,8 +412,10 @@ class DotsGatewayClient:
         use_pty: bool = False,
         stdin: Optional[str] = None,
         timeout: Optional[float] = None,
+        background: bool = False,
+        detach_after_seconds: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Execute a command and return the full output when complete."""
+        """Execute a command and return the full output when complete (or session handle if background/detached)."""
         payload: Dict[str, Any] = {
             "command": list(command) if isinstance(command, (list, tuple)) else command,
             "use_pty": use_pty,
@@ -426,6 +431,10 @@ class DotsGatewayClient:
             payload["stdin"] = stdin
         if timeout is not None:
             payload["timeout"] = timeout
+        if background:
+            payload["background"] = True
+        if detach_after_seconds is not None:
+            payload["detach_after_seconds"] = detach_after_seconds
         return self._request_json("POST", "/v1/exec", payload, timeout=(timeout or 21600.0) + 30.0)
 
     def stream_exec(
@@ -437,13 +446,16 @@ class DotsGatewayClient:
         use_pty: bool = False,
         stdin: Optional[str] = None,
         timeout: Optional[float] = None,
+        stream_mode: Optional[str] = None,
     ) -> Iterator[Dict[str, Any]]:
-        """Execute a command and yield real-time SSE events (`started`, `stdout`, `stderr`, `exit`)."""
+        """Execute a command and yield real-time SSE events (`started`, `stdout`/`stderr` or `progress`, `exit`)."""
         payload: Dict[str, Any] = {
             "command": list(command) if isinstance(command, (list, tuple)) else command,
             "use_pty": use_pty,
             "stream": True,
         }
+        if stream_mode is not None:
+            payload["stream_mode"] = stream_mode
         if shell is not None:
             payload["shell"] = shell
         if cwd:
@@ -470,6 +482,8 @@ class DotsGatewayClient:
         output_format: Optional[str] = None,
         add_dirs: Optional[Sequence[str]] = None,
         timeout: Optional[float] = None,
+        background: bool = False,
+        detach_after_seconds: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Invoke `agy --dangerously-skip-permissions` on the gateway machine and return result."""
         payload: Dict[str, Any] = {
@@ -495,6 +509,10 @@ class DotsGatewayClient:
             payload["add_dirs"] = list(add_dirs)
         if timeout is not None:
             payload["timeout"] = timeout
+        if background:
+            payload["background"] = True
+        if detach_after_seconds is not None:
+            payload["detach_after_seconds"] = detach_after_seconds
         return self._request_json("POST", "/v1/agy", payload, timeout=(timeout or 28800.0) + 30.0)
 
     def list_agy_models(self, refresh: bool = False) -> Dict[str, Any]:
@@ -516,6 +534,7 @@ class DotsGatewayClient:
         output_format: Optional[str] = "stream-json",
         add_dirs: Optional[Sequence[str]] = None,
         timeout: Optional[float] = None,
+        stream_mode: Optional[str] = None,
     ) -> Iterator[Dict[str, Any]]:
         """Invoke `agy --dangerously-skip-permissions` and stream real-time SSE events."""
         payload: Dict[str, Any] = {
@@ -525,6 +544,8 @@ class DotsGatewayClient:
             "continue_last": continue_last,
             "stream": True,
         }
+        if stream_mode is not None:
+            payload["stream_mode"] = stream_mode
         if cwd:
             payload["cwd"] = cwd
         if model:
@@ -559,6 +580,8 @@ class DotsGatewayClient:
         review: bool = False,
         add_dirs: Optional[Sequence[str]] = None,
         timeout: Optional[float] = None,
+        background: bool = False,
+        detach_after_seconds: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Invoke `codex -a never -s <sandbox_mode> exec` on the gateway machine and return result."""
         payload: Dict[str, Any] = {
@@ -584,6 +607,10 @@ class DotsGatewayClient:
             payload["add_dirs"] = list(add_dirs)
         if timeout is not None:
             payload["timeout"] = timeout
+        if background:
+            payload["background"] = True
+        if detach_after_seconds is not None:
+            payload["detach_after_seconds"] = detach_after_seconds
         return self._request_json("POST", "/v1/codex", payload, timeout=(timeout or 28800.0) + 30.0)
 
     def stream_codex(
@@ -593,7 +620,7 @@ class DotsGatewayClient:
         args: Optional[Sequence[str]] = None,
         skip_permissions: bool = True,
         sandbox_mode: str = "workspace-write",
-        json_events: bool = True,
+        json_events: Optional[bool] = True,
         model: Optional[str] = None,
         effort: Optional[str] = None,
         search: bool = False,
@@ -602,6 +629,7 @@ class DotsGatewayClient:
         review: bool = False,
         add_dirs: Optional[Sequence[str]] = None,
         timeout: Optional[float] = None,
+        stream_mode: Optional[str] = None,
     ) -> Iterator[Dict[str, Any]]:
         """Invoke `codex exec` and stream real-time SSE events."""
         payload: Dict[str, Any] = {
@@ -609,12 +637,15 @@ class DotsGatewayClient:
             "args": list(args or []),
             "skip_permissions": skip_permissions,
             "sandbox_mode": sandbox_mode,
-            "json_events": json_events,
             "search": search,
             "continue_last": continue_last,
             "review": review,
             "stream": True,
         }
+        if json_events is not None:
+            payload["json_events"] = json_events
+        if stream_mode is not None:
+            payload["stream_mode"] = stream_mode
         if cwd:
             payload["cwd"] = cwd
         if model:
@@ -643,6 +674,8 @@ class DotsGatewayClient:
         output_format: Optional[str] = None,
         add_dirs: Optional[Sequence[str]] = None,
         timeout: Optional[float] = None,
+        background: bool = False,
+        detach_after_seconds: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Invoke `claude -p` on the gateway machine and return result."""
         payload: Dict[str, Any] = {
@@ -668,6 +701,10 @@ class DotsGatewayClient:
             payload["add_dirs"] = list(add_dirs)
         if timeout is not None:
             payload["timeout"] = timeout
+        if background:
+            payload["background"] = True
+        if detach_after_seconds is not None:
+            payload["detach_after_seconds"] = detach_after_seconds
         return self._request_json("POST", "/v1/claude", payload, timeout=(timeout or 28800.0) + 30.0)
 
     def stream_claude(
@@ -684,6 +721,7 @@ class DotsGatewayClient:
         output_format: Optional[str] = "stream-json",
         add_dirs: Optional[Sequence[str]] = None,
         timeout: Optional[float] = None,
+        stream_mode: Optional[str] = None,
     ) -> Iterator[Dict[str, Any]]:
         """Invoke `claude -p` and stream real-time SSE events."""
         payload: Dict[str, Any] = {
@@ -693,6 +731,8 @@ class DotsGatewayClient:
             "continue_last": continue_last,
             "stream": True,
         }
+        if stream_mode is not None:
+            payload["stream_mode"] = stream_mode
         if cwd:
             payload["cwd"] = cwd
         if permission_mode:
@@ -716,11 +756,27 @@ class DotsGatewayClient:
         return self._request_json("POST", "/v1/sessions", kwargs)
 
     def stream_session_events(
-        self, session_id: str, after_seq: int = 0, timeout: float = 28800.0
+        self,
+        session_id: str,
+        after_seq: int = 0,
+        timeout: float = 28800.0,
+        mode: Optional[str] = None,
     ) -> Iterator[Dict[str, Any]]:
         """Resume/subscribe to SSE events of a running or completed session from `after_seq`."""
+        q = f"after_seq={after_seq}"
+        if mode:
+            q += f"&mode={urllib.parse.quote(mode)}"
         yield from self._stream_sse(
-            "GET", f"/v1/sessions/{session_id}/events?after_seq={after_seq}", timeout=timeout
+            "GET", f"/v1/sessions/{session_id}/events?{q}", timeout=timeout
+        )
+
+    def get_session_progress(
+        self, session_id: str, after_seq: int = 0, tail_chars: int = 2000
+    ) -> Dict[str, Any]:
+        """Fetch lightweight structured progress snapshot (`GET /v1/sessions/{id}/progress`)."""
+        return self._request_json(
+            "GET",
+            f"/v1/sessions/{session_id}/progress?after_seq={after_seq}&tail_chars={tail_chars}",
         )
 
     def send_session_input(
@@ -1057,6 +1113,14 @@ def main() -> int:
     p_exec.add_argument("command", help="Command string to run")
     p_exec.add_argument("--shell", action="store_true", default=None, help="Force shell execution")
     p_exec.add_argument("--no-stream", action="store_true", help="Wait instead of streaming")
+    p_exec.add_argument(
+        "--stream-mode",
+        choices=("off", "summary", "raw"),
+        default=None,
+        help="Per-call streaming mode override (off|summary|raw)",
+    )
+    p_exec.add_argument("--background", action="store_true", help="Start asynchronously and print session JSON")
+    p_exec.add_argument("--detach-after", type=float, default=None, help="Auto-detach after N seconds")
 
     p_agy = sub.add_parser("agy", help="Run `agy --dangerously-skip-permissions` on the gateway")
     p_agy.add_argument("prompt", help="Prompt to send to agy")
@@ -1064,8 +1128,16 @@ def main() -> int:
     p_agy.add_argument("--effort", default=None, help="Reasoning effort (low|medium|high|xhigh|max)")
     p_agy.add_argument("--conversation", default=None, help="Resume conversation ID")
     p_agy.add_argument("-c", "--continue-last", action="store_true", help="Continue last conversation")
-    p_agy.add_argument("--output-format", default="text", help="Output format (text|json|stream-json)")
+    p_agy.add_argument("--output-format", default=None, help="Output format (text|json|stream-json)")
     p_agy.add_argument("--no-stream", action="store_true", help="Wait instead of streaming")
+    p_agy.add_argument(
+        "--stream-mode",
+        choices=("off", "summary", "raw"),
+        default=None,
+        help="Per-call streaming mode override (off|summary|raw)",
+    )
+    p_agy.add_argument("--background", action="store_true", help="Start asynchronously and print session JSON")
+    p_agy.add_argument("--detach-after", type=float, default=None, help="Auto-detach after N seconds")
 
     p_agy_models = sub.add_parser("agy-models", help="List available agy models and default selection")
     p_agy_models.add_argument("--refresh", action="store_true", help="Bypass server cache")
@@ -1082,6 +1154,14 @@ def main() -> int:
     p_codex.add_argument("--review", action="store_true", help="Run `codex exec review`")
     p_codex.add_argument("--json", action="store_true", help="Emit JSONL events")
     p_codex.add_argument("--no-stream", action="store_true", help="Wait instead of streaming")
+    p_codex.add_argument(
+        "--stream-mode",
+        choices=("off", "summary", "raw"),
+        default=None,
+        help="Per-call streaming mode override (off|summary|raw)",
+    )
+    p_codex.add_argument("--background", action="store_true", help="Start asynchronously and print session JSON")
+    p_codex.add_argument("--detach-after", type=float, default=None, help="Auto-detach after N seconds")
 
     p_claude = sub.add_parser("claude", help="Run Anthropic Claude Code (`claude -p`) on the gateway")
     p_claude.add_argument("prompt", help="Task prompt for Claude Code")
@@ -1099,8 +1179,21 @@ def main() -> int:
     )
     p_claude.add_argument("--session", default=None, help="Resume Claude Code session UUID")
     p_claude.add_argument("-c", "--continue-last", action="store_true", help="Resume last Claude session")
-    p_claude.add_argument("--output-format", default="text", help="Output format (text|json|stream-json)")
+    p_claude.add_argument("--output-format", default=None, help="Output format (text|json|stream-json)")
     p_claude.add_argument("--no-stream", action="store_true", help="Wait instead of streaming")
+    p_claude.add_argument(
+        "--stream-mode",
+        choices=("off", "summary", "raw"),
+        default=None,
+        help="Per-call streaming mode override (off|summary|raw)",
+    )
+    p_claude.add_argument("--background", action="store_true", help="Start asynchronously and print session JSON")
+    p_claude.add_argument("--detach-after", type=float, default=None, help="Auto-detach after N seconds")
+
+    p_prog = sub.add_parser("progress", help="Fetch lightweight structured progress of a session")
+    p_prog.add_argument("session_id", help="Target session ID")
+    p_prog.add_argument("--after-seq", type=int, default=0, help="Only include activities with seq > N")
+    p_prog.add_argument("--tail-chars", type=int, default=2000, help="Trailing stdout chars to include")
 
     p_ls = sub.add_parser("ls", help="List remote workspace directory")
     p_ls.add_argument("path", nargs="?", default=".", help="Remote directory path")
@@ -1128,12 +1221,54 @@ def main() -> int:
         load_config_file=True,
     )
 
+    def _consume_sse(events: Iterator[Dict[str, Any]]) -> int:
+        rc = 0
+        saw_stdout = False
+        for ev in events:
+            etype = ev.get("type")
+            if etype == "stdout":
+                saw_stdout = True
+                sys.stdout.write(str(ev.get("data", "")))
+                sys.stdout.flush()
+            elif etype == "stderr":
+                sys.stderr.write(str(ev.get("data", "")))
+                sys.stderr.flush()
+            elif etype == "progress":
+                msg = str(ev.get("message") or "").strip()
+                if msg:
+                    sys.stderr.write(f"[progress] {msg}\n")
+                    sys.stderr.flush()
+            elif etype == "detached" or ev.get("detached"):
+                print(json.dumps(ev, indent=2, ensure_ascii=False))
+                return 0
+            elif etype == "exit":
+                edata = ev.get("data") or {}
+                if not saw_stdout and edata.get("final_output"):
+                    sys.stdout.write(str(edata["final_output"]))
+                    if not str(edata["final_output"]).endswith("\n"):
+                        sys.stdout.write("\n")
+                    sys.stdout.flush()
+                rc = int(edata.get("returncode") or 0)
+        return rc
+
     if args.cmd == "health":
         print(json.dumps(client.health(), indent=2, ensure_ascii=False))
         return 0
 
     if args.cmd == "policy":
         print(json.dumps(client.policy(), indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "progress":
+        print(
+            json.dumps(
+                client.get_session_progress(
+                    args.session_id, after_seq=args.after_seq, tail_chars=args.tail_chars
+                ),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
         return 0
 
     if args.cmd == "ls":
@@ -1161,26 +1296,33 @@ def main() -> int:
         return 0
 
     if args.cmd == "exec":
-        if args.no_stream:
-            res = client.exec_command(args.command, cwd=args.cwd, shell=args.shell)
+        use_sync = args.no_stream or args.stream_mode == "off" or args.background or (args.detach_after is not None)
+        if use_sync:
+            res = client.exec_command(
+                args.command,
+                cwd=args.cwd,
+                shell=args.shell,
+                background=args.background,
+                detach_after_seconds=args.detach_after,
+            )
+            if args.background or res.get("detached"):
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+                return 0
             sys.stdout.write(res.get("stdout", ""))
             sys.stderr.write(res.get("stderr", ""))
             return int(res.get("returncode") or 0)
-        rc = 0
-        for ev in client.stream_exec(args.command, cwd=args.cwd, shell=args.shell):
-            etype = ev.get("type")
-            if etype == "stdout":
-                sys.stdout.write(str(ev.get("data", "")))
-                sys.stdout.flush()
-            elif etype == "stderr":
-                sys.stderr.write(str(ev.get("data", "")))
-                sys.stderr.flush()
-            elif etype == "exit":
-                rc = int((ev.get("data") or {}).get("returncode") or 0)
-        return rc
+        return _consume_sse(
+            client.stream_exec(
+                args.command,
+                cwd=args.cwd,
+                shell=args.shell,
+                stream_mode=args.stream_mode,
+            )
+        )
 
     if args.cmd == "agy":
-        if args.no_stream:
+        use_sync = args.no_stream or args.stream_mode == "off" or args.background or (args.detach_after is not None)
+        if use_sync:
             res = client.run_agy(
                 prompt=args.prompt,
                 cwd=args.cwd,
@@ -1189,37 +1331,35 @@ def main() -> int:
                 conversation_id=args.conversation,
                 continue_last=args.continue_last,
                 output_format=args.output_format,
+                background=args.background,
+                detach_after_seconds=args.detach_after,
             )
+            if args.background or res.get("detached"):
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+                return 0
             sys.stdout.write(res.get("stdout", ""))
             sys.stderr.write(res.get("stderr", ""))
             return int(res.get("returncode") or 0)
-        rc = 0
-        for ev in client.stream_agy(
-            prompt=args.prompt,
-            cwd=args.cwd,
-            model=args.model,
-            effort=args.effort,
-            conversation_id=args.conversation,
-            continue_last=args.continue_last,
-            output_format=args.output_format,
-        ):
-            etype = ev.get("type")
-            if etype == "stdout":
-                sys.stdout.write(str(ev.get("data", "")))
-                sys.stdout.flush()
-            elif etype == "stderr":
-                sys.stderr.write(str(ev.get("data", "")))
-                sys.stderr.flush()
-            elif etype == "exit":
-                rc = int((ev.get("data") or {}).get("returncode") or 0)
-        return rc
+        return _consume_sse(
+            client.stream_agy(
+                prompt=args.prompt,
+                cwd=args.cwd,
+                model=args.model,
+                effort=args.effort,
+                conversation_id=args.conversation,
+                continue_last=args.continue_last,
+                output_format=args.output_format,
+                stream_mode=args.stream_mode,
+            )
+        )
 
     if args.cmd == "agy-models":
         print(json.dumps(client.list_agy_models(refresh=args.refresh), indent=2, ensure_ascii=False))
         return 0
 
     if args.cmd == "codex":
-        if args.no_stream:
+        use_sync = args.no_stream or args.stream_mode == "off" or args.background or (args.detach_after is not None)
+        if use_sync:
             res = client.run_codex(
                 prompt=args.prompt,
                 cwd=args.cwd,
@@ -1230,36 +1370,34 @@ def main() -> int:
                 session_id=args.session,
                 continue_last=args.continue_last,
                 review=args.review,
+                background=args.background,
+                detach_after_seconds=args.detach_after,
             )
+            if args.background or res.get("detached"):
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+                return 0
             sys.stdout.write(res.get("stdout", ""))
             sys.stderr.write(res.get("stderr", ""))
             return int(res.get("returncode") or 0)
-        rc = 0
-        for ev in client.stream_codex(
-            prompt=args.prompt,
-            cwd=args.cwd,
-            sandbox_mode=args.sandbox_mode,
-            json_events=args.json,
-            model=args.model,
-            effort=args.effort,
-            session_id=args.session,
-            continue_last=args.continue_last,
-            review=args.review,
-        ):
-            etype = ev.get("type")
-            if etype == "stdout":
-                sys.stdout.write(str(ev.get("data", "")))
-                sys.stdout.flush()
-            elif etype == "stderr":
-                sys.stderr.write(str(ev.get("data", "")))
-                sys.stderr.flush()
-            elif etype == "exit":
-                rc = int((ev.get("data") or {}).get("returncode") or 0)
-        return rc
+        return _consume_sse(
+            client.stream_codex(
+                prompt=args.prompt,
+                cwd=args.cwd,
+                sandbox_mode=args.sandbox_mode,
+                json_events=(True if args.json else None),
+                model=args.model,
+                effort=args.effort,
+                session_id=args.session,
+                continue_last=args.continue_last,
+                review=args.review,
+                stream_mode=args.stream_mode,
+            )
+        )
 
     if args.cmd == "claude":
         skip_perms = not bool(args.no_skip_permissions)
-        if args.no_stream:
+        use_sync = args.no_stream or args.stream_mode == "off" or args.background or (args.detach_after is not None)
+        if use_sync:
             res = client.run_claude(
                 prompt=args.prompt,
                 cwd=args.cwd,
@@ -1270,32 +1408,29 @@ def main() -> int:
                 session_id=args.session,
                 continue_last=args.continue_last,
                 output_format=args.output_format,
+                background=args.background,
+                detach_after_seconds=args.detach_after,
             )
+            if args.background or res.get("detached"):
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+                return 0
             sys.stdout.write(res.get("stdout", ""))
             sys.stderr.write(res.get("stderr", ""))
             return int(res.get("returncode") or 0)
-        rc = 0
-        for ev in client.stream_claude(
-            prompt=args.prompt,
-            cwd=args.cwd,
-            skip_permissions=skip_perms,
-            permission_mode=args.permission_mode,
-            model=args.model,
-            effort=args.effort,
-            session_id=args.session,
-            continue_last=args.continue_last,
-            output_format=args.output_format,
-        ):
-            etype = ev.get("type")
-            if etype == "stdout":
-                sys.stdout.write(str(ev.get("data", "")))
-                sys.stdout.flush()
-            elif etype == "stderr":
-                sys.stderr.write(str(ev.get("data", "")))
-                sys.stderr.flush()
-            elif etype == "exit":
-                rc = int((ev.get("data") or {}).get("returncode") or 0)
-        return rc
+        return _consume_sse(
+            client.stream_claude(
+                prompt=args.prompt,
+                cwd=args.cwd,
+                skip_permissions=skip_perms,
+                permission_mode=args.permission_mode,
+                model=args.model,
+                effort=args.effort,
+                session_id=args.session,
+                continue_last=args.continue_last,
+                output_format=args.output_format,
+                stream_mode=args.stream_mode,
+            )
+        )
 
     return 0
 

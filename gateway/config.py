@@ -11,7 +11,7 @@ import shutil
 import stat
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 GATEWAY_ROOT: Path = Path(__file__).resolve().parent.parent
 HOME_DIR: str = str(Path.home())
@@ -570,6 +570,18 @@ class GatewayConfig:
     max_output_buffer_events: int = 5000
     max_output_bytes: int = 32 * 1024 * 1024  # 32 MiB per stream
     sse_keepalive_seconds: float = 15.0
+    # Real-time streaming & progress feedback controls
+    # Valid modes: "off" | "summary" | "raw" (default: "summary")
+    # Precedence: per-call override > hot-reload stream_mode_file > stream_default_mode
+    stream_default_mode: str = "summary"
+    stream_mode_file: str = field(
+        default_factory=lambda: (
+            os.environ.get("GATEWAY_STREAM_MODE_FILE")
+            or str(Path.home() / ".config" / "dots-gateway" / "stream.mode")
+        ).strip()
+    )
+    stream_progress_interval_seconds: float = 1.0
+    default_detach_after_seconds: Optional[float] = None
     # TLS / mTLS settings
     tls_certfile: Optional[str] = None
     tls_keyfile: Optional[str] = None
@@ -828,6 +840,43 @@ class GatewayConfig:
             cfg.agy_queue_timeout_seconds = max(
                 1.0, float(os.environ["GATEWAY_AGY_QUEUE_TIMEOUT"])
             )
+        if os.environ.get("GATEWAY_STREAM_MODE") or os.environ.get("GATEWAY_STREAM_DEFAULT_MODE"):
+            raw_sm = (
+                os.environ.get("GATEWAY_STREAM_MODE")
+                or os.environ.get("GATEWAY_STREAM_DEFAULT_MODE")
+                or ""
+            ).strip()
+            if raw_sm:
+                cfg.stream_default_mode = normalize_stream_mode(raw_sm, default="summary") or "summary"
+        if os.environ.get("GATEWAY_STREAM_MODE_FILE"):
+            cfg.stream_mode_file = os.environ["GATEWAY_STREAM_MODE_FILE"].strip()
+        if os.environ.get("GATEWAY_STREAM_PROGRESS_INTERVAL"):
+            cfg.stream_progress_interval_seconds = max(
+                0.05, float(os.environ["GATEWAY_STREAM_PROGRESS_INTERVAL"])
+            )
+        if os.environ.get("GATEWAY_DEFAULT_DETACH_AFTER_SECONDS"):
+            raw_det = os.environ["GATEWAY_DEFAULT_DETACH_AFTER_SECONDS"].strip().lower()
+            if raw_det in ("", "0", "none", "off", "false"):
+                cfg.default_detach_after_seconds = None
+            else:
+                det_val = float(raw_det)
+                cfg.default_detach_after_seconds = det_val if det_val > 0 else None
+
+        cfg.stream_default_mode = (
+            normalize_stream_mode(getattr(cfg, "stream_default_mode", "summary"), default="summary")
+            or "summary"
+        )
+        cfg.stream_progress_interval_seconds = max(
+            0.05,
+            float(
+                1.0
+                if getattr(cfg, "stream_progress_interval_seconds", None) is None
+                else cfg.stream_progress_interval_seconds
+            ),
+        )
+        if cfg.default_detach_after_seconds is not None:
+            det_f = float(cfg.default_detach_after_seconds)
+            cfg.default_detach_after_seconds = det_f if det_f > 0 else None
 
         cfg.max_timeout_seconds = max(60.0, float(cfg.max_timeout_seconds or 86400.0))
         cfg.default_timeout_seconds = min(
@@ -1009,6 +1058,108 @@ def docker_access_state(cfg: "GatewayConfig") -> Dict[str, object]:
 def docker_access_enabled(cfg: "GatewayConfig") -> bool:
     """Shorthand for `docker_access_state(cfg)["enabled"]`."""
     return bool(docker_access_state(cfg)["enabled"])
+
+
+VALID_STREAM_MODES: Tuple[str, ...] = ("off", "summary", "raw")
+_STREAM_OFF_VALUES = ("0", "false", "no", "off", "none", "disable", "disabled")
+_STREAM_SUMMARY_VALUES = ("1", "true", "yes", "on", "enable", "enabled", "summary", "progress")
+_STREAM_RAW_VALUES = ("raw", "full", "verbose", "all")
+
+
+def normalize_stream_mode(value: Any, *, default: Optional[str] = None) -> Optional[str]:
+    """Normalize bool/string streaming toggle into `'off'`, `'summary'`, or `'raw'`."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return "summary" if value else "off"
+    raw = str(value).strip().lower()
+    if not raw:
+        return default
+    if raw in _STREAM_OFF_VALUES:
+        return "off"
+    if raw in _STREAM_SUMMARY_VALUES:
+        return "summary"
+    if raw in _STREAM_RAW_VALUES:
+        return "raw"
+    raise ValueError(f"Invalid stream_mode {value!r}; expected 'off', 'summary', or 'raw'")
+
+
+def stream_mode_state(cfg: "GatewayConfig") -> Dict[str, Any]:
+    """Return hot-reloaded streaming state without requiring a gateway restart.
+
+    Precedence: `stream_mode_file` (first non-comment line `off`/`summary`/`raw`, written by
+    `dots-gateway stream ...`) > `cfg.stream_default_mode` (default: `'summary'`).
+    """
+    interval = max(
+        0.05,
+        float(
+            1.0
+            if getattr(cfg, "stream_progress_interval_seconds", None) is None
+            else cfg.stream_progress_interval_seconds
+        ),
+    )
+    raw_detach = getattr(cfg, "default_detach_after_seconds", None)
+    default_detach = float(raw_detach) if (raw_detach is not None and float(raw_detach) > 0) else None
+
+    mode_file = str(getattr(cfg, "stream_mode_file", "") or "").strip()
+    if mode_file:
+        try:
+            raw = Path(mode_file).expanduser().read_text(encoding="utf-8")
+        except OSError:
+            raw = ""
+        for line in raw.splitlines():
+            val = line.split("#", 1)[0].strip().lower()
+            if not val:
+                continue
+            try:
+                parsed = normalize_stream_mode(val)
+            except ValueError:
+                parsed = None
+            if parsed in VALID_STREAM_MODES:
+                return {
+                    "mode": parsed,
+                    "enabled": parsed != "off",
+                    "source": mode_file,
+                    "progress_interval_seconds": interval,
+                    "default_detach_after_seconds": default_detach,
+                }
+            break
+
+    try:
+        cfg_mode = normalize_stream_mode(getattr(cfg, "stream_default_mode", "summary"), default="summary") or "summary"
+    except ValueError:
+        cfg_mode = "summary"
+    return {
+        "mode": cfg_mode,
+        "enabled": cfg_mode != "off",
+        "source": "config.stream_default_mode",
+        "progress_interval_seconds": interval,
+        "default_detach_after_seconds": default_detach,
+    }
+
+
+def resolve_effective_stream_mode(
+    cfg: "GatewayConfig",
+    *,
+    stream: Any = None,
+    stream_mode: Any = None,
+) -> Tuple[str, str]:
+    """Resolve effective streaming mode for a single execution.
+
+    Precedence: per-call `stream_mode` > per-call `stream` boolean > server hot-reload / config default.
+    Returns `(mode, source)`.
+    """
+    if stream_mode is not None:
+        resolved = normalize_stream_mode(stream_mode)
+        assert resolved is not None
+        return resolved, "call.stream_mode"
+    if stream is not None:
+        resolved = normalize_stream_mode(stream)
+        assert resolved is not None
+        return resolved, "call.stream"
+    state = stream_mode_state(cfg)
+    return str(state["mode"]), str(state["source"])
+
 
 
 _DIAGNOSTIC_SECRET_PATTERNS = (

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import ssl
 import threading
@@ -14,7 +15,14 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .auth import Authenticator, extract_mcp_path_token
-from .config import GatewayConfig, effective_plugin_state_dir, redact_diagnostic_text
+from .config import (
+    GatewayConfig,
+    effective_plugin_state_dir,
+    normalize_stream_mode,
+    redact_diagnostic_text,
+    resolve_effective_stream_mode,
+    stream_mode_state,
+)
 from .docker_proxy import DockerProxy
 from .executor import ExecutionSession, SessionManager
 from .files import FileService
@@ -36,7 +44,7 @@ from .tls import build_server_ssl_context
 logger = logging.getLogger("dots_gateway")
 
 _SESSION_ID_RE = re.compile(
-    r"^/v1/sessions/([A-Za-z0-9_-]+)(?:/(events|input|signal|resize))?$"
+    r"^/v1/sessions/([A-Za-z0-9_-]+)(?:/(events|progress|input|signal|resize))?$"
 )
 _FORBIDDEN_TASK_PLUGIN_KEYS = (
     "plugin_dirs",
@@ -605,6 +613,7 @@ class GatewayServer:
                     "agy_auth": self.sessions.get_agy_auth_info(),
                     "agy_plugins": self.policy.get_agy_plugins_info(),
                     "docker": self.sessions.get_docker_info(),
+                    "streaming": self.sessions.get_stream_info(),
                     "codex_binary": self.config.codex_binary,
                     "codex_default_skip_permissions": self.config.codex_default_skip_permissions,
                     "codex_default_sandbox": self.config.codex_default_sandbox,
@@ -676,6 +685,26 @@ class GatewayServer:
                 )
                 return
 
+            if req.method == "GET" and subaction == "progress":
+                try:
+                    after_seq = int((query.get("after_seq") or ["0"])[0])
+                    tail_chars = max(0, int((query.get("tail_chars") or ["2000"])[0]))
+                except ValueError:
+                    await send_json_response(
+                        writer, 400, {"ok": False, "error": "Invalid integer parameter 'after_seq' or 'tail_chars'"}
+                    )
+                    return
+                prog_payload: Dict[str, Any] = {
+                    "ok": True,
+                    **session.get_progress(after_seq=after_seq),
+                    "stdout_tail": session.get_stdout_tail(tail_chars),
+                    "stderr_tail": session.get_stderr_tail(min(1000, tail_chars)),
+                }
+                if session.status not in ("queued", "starting", "running", "orphaned_running"):
+                    prog_payload["final_output"] = session.get_final_output()
+                await send_json_response(writer, 200, prog_payload)
+                return
+
             if req.method == "GET" and subaction == "events":
                 try:
                     after_seq = int((query.get("after_seq") or ["0"])[0])
@@ -684,7 +713,20 @@ class GatewayServer:
                         writer, 400, {"ok": False, "error": "Invalid integer parameter 'after_seq'"}
                     )
                     return
-                await self._stream_session_sse(session, writer, after_seq=after_seq)
+                raw_mode = (query.get("mode") or [None])[0]
+                sse_mode = "raw"
+                if raw_mode is not None:
+                    try:
+                        parsed_m = normalize_stream_mode(raw_mode)
+                        sse_mode = "summary" if parsed_m == "summary" else "raw"
+                    except ValueError as exc:
+                        await send_json_response(
+                            writer,
+                            400,
+                            {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+                        )
+                        return
+                await self._stream_session_sse(session, writer, after_seq=after_seq, mode=sse_mode)
                 return
 
             if req.method == "POST" and subaction == "input":
@@ -955,17 +997,259 @@ class GatewayServer:
             )
 
     async def _stream_session_sse(
-        self, session: ExecutionSession, writer: asyncio.StreamWriter, after_seq: int = 0
+        self,
+        session: ExecutionSession,
+        writer: asyncio.StreamWriter,
+        after_seq: int = 0,
+        mode: str = "raw",
+        detach_after_seconds: Optional[float] = None,
     ) -> None:
-        sse = SSEWriter(writer, extra_headers={"X-Session-Id": session.session_id})
+        sse = SSEWriter(
+            writer,
+            extra_headers={
+                "X-Session-Id": session.session_id,
+                "X-Stream-Mode": mode,
+            },
+        )
         await sse.start()
+
+        keepalive_sec = max(0.2, float(self.config.sse_keepalive_seconds))
+        deadline = (
+            time.monotonic() + detach_after_seconds
+            if detach_after_seconds is not None
+            else None
+        )
+        hb_sec = (
+            min(keepalive_sec, max(0.05, min(0.25, detach_after_seconds / 2.0)))
+            if detach_after_seconds is not None
+            else keepalive_sec
+        )
+        last_keepalive_mono = time.monotonic()
+
+        async def _send_detached() -> None:
+            assert detach_after_seconds is not None
+            await sse.send_event(
+                "detached",
+                {
+                    "type": "detached",
+                    "session_id": session.session_id,
+                    "status": session.status,
+                    "detached": True,
+                    "detach_after_seconds": detach_after_seconds,
+                    "last_seq": session._seq,
+                    "progress": session.get_progress(after_seq=after_seq),
+                    "stdout_tail": session.get_stdout_tail(2000),
+                    "stderr_tail": session.get_stderr_tail(1000),
+                },
+                event_id=session._seq,
+            )
+
+        if mode != "summary":
+            async for ev in session.subscribe_with_heartbeat(
+                after_seq=after_seq, heartbeat_seconds=hb_sec
+            ):
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    if session.status in ("queued", "starting", "running"):
+                        await _send_detached()
+                        return
+                if ev is None:
+                    if (now - last_keepalive_mono) >= keepalive_sec:
+                        last_keepalive_mono = now
+                        await sse.send_comment(f"keepalive {int(time.time())}")
+                else:
+                    await sse.send_event(ev.type, ev.to_dict(), event_id=ev.seq)
+            return
+
+        # Summary SSE mode: milestone events + throttled semantic progress frames + clean exit
+        interval = max(0.05, float(getattr(self.config, "stream_progress_interval_seconds", 1.0)))
+        last_emit_mono = 0.0
+        last_sent_msg = ""
+        pending_payload: Optional[Tuple[int, Dict[str, Any]]] = None
+
+        async def _flush_pending() -> None:
+            nonlocal pending_payload, last_emit_mono, last_sent_msg
+            if pending_payload is None:
+                return
+            seq_id, payload = pending_payload
+            pending_payload = None
+            msg = str(payload.get("message") or "")
+            if msg and msg != last_sent_msg:
+                last_sent_msg = msg
+                last_emit_mono = time.monotonic()
+                await sse.send_event("progress", payload, event_id=seq_id)
+
         async for ev in session.subscribe_with_heartbeat(
-            after_seq=after_seq, heartbeat_seconds=self.config.sse_keepalive_seconds
+            after_seq=after_seq, heartbeat_seconds=hb_sec
         ):
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                if session.status in ("queued", "starting", "running"):
+                    await _flush_pending()
+                    await _send_detached()
+                    return
+
             if ev is None:
-                await sse.send_comment(f"keepalive {int(time.time())}")
+                if pending_payload is not None and (now - last_emit_mono) >= interval:
+                    await _flush_pending()
+                if (now - last_keepalive_mono) >= keepalive_sec:
+                    last_keepalive_mono = now
+                    await sse.send_comment(f"keepalive {int(time.time())}")
+                continue
+
+            if ev.type in ("queued", "started", "error", "exit"):
+                if ev.type == "exit":
+                    await _flush_pending()
+                    ev_dict = ev.to_dict()
+                    ev_data = dict(ev_dict.get("data") or {}) if isinstance(ev_dict.get("data"), dict) else {}
+                    ev_data["final_output"] = session.get_final_output()
+                    ev_data["progress"] = session.get_progress(after_seq=after_seq)
+                    ev_dict["data"] = ev_data
+                    await sse.send_event("exit", ev_dict, event_id=ev.seq)
+                else:
+                    await sse.send_event(ev.type, ev.to_dict(), event_id=ev.seq)
+                continue
+
+            formatted = session.format_progress_event(ev)
+            if formatted is None:
+                continue
+            summary_text, is_milestone = formatted
+            payload = {
+                "seq": ev.seq,
+                "type": "progress",
+                "timestamp": ev.timestamp,
+                "session_id": session.session_id,
+                "message": summary_text,
+                "milestone": is_milestone,
+                "progress": session.get_progress(after_seq=max(0, ev.seq - 1)),
+            }
+            if is_milestone or (now - last_emit_mono) >= interval:
+                pending_payload = None
+                if summary_text != last_sent_msg:
+                    last_sent_msg = summary_text
+                    last_emit_mono = now
+                    await sse.send_event("progress", payload, event_id=ev.seq)
             else:
-                await sse.send_event(ev.type, ev.to_dict(), event_id=ev.seq)
+                pending_payload = (ev.seq, payload)
+
+        await _flush_pending()
+
+    def _resolve_http_exec_controls(
+        self, req: HTTPRequest, body: Dict[str, Any]
+    ) -> Tuple[bool, str, str, bool, Optional[float]]:
+        """Resolve `(use_sse, eff_stream_mode, sse_wire_mode, background, detach_after_seconds)`."""
+        background = bool(body.get("background", False))
+        raw_detach = body.get("detach_after_seconds")
+        detach_after: Optional[float] = None
+        if not background:
+            if raw_detach is not None:
+                try:
+                    val = float(raw_detach)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid detach_after_seconds value: {raw_detach!r}") from exc
+                if not math.isfinite(val) or val <= 0:
+                    raise ValueError("detach_after_seconds must be a positive finite number")
+                detach_after = val
+            else:
+                default_det = getattr(self.config, "default_detach_after_seconds", None)
+                if default_det is not None and float(default_det) > 0:
+                    detach_after = float(default_det)
+
+        accept_sse = "text/event-stream" in req.headers.get("accept", "").lower()
+        has_stream_mode = body.get("stream_mode") is not None
+        has_stream_flag = "stream" in body and body.get("stream") is not None
+
+        if has_stream_mode:
+            eff_mode = normalize_stream_mode(body.get("stream_mode"))
+            assert eff_mode is not None
+            use_sse = (eff_mode != "off") and not background
+            sse_wire_mode = "summary" if eff_mode == "summary" else "raw"
+            return use_sse, eff_mode, sse_wire_mode, background, detach_after
+
+        if has_stream_flag:
+            want_stream = bool(body.get("stream"))
+            if not want_stream:
+                return False, "off", "raw", background, detach_after
+            server_mode = str(stream_mode_state(self.config)["mode"])
+            eff_mode = server_mode if server_mode != "off" else "summary"
+            # Preserve raw SSE wire format when caller only passes legacy `stream: true`
+            return (not background), eff_mode, "raw", background, detach_after
+
+        server_mode = str(stream_mode_state(self.config)["mode"])
+        if accept_sse and not background and server_mode != "off":
+            return True, server_mode, server_mode, background, detach_after
+        return False, server_mode, "raw", background, detach_after
+
+    async def _finish_http_session(
+        self,
+        session: ExecutionSession,
+        writer: asyncio.StreamWriter,
+        *,
+        use_sse: bool,
+        eff_stream_mode: str,
+        sse_wire_mode: str,
+        background: bool,
+        detach_after: Optional[float],
+        interactive: bool = False,
+        wait_interactive: bool = False,
+        auto_structured: bool = False,
+    ) -> None:
+        if background or (interactive and not wait_interactive and not use_sse):
+            payload: Dict[str, Any] = {
+                "ok": True,
+                **session.to_summary(include_output=False),
+                "progress": session.get_progress(after_seq=0),
+            }
+            if background:
+                payload["background"] = True
+            await send_json_response(
+                writer,
+                200,
+                payload,
+                extra_headers={"X-Session-Id": session.session_id},
+            )
+            return
+
+        if use_sse:
+            await self._stream_session_sse(
+                session,
+                writer,
+                after_seq=0,
+                mode=sse_wire_mode,
+                detach_after_seconds=detach_after,
+            )
+            return
+
+        if detach_after is not None:
+            try:
+                await asyncio.wait_for(session._done_event.wait(), timeout=detach_after)
+            except asyncio.TimeoutError:
+                if session.status in ("queued", "starting", "running"):
+                    await send_json_response(
+                        writer,
+                        200,
+                        {
+                            "ok": True,
+                            "detached": True,
+                            "detach_after_seconds": detach_after,
+                            **session.to_summary(include_output=False),
+                            "progress": session.get_progress(after_seq=0),
+                            "stdout_tail": session.get_stdout_tail(2000),
+                            "stderr_tail": session.get_stderr_tail(1000),
+                        },
+                        extra_headers={"X-Session-Id": session.session_id},
+                    )
+                    return
+
+        summary = await session.wait()
+        if auto_structured and eff_stream_mode != "raw":
+            summary["stdout"] = summary.get("final_output", summary["stdout"])
+        await send_json_response(
+            writer,
+            200,
+            {"ok": summary["returncode"] == 0, **summary},
+            extra_headers={"X-Session-Id": session.session_id},
+        )
 
     async def _handle_http_exec(
         self, req: HTTPRequest, writer: asyncio.StreamWriter
@@ -998,9 +1282,18 @@ class GatewayServer:
             )
             return
 
-        stream = bool(body.get("stream", False)) or (
-            "text/event-stream" in req.headers.get("accept", "")
-        )
+        try:
+            use_sse, eff_stream_mode, sse_wire_mode, background, detach_after = (
+                self._resolve_http_exec_controls(req, body)
+            )
+        except ValueError as exc:
+            await send_json_response(
+                writer,
+                400,
+                {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+            )
+            return
+
         close_stdin = bool(body.get("close_stdin", not bool(body.get("interactive", False))))
         raw_shell = body.get("shell")
         shell_opt = None if raw_shell is None else bool(raw_shell)
@@ -1016,6 +1309,7 @@ class GatewayServer:
                 timeout=body.get("timeout"),
                 initial_stdin=body.get("stdin"),
                 close_stdin=close_stdin,
+                stream_mode=eff_stream_mode,
             )
         except PermissionError as exc:
             safe_err = redact_diagnostic_text(str(exc), self.config)
@@ -1041,16 +1335,15 @@ class GatewayServer:
             )
             return
 
-        if stream:
-            await self._stream_session_sse(session, writer, after_seq=0)
-        else:
-            summary = await session.wait()
-            await send_json_response(
-                writer,
-                200,
-                {"ok": summary["returncode"] == 0, **summary},
-                extra_headers={"X-Session-Id": session.session_id},
-            )
+        await self._finish_http_session(
+            session,
+            writer,
+            use_sse=use_sse,
+            eff_stream_mode=eff_stream_mode,
+            sse_wire_mode=sse_wire_mode,
+            background=background,
+            detach_after=detach_after,
+        )
 
     async def _handle_http_agy(
         self, req: HTTPRequest, writer: asyncio.StreamWriter
@@ -1087,14 +1380,36 @@ class GatewayServer:
             )
             return
 
-        stream = bool(body.get("stream", False)) or (
-            "text/event-stream" in req.headers.get("accept", "")
-        )
+        try:
+            use_sse, eff_stream_mode, sse_wire_mode, background, detach_after = (
+                self._resolve_http_exec_controls(req, body)
+            )
+        except ValueError as exc:
+            await send_json_response(
+                writer,
+                400,
+                {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+            )
+            return
+
         input_format = body.get("input_format")
         output_format = body.get("output_format")
+        has_raw_fmt = any(
+            str(a) == "--output-format" or str(a).startswith("--output-format=")
+            for a in args
+        )
+        auto_structured = False
         if interactive and not input_format:
             input_format = "stream-json"
             output_format = "stream-json"
+        elif (
+            output_format is None
+            and not has_raw_fmt
+            and eff_stream_mode != "off"
+            and (use_sse or background or detach_after is not None)
+        ):
+            output_format = "stream-json"
+            auto_structured = True
 
         close_stdin = bool(body.get("close_stdin", not interactive))
 
@@ -1118,6 +1433,7 @@ class GatewayServer:
                 timeout=body.get("timeout"),
                 initial_stdin=body.get("stdin"),
                 close_stdin=close_stdin,
+                stream_mode=eff_stream_mode,
             )
             if interactive and prompt is not None:
                 await session.send_agy_turn(str(prompt), close_after=False)
@@ -1145,23 +1461,18 @@ class GatewayServer:
             )
             return
 
-        if stream:
-            await self._stream_session_sse(session, writer, after_seq=0)
-        elif interactive and not bool(body.get("wait", False)):
-            await send_json_response(
-                writer,
-                200,
-                {"ok": True, **session.to_summary(include_output=False)},
-                extra_headers={"X-Session-Id": session.session_id},
-            )
-        else:
-            summary = await session.wait()
-            await send_json_response(
-                writer,
-                200,
-                {"ok": summary["returncode"] == 0, **summary},
-                extra_headers={"X-Session-Id": session.session_id},
-            )
+        await self._finish_http_session(
+            session,
+            writer,
+            use_sse=use_sse,
+            eff_stream_mode=eff_stream_mode,
+            sse_wire_mode=sse_wire_mode,
+            background=background,
+            detach_after=detach_after,
+            interactive=interactive,
+            wait_interactive=bool(body.get("wait", False)),
+            auto_structured=auto_structured,
+        )
 
     async def _handle_http_codex(
         self, req: HTTPRequest, writer: asyncio.StreamWriter
@@ -1198,9 +1509,28 @@ class GatewayServer:
             )
             return
 
-        stream = bool(body.get("stream", False)) or (
-            "text/event-stream" in req.headers.get("accept", "")
+        try:
+            use_sse, eff_stream_mode, sse_wire_mode, background, detach_after = (
+                self._resolve_http_exec_controls(req, body)
+            )
+        except ValueError as exc:
+            await send_json_response(
+                writer,
+                400,
+                {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+            )
+            return
+
+        caller_json_events = body.get("json_events")
+        has_raw_json = "--json" in [str(a) for a in args]
+        auto_structured = (
+            caller_json_events is None
+            and not has_raw_json
+            and eff_stream_mode != "off"
+            and (use_sse or background or detach_after is not None)
         )
+        eff_json_events = True if auto_structured else bool(caller_json_events or False)
+
         try:
             session = await self.sessions.create_codex_session(
                 prompt=prompt,
@@ -1209,7 +1539,7 @@ class GatewayServer:
                 args=args,
                 skip_permissions=body.get("skip_permissions"),
                 sandbox_mode=body.get("sandbox_mode"),
-                json_events=bool(body.get("json_events", False)),
+                json_events=eff_json_events,
                 model=body.get("model"),
                 effort=body.get("effort"),
                 search=bool(body.get("search", False)),
@@ -1221,6 +1551,7 @@ class GatewayServer:
                 timeout=body.get("timeout"),
                 initial_stdin=body.get("stdin"),
                 close_stdin=bool(body.get("close_stdin", True)),
+                stream_mode=eff_stream_mode,
             )
         except PermissionError as exc:
             safe_err = redact_diagnostic_text(str(exc), self.config)
@@ -1246,16 +1577,16 @@ class GatewayServer:
             )
             return
 
-        if stream:
-            await self._stream_session_sse(session, writer, after_seq=0)
-        else:
-            summary = await session.wait()
-            await send_json_response(
-                writer,
-                200,
-                {"ok": summary["returncode"] == 0, **summary},
-                extra_headers={"X-Session-Id": session.session_id},
-            )
+        await self._finish_http_session(
+            session,
+            writer,
+            use_sse=use_sse,
+            eff_stream_mode=eff_stream_mode,
+            sse_wire_mode=sse_wire_mode,
+            background=background,
+            detach_after=detach_after,
+            auto_structured=auto_structured,
+        )
 
     async def _handle_http_claude(
         self, req: HTTPRequest, writer: asyncio.StreamWriter
@@ -1292,14 +1623,36 @@ class GatewayServer:
             )
             return
 
-        stream = bool(body.get("stream", False)) or (
-            "text/event-stream" in req.headers.get("accept", "")
-        )
+        try:
+            use_sse, eff_stream_mode, sse_wire_mode, background, detach_after = (
+                self._resolve_http_exec_controls(req, body)
+            )
+        except ValueError as exc:
+            await send_json_response(
+                writer,
+                400,
+                {"ok": False, "error": redact_diagnostic_text(str(exc), self.config)},
+            )
+            return
+
         input_format = body.get("input_format")
         output_format = body.get("output_format")
+        has_raw_fmt = any(
+            str(a) == "--output-format" or str(a).startswith("--output-format=")
+            for a in args
+        )
+        auto_structured = False
         if interactive and not input_format:
             input_format = "stream-json"
             output_format = "stream-json"
+        elif (
+            output_format is None
+            and not has_raw_fmt
+            and eff_stream_mode != "off"
+            and (use_sse or background or detach_after is not None)
+        ):
+            output_format = "stream-json"
+            auto_structured = True
 
         close_stdin = bool(body.get("close_stdin", not interactive))
 
@@ -1323,6 +1676,7 @@ class GatewayServer:
                 timeout=body.get("timeout"),
                 initial_stdin=body.get("stdin"),
                 close_stdin=close_stdin,
+                stream_mode=eff_stream_mode,
             )
             if interactive and prompt is not None:
                 await session.send_agy_turn(str(prompt), close_after=False)
@@ -1350,23 +1704,18 @@ class GatewayServer:
             )
             return
 
-        if stream:
-            await self._stream_session_sse(session, writer, after_seq=0)
-        elif interactive and not bool(body.get("wait", False)):
-            await send_json_response(
-                writer,
-                200,
-                {"ok": True, **session.to_summary(include_output=False)},
-                extra_headers={"X-Session-Id": session.session_id},
-            )
-        else:
-            summary = await session.wait()
-            await send_json_response(
-                writer,
-                200,
-                {"ok": summary["returncode"] == 0, **summary},
-                extra_headers={"X-Session-Id": session.session_id},
-            )
+        await self._finish_http_session(
+            session,
+            writer,
+            use_sse=use_sse,
+            eff_stream_mode=eff_stream_mode,
+            sse_wire_mode=sse_wire_mode,
+            background=background,
+            detach_after=detach_after,
+            interactive=interactive,
+            wait_interactive=bool(body.get("wait", False)),
+            auto_structured=auto_structured,
+        )
 
     async def _handle_http_create_session(
         self, req: HTTPRequest, writer: asyncio.StreamWriter
@@ -1388,6 +1737,9 @@ class GatewayServer:
         session_type = body.get("type", "exec")
         try:
             _reject_task_plugin_overrides(body)
+            eff_stream_mode, _ = resolve_effective_stream_mode(
+                self.config, stream=body.get("stream"), stream_mode=body.get("stream_mode")
+            )
             if session_type == "agy":
                 input_format = body.get("input_format", "stream-json")
                 output_format = body.get("output_format", "stream-json")
@@ -1409,6 +1761,7 @@ class GatewayServer:
                     use_pty=bool(body.get("use_pty", False)),
                     timeout=body.get("timeout"),
                     close_stdin=False,
+                    stream_mode=eff_stream_mode,
                 )
                 if body.get("prompt"):
                     await session.send_agy_turn(str(body["prompt"]), close_after=False)
@@ -1423,6 +1776,8 @@ class GatewayServer:
                         {"ok": False, "error": "Missing 'prompt' for session type 'codex'"},
                     )
                     return
+                caller_json = body.get("json_events")
+                eff_json = (eff_stream_mode != "off") if caller_json is None else bool(caller_json)
                 session = await self.sessions.create_codex_session(
                     prompt=prompt,
                     cwd=body.get("cwd"),
@@ -1430,7 +1785,7 @@ class GatewayServer:
                     args=args,
                     skip_permissions=body.get("skip_permissions"),
                     sandbox_mode=body.get("sandbox_mode"),
-                    json_events=bool(body.get("json_events", True)),
+                    json_events=eff_json,
                     model=body.get("model"),
                     effort=body.get("effort"),
                     search=bool(body.get("search", False)),
@@ -1441,6 +1796,7 @@ class GatewayServer:
                     use_pty=bool(body.get("use_pty", False)),
                     timeout=body.get("timeout"),
                     close_stdin=True,
+                    stream_mode=eff_stream_mode,
                 )
             elif session_type == "claude":
                 input_format = body.get("input_format", "stream-json")
@@ -1463,6 +1819,7 @@ class GatewayServer:
                     use_pty=bool(body.get("use_pty", False)),
                     timeout=body.get("timeout"),
                     close_stdin=False,
+                    stream_mode=eff_stream_mode,
                 )
                 if body.get("prompt"):
                     await session.send_agy_turn(str(body["prompt"]), close_after=False)
@@ -1485,6 +1842,7 @@ class GatewayServer:
                     timeout=body.get("timeout"),
                     initial_stdin=body.get("stdin"),
                     close_stdin=bool(body.get("close_stdin", False)),
+                    stream_mode=eff_stream_mode,
                 )
         except PermissionError as exc:
             safe_err = redact_diagnostic_text(str(exc), self.config)
@@ -1519,7 +1877,11 @@ class GatewayServer:
         await send_json_response(
             writer,
             200,
-            {"ok": True, **session.to_summary(include_output=False)},
+            {
+                "ok": True,
+                **session.to_summary(include_output=False),
+                "progress": session.get_progress(after_seq=0),
+            },
             extra_headers={"X-Session-Id": session.session_id},
         )
 

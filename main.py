@@ -9,7 +9,7 @@ import json
 import logging
 from pathlib import Path
 
-from gateway.config import GatewayConfig, hash_password_pbkdf2
+from gateway.config import GatewayConfig, hash_password_pbkdf2, stream_mode_state
 from gateway.server import GatewayServer
 from gateway.tls import compute_cert_sha256, ensure_tls_pki
 
@@ -200,6 +200,11 @@ async def async_main() -> int:
     print(
         f"  Claude Binary       : {cfg.claude_binary} "
         f"(skip_permissions={cfg.claude_default_skip_permissions}, mode={cfg.claude_default_permission_mode}, max_concurrent_claude={cfg.max_concurrent_claude})"
+    )
+    st_stream = stream_mode_state(cfg)
+    print(
+        f"  Stream Output       : {st_stream['mode']} "
+        f"(source={st_stream['source']}, detach_default={st_stream['default_detach_after_seconds'] or 'disabled'})"
     )
     print("-" * 76)
     print(f"  Bearer API Token    : {cfg.api_tokens[0]}")

@@ -14,13 +14,20 @@ import asyncio
 from collections import OrderedDict
 import json
 import logging
+import math
 import secrets
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 from . import __version__
-from .config import GatewayConfig, effective_plugin_state_dir, redact_diagnostic_text
+from .config import (
+    GatewayConfig,
+    effective_plugin_state_dir,
+    redact_diagnostic_text,
+    resolve_effective_stream_mode,
+    stream_mode_state,
+)
 from .executor import ExecutionSession, SessionManager
 from .files import FileService
 from .policy import CommandPolicy, redact_for_audit_log
@@ -174,6 +181,25 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "minimum": 0.1,
                     "description": "Timeout in seconds (default: 21600 [6h], max: 86400 [24h]).",
                 },
+                "stream": {
+                    "type": "boolean",
+                    "description": "Per-call streaming toggle override (true -> 'summary', false -> 'off'). Omit to follow gateway default.",
+                },
+                "stream_mode": {
+                    "type": "string",
+                    "enum": ["off", "summary", "raw"],
+                    "description": "Per-call streaming granularity override ('off', 'summary', or 'raw'). Overrides 'stream' and gateway default.",
+                },
+                "background": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Start asynchronously and return `session_id` + `progress` immediately without waiting for completion.",
+                },
+                "detach_after_seconds": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "description": "Optional auto-detach threshold in seconds (disabled by default). If still running after this duration, returns `detached=true`, `session_id`, and live `progress`.",
+                },
             },
             "required": ["command"],
             "additionalProperties": False,
@@ -238,6 +264,11 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "description": "Continue the most recent `agy` conversation in `cwd`.",
                     "default": False,
                 },
+                "output_format": {
+                    "type": "string",
+                    "enum": ["text", "json", "stream-json"],
+                    "description": "Optional explicit CLI output format override (`text`, `json`, or `stream-json`).",
+                },
                 "add_dirs": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -252,6 +283,25 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "type": "number",
                     "minimum": 0.1,
                     "description": "Timeout in seconds (default: 28800 [8h], max: 86400 [24h]).",
+                },
+                "stream": {
+                    "type": "boolean",
+                    "description": "Per-call streaming toggle override (true -> 'summary', false -> 'off'). Omit to follow gateway default.",
+                },
+                "stream_mode": {
+                    "type": "string",
+                    "enum": ["off", "summary", "raw"],
+                    "description": "Per-call streaming granularity override ('off', 'summary', or 'raw'). Overrides 'stream' and gateway default.",
+                },
+                "background": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Start asynchronously and return `session_id` + `progress` immediately for tracking via `session_poll`.",
+                },
+                "detach_after_seconds": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "description": "Optional auto-detach threshold in seconds (disabled by default). If still running after this duration, returns `detached=true`, `session_id`, and live `progress`.",
                 },
             },
             "required": ["prompt"],
@@ -324,8 +374,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "json_events": {
                     "type": "boolean",
-                    "default": False,
-                    "description": "Emit raw JSONL events on stdout (`--json`). Defaults to false (clean final message on stdout).",
+                    "description": "Explicitly enable or disable raw JSONL events on stdout (`--json`).",
                 },
                 "add_dirs": {
                     "type": "array",
@@ -341,6 +390,25 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "type": "number",
                     "minimum": 0.1,
                     "description": "Timeout in seconds (default: 28800 [8h], max: 86400 [24h]).",
+                },
+                "stream": {
+                    "type": "boolean",
+                    "description": "Per-call streaming toggle override (true -> 'summary', false -> 'off'). Omit to follow gateway default.",
+                },
+                "stream_mode": {
+                    "type": "string",
+                    "enum": ["off", "summary", "raw"],
+                    "description": "Per-call streaming granularity override ('off', 'summary', or 'raw'). Overrides 'stream' and gateway default.",
+                },
+                "background": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Start asynchronously and return `session_id` + `progress` immediately for tracking via `session_poll`.",
+                },
+                "detach_after_seconds": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "description": "Optional auto-detach threshold in seconds (disabled by default). If still running after this duration, returns `detached=true`, `session_id`, and live `progress`.",
                 },
             },
             "additionalProperties": False,
@@ -438,6 +506,25 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "type": "number",
                     "minimum": 0.1,
                     "description": "Timeout in seconds (default: 28800 [8h], max: 86400 [24h]).",
+                },
+                "stream": {
+                    "type": "boolean",
+                    "description": "Per-call streaming toggle override (true -> 'summary', false -> 'off'). Omit to follow gateway default.",
+                },
+                "stream_mode": {
+                    "type": "string",
+                    "enum": ["off", "summary", "raw"],
+                    "description": "Per-call streaming granularity override ('off', 'summary', or 'raw'). Overrides 'stream' and gateway default.",
+                },
+                "background": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Start asynchronously and return `session_id` + `progress` immediately for tracking via `session_poll`.",
+                },
+                "detach_after_seconds": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "description": "Optional auto-detach threshold in seconds (disabled by default). If still running after this duration, returns `detached=true`, `session_id`, and live `progress`.",
                 },
             },
             "required": ["prompt"],
@@ -563,6 +650,24 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "minimum": 0.1,
                     "description": "Timeout in seconds (default: 28800 [8h] for agy/codex/claude, 21600 [6h] for exec; max: 86400 [24h]).",
                 },
+                "output_format": {
+                    "type": "string",
+                    "enum": ["text", "json", "stream-json"],
+                    "description": "Optional explicit CLI output format override for `type='agy'` or `type='claude'`.",
+                },
+                "json_events": {
+                    "type": "boolean",
+                    "description": "Optional explicit `--json` toggle for `type='codex'`.",
+                },
+                "stream": {
+                    "type": "boolean",
+                    "description": "Per-session streaming mode toggle override (true -> 'summary', false -> 'off').",
+                },
+                "stream_mode": {
+                    "type": "string",
+                    "enum": ["off", "summary", "raw"],
+                    "description": "Per-session streaming granularity override ('off', 'summary', or 'raw').",
+                },
             },
             "additionalProperties": False,
         },
@@ -577,21 +682,22 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "session_poll",
         "title": "Poll Background Session Output & Status",
         "description": (
-            "Fetch current status, `process_alive` (/proc kernel identity check), stdout/stderr, "
-            "and incremental events (`after_seq`) of a background or pre-restart persisted session, "
-            "optionally waiting up to `wait_seconds` for new output."
+            "Fetch current status, `process_alive` (/proc kernel identity check), structured `progress`, "
+            "stdout/stderr, and incremental events (`after_seq`) of a background or pre-restart persisted session, "
+            "optionally waiting up to `wait_seconds` for new output. Use `view='progress'` for lightweight "
+            "progress polling without repeating full accumulated output."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "Target `session_id` returned by `session_start`.",
+                    "description": "Target `session_id` returned by `session_start` or a background/detached task.",
                 },
                 "after_seq": {
                     "type": "integer",
                     "default": 0,
-                    "description": "Only return events with sequence number > `after_seq`.",
+                    "description": "Only return events/activities with sequence number > `after_seq`.",
                 },
                 "wait_seconds": {
                     "type": "number",
@@ -602,6 +708,22 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "type": "boolean",
                     "default": False,
                     "description": "If true, wait up to `wait_seconds` for the session to finish completely.",
+                },
+                "view": {
+                    "type": "string",
+                    "enum": ["full", "progress", "delta"],
+                    "default": "full",
+                    "description": (
+                        "'full' (default) returns full stdout/stderr + progress + events; "
+                        "'progress' returns lightweight structured progress + new activities + output tail; "
+                        "'delta' returns only incremental stdout/stderr & events since `after_seq`."
+                    ),
+                },
+                "tail_chars": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 2000,
+                    "description": "Maximum trailing characters in `stdout_tail` when `view='progress'`.",
                 },
                 "include_events": {
                     "type": "boolean",
@@ -993,6 +1115,7 @@ class MCPHandler:
         self.sessions = sessions
         self._started_at = started_at or time.time()
         self._mcp_sessions: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+        self._active_request_sessions: Dict[Tuple[Optional[str], Any], str] = {}
 
     def _allocate_session(self, protocol_version: str, client_info: Dict[str, Any]) -> str:
         sid = f"mcp_{secrets.token_urlsafe(24)}"
@@ -1020,9 +1143,8 @@ class MCPHandler:
             return True
         return False
 
-    @staticmethod
-    def should_stream_sse(payload: Any) -> bool:
-        """Return True if payload contains a potentially long-running tool call suited for SSE."""
+    def should_stream_sse(self, payload: Any) -> bool:
+        """Return True if payload contains a long-running tool call with streaming enabled."""
         items = payload if isinstance(payload, list) else [payload]
         for item in items:
             if not isinstance(item, dict):
@@ -1034,10 +1156,29 @@ class MCPHandler:
                 continue
             name = params.get("name")
             args = params.get("arguments") or {}
+            if not isinstance(args, dict):
+                args = {}
             if name in ("exec_command", "run_agy", "run_codex", "run_claude"):
-                return True
-            if name == "session_poll" and isinstance(args, dict) and float(args.get("wait_seconds") or 0) > 0:
-                return True
+                if bool(args.get("background", False)):
+                    continue
+                try:
+                    eff_mode, _ = resolve_effective_stream_mode(
+                        self.config,
+                        stream=args.get("stream"),
+                        stream_mode=args.get("stream_mode"),
+                    )
+                except ValueError:
+                    continue
+                if eff_mode != "off":
+                    return True
+            if name == "session_poll":
+                try:
+                    wait_sec = float(args.get("wait_seconds") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(wait_sec) and wait_sec > 0:
+                    if stream_mode_state(self.config)["mode"] != "off":
+                        return True
         return False
 
     async def handle_payload(
@@ -1062,19 +1203,27 @@ class MCPHandler:
                 return _jsonrpc_error(None, -32600, "Invalid Request: empty batch"), resp_headers
             responses: List[Dict[str, Any]] = []
             for item in payload:
-                res, item_hdrs = await self._handle_single(item, emit_event=emit_event)
+                res, item_hdrs = await self._handle_single(
+                    item, emit_event=emit_event, mcp_session_id=active_sid
+                )
                 resp_headers.update(item_hdrs)
                 if res is not None:
                     responses.append(res)
             return (responses if responses else None), resp_headers
 
-        return await self._handle_single(payload, existing_headers=resp_headers, emit_event=emit_event)
+        return await self._handle_single(
+            payload,
+            existing_headers=resp_headers,
+            emit_event=emit_event,
+            mcp_session_id=active_sid,
+        )
 
     async def _handle_single(
         self,
         msg: Any,
         existing_headers: Optional[Dict[str, str]] = None,
         emit_event: Optional[EmitCallback] = None,
+        mcp_session_id: Optional[str] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, str]]:
         headers = dict(existing_headers or {})
         if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
@@ -1108,9 +1257,22 @@ class MCPHandler:
         # Notifications (`notifications/initialized`, `notifications/cancelled`, etc.)
         if not has_id:
             if method == "notifications/cancelled":
-                # Best-effort cancellation hook if a session_id was supplied in params
-                cancel_sid = params.get("sessionId")
-                if isinstance(cancel_sid, str):
+                # Support both standard MCP `requestId` mapping (scoped by MCP session) and explicit `sessionId`
+                cancel_sid: Optional[str] = None
+                cancel_req_id = params.get("requestId")
+                if isinstance(cancel_req_id, (str, int)) and not isinstance(cancel_req_id, bool):
+                    cancel_sid = self._active_request_sessions.get((mcp_session_id, cancel_req_id))
+                    if cancel_sid is None and mcp_session_id is None:
+                        matches = [
+                            sid
+                            for (_, rid), sid in self._active_request_sessions.items()
+                            if rid == cancel_req_id
+                        ]
+                        if len(matches) == 1:
+                            cancel_sid = matches[0]
+                if not cancel_sid and isinstance(params.get("sessionId"), str):
+                    cancel_sid = str(params["sessionId"])
+                if cancel_sid:
                     sess = self.sessions.get_session(cancel_sid)
                     if sess is not None:
                         await sess.send_signal("SIGTERM")
@@ -1167,6 +1329,7 @@ class MCPHandler:
                 params=params,
                 progress_token=progress_token,
                 emit_event=emit_event,
+                mcp_session_id=mcp_session_id,
             )
             return res, headers
 
@@ -1224,30 +1387,116 @@ class MCPHandler:
 
         return _jsonrpc_error(req_id, -32601, f"Method not found: {method}"), headers
 
+    def _resolve_detach_after(self, args: Dict[str, Any]) -> Optional[float]:
+        """Validate optional per-call `detach_after_seconds` (or server default, disabled by default)."""
+        raw = args.get("detach_after_seconds")
+        if raw is None:
+            default_det = getattr(self.config, "default_detach_after_seconds", None)
+            return float(default_det) if (default_det is not None and float(default_det) > 0) else None
+        try:
+            val = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid detach_after_seconds value: {raw!r}") from exc
+        if not math.isfinite(val) or val <= 0:
+            raise ValueError("detach_after_seconds must be a positive finite number")
+        return val
+
+    @staticmethod
+    def _build_detached_result(
+        session: ExecutionSession,
+        *,
+        stream_mode: str,
+        detach_after_seconds: float,
+    ) -> Dict[str, Any]:
+        return {
+            "session_id": session.session_id,
+            "session_kind": (
+                "agy"
+                if session.is_agy
+                else ("codex" if session.is_codex else ("claude" if session.is_claude else "exec"))
+            ),
+            "status": session.status,
+            "process_alive": session.status in ("queued", "starting", "running"),
+            "detached": True,
+            "detach_after_seconds": detach_after_seconds,
+            "stream_mode": stream_mode,
+            "cwd": session.cwd,
+            "last_seq": session._seq,
+            "agent_conversation_id": session.agent_conversation_id,
+            "progress": session.get_progress(after_seq=0),
+            "stdout_tail": session.get_stdout_tail(2000),
+            "stderr_tail": session.get_stderr_tail(1000),
+            "message": (
+                f"Session '{session.session_id}' is still {session.status} after {detach_after_seconds}s "
+                "and continues running in the background. Call `session_poll` with "
+                f"`session_id='{session.session_id}'`, `after_seq={session._seq}`, `view='progress'` to track it."
+            ),
+        }
+
     async def _watch_session_with_progress(
         self,
         session: ExecutionSession,
         progress_token: Any,
         emit_event: Optional[EmitCallback],
-    ) -> Dict[str, Any]:
-        """Wait for `session` to finish while emitting MCP progress notifications & NAT keepalives."""
-        if emit_event is None:
-            return await session.wait()
+        *,
+        req_id: Any = None,
+        mcp_session_id: Optional[str] = None,
+        stream_mode: str = "summary",
+        detach_after_seconds: Optional[float] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], bool]:
+        """Wait for `session` to finish (or auto-detach) while emitting MCP progress notifications.
 
-        step = 0
-        async for ev in session.subscribe_with_heartbeat(
-            after_seq=0, heartbeat_seconds=self.config.sse_keepalive_seconds
-        ):
-            if ev is None:
-                await emit_event(None)
-                continue
-            if progress_token is not None and ev.type in ("queued", "stdout", "stderr", "agy_event", "started"):
+        Returns `(summary_or_None, detached_bool)`.
+        `notifications/progress` is emitted ONLY when `progress_token is not None` and `stream_mode != 'off'`.
+        """
+        req_key: Optional[Tuple[Optional[str], Any]] = (
+            (mcp_session_id, req_id)
+            if (isinstance(req_id, (str, int)) and not isinstance(req_id, bool))
+            else None
+        )
+        if req_key is not None:
+            self._active_request_sessions[req_key] = session.session_id
+        try:
+            can_emit_progress = (
+                emit_event is not None
+                and progress_token is not None
+                and stream_mode != "off"
+            )
+            if emit_event is None or stream_mode == "off":
+                if detach_after_seconds is not None:
+                    try:
+                        await asyncio.wait_for(session._done_event.wait(), timeout=detach_after_seconds)
+                    except asyncio.TimeoutError:
+                        if session.status in ("queued", "starting", "running"):
+                            return None, True
+                return (await session.wait()), False
+
+            step = 0
+            interval = max(0.05, float(getattr(self.config, "stream_progress_interval_seconds", 1.0)))
+            keepalive_sec = max(0.2, float(self.config.sse_keepalive_seconds))
+            deadline = (
+                time.monotonic() + detach_after_seconds
+                if detach_after_seconds is not None
+                else None
+            )
+            hb_sec = (
+                min(keepalive_sec, max(0.05, min(0.25, detach_after_seconds / 2.0)))
+                if detach_after_seconds is not None
+                else keepalive_sec
+            )
+            last_keepalive_mono = time.monotonic()
+            last_emit_mono = 0.0
+            last_sent_msg = ""
+            pending_msg: Optional[str] = None
+
+            async def _send_progress(msg: str) -> None:
+                nonlocal step, last_emit_mono, last_sent_msg
+                clean = msg.strip()
+                if not clean or clean == last_sent_msg:
+                    return
                 step += 1
-                snippet = (
-                    ev.data if isinstance(ev.data, str) else json.dumps(ev.data, ensure_ascii=False)
-                )
-                if len(snippet) > 400:
-                    snippet = snippet[:400] + "..."
+                last_emit_mono = time.monotonic()
+                last_sent_msg = clean
                 await emit_event(
                     {
                         "jsonrpc": "2.0",
@@ -1255,11 +1504,74 @@ class MCPHandler:
                         "params": {
                             "progressToken": progress_token,
                             "progress": step,
-                            "message": f"[{ev.type}] {snippet.strip()}",
+                            "message": clean,
                         },
                     }
                 )
-        return await session.wait()
+
+            async for ev in session.subscribe_with_heartbeat(
+                after_seq=0, heartbeat_seconds=hb_sec
+            ):
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    if session.status in ("queued", "starting", "running"):
+                        if can_emit_progress and pending_msg:
+                            await _send_progress(pending_msg)
+                            pending_msg = None
+                        return None, True
+
+                if ev is None:
+                    if can_emit_progress and pending_msg and (now - last_emit_mono) >= interval:
+                        await _send_progress(pending_msg)
+                        pending_msg = None
+                    if (now - last_keepalive_mono) >= keepalive_sec:
+                        last_keepalive_mono = now
+                        await emit_event(None)
+                    continue
+
+                if not can_emit_progress:
+                    continue
+
+                if stream_mode == "raw":
+                    if ev.type not in ("queued", "stdout", "stderr", "agy_event", "started", "error"):
+                        continue
+                    if ev.type == "stdout" and session.stream_json:
+                        stripped = str(ev.data or "").strip()
+                        if stripped.startswith("{") and stripped.endswith("}"):
+                            try:
+                                json.loads(stripped)
+                                continue
+                            except json.JSONDecodeError:
+                                pass
+                    snippet = (
+                        ev.data if isinstance(ev.data, str) else json.dumps(ev.data, ensure_ascii=False)
+                    )
+                    if len(snippet) > 400:
+                        snippet = snippet[:400] + "..."
+                    await _send_progress(f"[{ev.type}] {snippet.strip()}")
+                    continue
+
+                # stream_mode == "summary": semantic, deduplicated, throttled progress
+                formatted = session.format_progress_event(ev)
+                if formatted is None:
+                    continue
+                summary_text, is_milestone = formatted
+                if is_milestone:
+                    pending_msg = None
+                    await _send_progress(summary_text)
+                else:
+                    if (now - last_emit_mono) >= interval:
+                        pending_msg = None
+                        await _send_progress(summary_text)
+                    else:
+                        pending_msg = summary_text
+
+            if can_emit_progress and pending_msg:
+                await _send_progress(pending_msg)
+            return (await session.wait()), False
+        finally:
+            if req_key is not None and self._active_request_sessions.get(req_key) == session.session_id:
+                self._active_request_sessions.pop(req_key, None)
 
     async def _handle_tool_call(
         self,
@@ -1267,6 +1579,7 @@ class MCPHandler:
         params: Dict[str, Any],
         progress_token: Any = None,
         emit_event: Optional[EmitCallback] = None,
+        mcp_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         tool_name = params.get("name")
         if not isinstance(tool_name, str) or tool_name not in TOOL_MAP:
@@ -1326,6 +1639,7 @@ class MCPHandler:
                     "agy_auth": self.sessions.get_agy_auth_info(),
                     "agy_plugins": self.policy.get_agy_plugins_info(),
                     "docker": self.sessions.get_docker_info(),
+                    "streaming": self.sessions.get_stream_info(),
                     "codex_binary": self.config.codex_binary,
                     "codex_default_skip_permissions": self.config.codex_default_skip_permissions,
                     "codex_default_sandbox": self.config.codex_default_sandbox,
@@ -1347,6 +1661,11 @@ class MCPHandler:
                 command = args.get("command")
                 if not command:
                     return _jsonrpc_result(req_id, _tool_error("Missing required argument 'command'"))
+                eff_stream_mode, _ = resolve_effective_stream_mode(
+                    self.config, stream=args.get("stream"), stream_mode=args.get("stream_mode")
+                )
+                background = bool(args.get("background", False))
+                detach_after = None if background else self._resolve_detach_after(args)
                 session = await self.sessions.create_session(
                     command=command,
                     cwd=args.get("cwd"),
@@ -1355,18 +1674,48 @@ class MCPHandler:
                     timeout=args.get("timeout"),
                     initial_stdin=args.get("stdin"),
                     close_stdin=True,
+                    stream_mode=eff_stream_mode,
                 )
-                summary = await self._watch_session_with_progress(session, progress_token, emit_event)
+                if background:
+                    bg_data = {
+                        **session.to_summary(include_output=False),
+                        "background": True,
+                        "progress": session.get_progress(after_seq=0),
+                    }
+                    return _jsonrpc_result(req_id, _tool_success(bg_data))
+                summary, detached = await self._watch_session_with_progress(
+                    session,
+                    progress_token,
+                    emit_event,
+                    req_id=req_id,
+                    mcp_session_id=mcp_session_id,
+                    stream_mode=eff_stream_mode,
+                    detach_after_seconds=detach_after,
+                )
+                if detached or summary is None:
+                    assert detach_after is not None
+                    return _jsonrpc_result(
+                        req_id,
+                        _tool_success(
+                            self._build_detached_result(
+                                session,
+                                stream_mode=eff_stream_mode,
+                                detach_after_seconds=detach_after,
+                            )
+                        ),
+                    )
                 result_data = {
                     "session_id": summary["session_id"],
                     "status": summary["status"],
                     "returncode": summary["returncode"],
                     "cwd": summary["cwd"],
                     "duration_seconds": summary["duration_seconds"],
+                    "stream_mode": eff_stream_mode,
                     "stdout": summary["stdout"],
                     "stderr": summary["stderr"],
                     "stdout_truncated": summary["stdout_truncated"],
                     "stderr_truncated": summary["stderr_truncated"],
+                    "progress": summary.get("progress"),
                 }
                 if summary["returncode"] != 0:
                     return _jsonrpc_result(
@@ -1394,6 +1743,32 @@ class MCPHandler:
                 extra_args = args.get("args") or []
                 if not prompt and not extra_args:
                     return _jsonrpc_result(req_id, _tool_error("Provide 'prompt' or 'args' for run_agy"))
+                eff_stream_mode, _ = resolve_effective_stream_mode(
+                    self.config, stream=args.get("stream"), stream_mode=args.get("stream_mode")
+                )
+                background = bool(args.get("background", False))
+                detach_after = None if background else self._resolve_detach_after(args)
+                caller_fmt = args.get("output_format")
+                has_raw_fmt = any(
+                    str(a) == "--output-format" or str(a).startswith("--output-format=")
+                    for a in extra_args
+                )
+                explicit_stream_req = args.get("stream") is True or args.get("stream_mode") in (
+                    "summary",
+                    "raw",
+                )
+                auto_structured = (
+                    eff_stream_mode != "off"
+                    and caller_fmt is None
+                    and not has_raw_fmt
+                    and (
+                        progress_token is not None
+                        or background
+                        or detach_after is not None
+                        or explicit_stream_req
+                    )
+                )
+                eff_output_format = "stream-json" if auto_structured else caller_fmt
                 session = await self.sessions.create_agy_session(
                     prompt=prompt,
                     cwd=args.get("cwd"),
@@ -1401,6 +1776,7 @@ class MCPHandler:
                     args=extra_args,
                     skip_permissions=args.get("skip_permissions"),
                     print_mode=True,
+                    output_format=eff_output_format,
                     model=args.get("model"),
                     effort=args.get("effort"),
                     mode=args.get("mode"),
@@ -1409,16 +1785,54 @@ class MCPHandler:
                     add_dirs=args.get("add_dirs"),
                     timeout=args.get("timeout"),
                     close_stdin=True,
+                    stream_mode=eff_stream_mode,
                 )
-                summary = await self._watch_session_with_progress(session, progress_token, emit_event)
+                if background:
+                    bg_data = {
+                        **session.to_summary(include_output=False),
+                        "background": True,
+                        "progress": session.get_progress(after_seq=0),
+                    }
+                    return _jsonrpc_result(req_id, _tool_success(bg_data))
+                summary, detached = await self._watch_session_with_progress(
+                    session,
+                    progress_token,
+                    emit_event,
+                    req_id=req_id,
+                    mcp_session_id=mcp_session_id,
+                    stream_mode=eff_stream_mode,
+                    detach_after_seconds=detach_after,
+                )
+                if detached or summary is None:
+                    assert detach_after is not None
+                    return _jsonrpc_result(
+                        req_id,
+                        _tool_success(
+                            self._build_detached_result(
+                                session,
+                                stream_mode=eff_stream_mode,
+                                detach_after_seconds=detach_after,
+                            )
+                        ),
+                    )
+                clean_final = summary.get("final_output", summary["stdout"])
+                out_stdout = (
+                    clean_final
+                    if (auto_structured and eff_stream_mode != "raw")
+                    else summary["stdout"]
+                )
                 result_data = {
                     "session_id": summary["session_id"],
+                    "agent_conversation_id": summary.get("agent_conversation_id"),
                     "status": summary["status"],
                     "returncode": summary["returncode"],
                     "cwd": summary["cwd"],
                     "duration_seconds": summary["duration_seconds"],
-                    "stdout": summary["stdout"],
+                    "stream_mode": eff_stream_mode,
+                    "stdout": out_stdout,
                     "stderr": summary["stderr"],
+                    "final_output": clean_final,
+                    "progress": summary.get("progress"),
                 }
                 if summary["returncode"] != 0:
                     return _jsonrpc_result(
@@ -1439,6 +1853,31 @@ class MCPHandler:
                         req_id,
                         _tool_error("Provide 'prompt', 'review=true', or 'args' for run_codex"),
                     )
+                eff_stream_mode, _ = resolve_effective_stream_mode(
+                    self.config, stream=args.get("stream"), stream_mode=args.get("stream_mode")
+                )
+                background = bool(args.get("background", False))
+                detach_after = None if background else self._resolve_detach_after(args)
+                caller_json_events = args.get("json_events")
+                has_raw_json = "--json" in [str(a) for a in extra_args]
+                explicit_stream_req = args.get("stream") is True or args.get("stream_mode") in (
+                    "summary",
+                    "raw",
+                )
+                auto_structured = (
+                    eff_stream_mode != "off"
+                    and caller_json_events is None
+                    and not has_raw_json
+                    and (
+                        progress_token is not None
+                        or background
+                        or detach_after is not None
+                        or explicit_stream_req
+                    )
+                )
+                eff_json_events = (
+                    True if auto_structured else bool(caller_json_events or False)
+                )
                 session = await self.sessions.create_codex_session(
                     prompt=prompt,
                     cwd=args.get("cwd"),
@@ -1446,7 +1885,7 @@ class MCPHandler:
                     args=extra_args,
                     skip_permissions=args.get("skip_permissions"),
                     sandbox_mode=args.get("sandbox_mode"),
-                    json_events=bool(args.get("json_events", False)),
+                    json_events=eff_json_events,
                     model=args.get("model"),
                     effort=args.get("effort"),
                     search=bool(args.get("search", False)),
@@ -1456,16 +1895,54 @@ class MCPHandler:
                     add_dirs=args.get("add_dirs"),
                     timeout=args.get("timeout"),
                     close_stdin=True,
+                    stream_mode=eff_stream_mode,
                 )
-                summary = await self._watch_session_with_progress(session, progress_token, emit_event)
+                if background:
+                    bg_data = {
+                        **session.to_summary(include_output=False),
+                        "background": True,
+                        "progress": session.get_progress(after_seq=0),
+                    }
+                    return _jsonrpc_result(req_id, _tool_success(bg_data))
+                summary, detached = await self._watch_session_with_progress(
+                    session,
+                    progress_token,
+                    emit_event,
+                    req_id=req_id,
+                    mcp_session_id=mcp_session_id,
+                    stream_mode=eff_stream_mode,
+                    detach_after_seconds=detach_after,
+                )
+                if detached or summary is None:
+                    assert detach_after is not None
+                    return _jsonrpc_result(
+                        req_id,
+                        _tool_success(
+                            self._build_detached_result(
+                                session,
+                                stream_mode=eff_stream_mode,
+                                detach_after_seconds=detach_after,
+                            )
+                        ),
+                    )
+                clean_final = summary.get("final_output", summary["stdout"])
+                out_stdout = (
+                    clean_final
+                    if (auto_structured and eff_stream_mode != "raw")
+                    else summary["stdout"]
+                )
                 result_data = {
                     "session_id": summary["session_id"],
+                    "agent_conversation_id": summary.get("agent_conversation_id"),
                     "status": summary["status"],
                     "returncode": summary["returncode"],
                     "cwd": summary["cwd"],
                     "duration_seconds": summary["duration_seconds"],
-                    "stdout": summary["stdout"],
+                    "stream_mode": eff_stream_mode,
+                    "stdout": out_stdout,
                     "stderr": summary["stderr"],
+                    "final_output": clean_final,
+                    "progress": summary.get("progress"),
                 }
                 if summary["returncode"] != 0:
                     return _jsonrpc_result(
@@ -1484,6 +1961,32 @@ class MCPHandler:
                     return _jsonrpc_result(
                         req_id, _tool_error("Provide 'prompt' or 'args' for run_claude")
                     )
+                eff_stream_mode, _ = resolve_effective_stream_mode(
+                    self.config, stream=args.get("stream"), stream_mode=args.get("stream_mode")
+                )
+                background = bool(args.get("background", False))
+                detach_after = None if background else self._resolve_detach_after(args)
+                caller_fmt = args.get("output_format")
+                has_raw_fmt = any(
+                    str(a) == "--output-format" or str(a).startswith("--output-format=")
+                    for a in extra_args
+                )
+                explicit_stream_req = args.get("stream") is True or args.get("stream_mode") in (
+                    "summary",
+                    "raw",
+                )
+                auto_structured = (
+                    eff_stream_mode != "off"
+                    and caller_fmt is None
+                    and not has_raw_fmt
+                    and (
+                        progress_token is not None
+                        or background
+                        or detach_after is not None
+                        or explicit_stream_req
+                    )
+                )
+                eff_output_format = "stream-json" if auto_structured else caller_fmt
                 session = await self.sessions.create_claude_session(
                     prompt=prompt,
                     cwd=args.get("cwd"),
@@ -1492,7 +1995,7 @@ class MCPHandler:
                     skip_permissions=args.get("skip_permissions"),
                     permission_mode=args.get("permission_mode"),
                     print_mode=True,
-                    output_format=args.get("output_format"),
+                    output_format=eff_output_format,
                     model=args.get("model"),
                     effort=args.get("effort"),
                     session_id=args.get("session_id"),
@@ -1500,8 +2003,42 @@ class MCPHandler:
                     add_dirs=args.get("add_dirs"),
                     timeout=args.get("timeout"),
                     close_stdin=True,
+                    stream_mode=eff_stream_mode,
                 )
-                summary = await self._watch_session_with_progress(session, progress_token, emit_event)
+                if background:
+                    bg_data = {
+                        **session.to_summary(include_output=False),
+                        "background": True,
+                        "progress": session.get_progress(after_seq=0),
+                    }
+                    return _jsonrpc_result(req_id, _tool_success(bg_data))
+                summary, detached = await self._watch_session_with_progress(
+                    session,
+                    progress_token,
+                    emit_event,
+                    req_id=req_id,
+                    mcp_session_id=mcp_session_id,
+                    stream_mode=eff_stream_mode,
+                    detach_after_seconds=detach_after,
+                )
+                if detached or summary is None:
+                    assert detach_after is not None
+                    return _jsonrpc_result(
+                        req_id,
+                        _tool_success(
+                            self._build_detached_result(
+                                session,
+                                stream_mode=eff_stream_mode,
+                                detach_after_seconds=detach_after,
+                            )
+                        ),
+                    )
+                clean_final = summary.get("final_output", summary["stdout"])
+                out_stdout = (
+                    clean_final
+                    if (auto_structured and eff_stream_mode != "raw")
+                    else summary["stdout"]
+                )
                 result_data = {
                     "session_id": summary["session_id"],
                     "agent_conversation_id": summary.get("agent_conversation_id"),
@@ -1509,8 +2046,11 @@ class MCPHandler:
                     "returncode": summary["returncode"],
                     "cwd": summary["cwd"],
                     "duration_seconds": summary["duration_seconds"],
-                    "stdout": summary["stdout"],
+                    "stream_mode": eff_stream_mode,
+                    "stdout": out_stdout,
                     "stderr": summary["stderr"],
+                    "final_output": clean_final,
+                    "progress": summary.get("progress"),
                 }
                 if summary["returncode"] != 0:
                     return _jsonrpc_result(
@@ -1524,28 +2064,57 @@ class MCPHandler:
 
             if tool_name == "session_start":
                 stype = str(args.get("type", "exec"))
+                eff_stream_mode, _ = resolve_effective_stream_mode(
+                    self.config, stream=args.get("stream"), stream_mode=args.get("stream_mode")
+                )
                 if stype == "agy":
-                    session = await self.sessions.create_agy_session(
-                        prompt=None,
-                        cwd=args.get("cwd"),
-                        env=args.get("env"),
-                        args=args.get("args"),
-                        skip_permissions=args.get("skip_permissions"),
-                        print_mode=True,
-                        output_format="stream-json",
-                        input_format="stream-json",
-                        model=args.get("model"),
-                        effort=args.get("effort"),
-                        mode=args.get("mode"),
-                        conversation_id=args.get("conversation_id"),
-                        continue_last=bool(args.get("continue_last", False)),
-                        add_dirs=args.get("add_dirs"),
-                        use_pty=bool(args.get("use_pty", False)),
-                        timeout=args.get("timeout"),
-                        close_stdin=False,
-                    )
-                    if args.get("prompt"):
-                        await session.send_agy_turn(str(args["prompt"]), close_after=False)
+                    caller_fmt = args.get("output_format")
+                    close_stdin_arg = bool(args.get("close_stdin", False))
+                    if eff_stream_mode == "off" and caller_fmt is None and args.get("prompt") and close_stdin_arg:
+                        session = await self.sessions.create_agy_session(
+                            prompt=str(args["prompt"]),
+                            cwd=args.get("cwd"),
+                            env=args.get("env"),
+                            args=args.get("args"),
+                            skip_permissions=args.get("skip_permissions"),
+                            print_mode=True,
+                            output_format="text",
+                            input_format=None,
+                            model=args.get("model"),
+                            effort=args.get("effort"),
+                            mode=args.get("mode"),
+                            conversation_id=args.get("conversation_id"),
+                            continue_last=bool(args.get("continue_last", False)),
+                            add_dirs=args.get("add_dirs"),
+                            use_pty=bool(args.get("use_pty", False)),
+                            timeout=args.get("timeout"),
+                            close_stdin=True,
+                            stream_mode=eff_stream_mode,
+                        )
+                    else:
+                        out_fmt = caller_fmt or "stream-json"
+                        session = await self.sessions.create_agy_session(
+                            prompt=None,
+                            cwd=args.get("cwd"),
+                            env=args.get("env"),
+                            args=args.get("args"),
+                            skip_permissions=args.get("skip_permissions"),
+                            print_mode=True,
+                            output_format=out_fmt,
+                            input_format="stream-json",
+                            model=args.get("model"),
+                            effort=args.get("effort"),
+                            mode=args.get("mode"),
+                            conversation_id=args.get("conversation_id"),
+                            continue_last=bool(args.get("continue_last", False)),
+                            add_dirs=args.get("add_dirs"),
+                            use_pty=bool(args.get("use_pty", False)),
+                            timeout=args.get("timeout"),
+                            close_stdin=False,
+                            stream_mode=eff_stream_mode,
+                        )
+                        if args.get("prompt"):
+                            await session.send_agy_turn(str(args["prompt"]), close_after=close_stdin_arg)
                 elif stype == "codex":
                     prompt = args.get("prompt")
                     extra_args = args.get("args") or []
@@ -1557,6 +2126,8 @@ class MCPHandler:
                                 "Provide 'prompt', 'review=true', or 'args' for session_start(type='codex')"
                             ),
                         )
+                    caller_json = args.get("json_events")
+                    eff_json = (eff_stream_mode != "off") if caller_json is None else bool(caller_json)
                     session = await self.sessions.create_codex_session(
                         prompt=str(prompt) if prompt is not None else None,
                         cwd=args.get("cwd"),
@@ -1564,7 +2135,7 @@ class MCPHandler:
                         args=extra_args,
                         skip_permissions=args.get("skip_permissions"),
                         sandbox_mode=args.get("sandbox_mode"),
-                        json_events=True,
+                        json_events=eff_json,
                         model=args.get("model"),
                         effort=args.get("effort"),
                         search=bool(args.get("search", False)),
@@ -1575,29 +2146,56 @@ class MCPHandler:
                         use_pty=bool(args.get("use_pty", False)),
                         timeout=args.get("timeout"),
                         close_stdin=True,
+                        stream_mode=eff_stream_mode,
                     )
                 elif stype == "claude":
-                    session = await self.sessions.create_claude_session(
-                        prompt=None,
-                        cwd=args.get("cwd"),
-                        env=args.get("env"),
-                        args=args.get("args"),
-                        skip_permissions=args.get("skip_permissions"),
-                        permission_mode=args.get("permission_mode"),
-                        print_mode=True,
-                        output_format="stream-json",
-                        input_format="stream-json",
-                        model=args.get("model"),
-                        effort=args.get("effort"),
-                        session_id=args.get("session_id"),
-                        continue_last=bool(args.get("continue_last", False)),
-                        add_dirs=args.get("add_dirs"),
-                        use_pty=bool(args.get("use_pty", False)),
-                        timeout=args.get("timeout"),
-                        close_stdin=False,
-                    )
-                    if args.get("prompt"):
-                        await session.send_agy_turn(str(args["prompt"]), close_after=False)
+                    caller_fmt = args.get("output_format")
+                    close_stdin_arg = bool(args.get("close_stdin", False))
+                    if eff_stream_mode == "off" and caller_fmt is None and args.get("prompt") and close_stdin_arg:
+                        session = await self.sessions.create_claude_session(
+                            prompt=str(args["prompt"]),
+                            cwd=args.get("cwd"),
+                            env=args.get("env"),
+                            args=args.get("args"),
+                            skip_permissions=args.get("skip_permissions"),
+                            permission_mode=args.get("permission_mode"),
+                            print_mode=True,
+                            output_format="text",
+                            input_format=None,
+                            model=args.get("model"),
+                            effort=args.get("effort"),
+                            session_id=args.get("session_id"),
+                            continue_last=bool(args.get("continue_last", False)),
+                            add_dirs=args.get("add_dirs"),
+                            use_pty=bool(args.get("use_pty", False)),
+                            timeout=args.get("timeout"),
+                            close_stdin=True,
+                            stream_mode=eff_stream_mode,
+                        )
+                    else:
+                        out_fmt = caller_fmt or "stream-json"
+                        session = await self.sessions.create_claude_session(
+                            prompt=None,
+                            cwd=args.get("cwd"),
+                            env=args.get("env"),
+                            args=args.get("args"),
+                            skip_permissions=args.get("skip_permissions"),
+                            permission_mode=args.get("permission_mode"),
+                            print_mode=True,
+                            output_format=out_fmt,
+                            input_format="stream-json",
+                            model=args.get("model"),
+                            effort=args.get("effort"),
+                            session_id=args.get("session_id"),
+                            continue_last=bool(args.get("continue_last", False)),
+                            add_dirs=args.get("add_dirs"),
+                            use_pty=bool(args.get("use_pty", False)),
+                            timeout=args.get("timeout"),
+                            close_stdin=False,
+                            stream_mode=eff_stream_mode,
+                        )
+                        if args.get("prompt"):
+                            await session.send_agy_turn(str(args["prompt"]), close_after=close_stdin_arg)
                 else:
                     command = args.get("command")
                     if not command:
@@ -1612,22 +2210,42 @@ class MCPHandler:
                         timeout=args.get("timeout"),
                         initial_stdin=args.get("stdin"),
                         close_stdin=bool(args.get("close_stdin", False)),
+                        stream_mode=eff_stream_mode,
                     )
-                return _jsonrpc_result(req_id, _tool_success(session.to_summary(include_output=False)))
+                start_data = {
+                    **session.to_summary(include_output=False),
+                    "progress": session.get_progress(after_seq=0),
+                }
+                return _jsonrpc_result(req_id, _tool_success(start_data))
 
             if tool_name == "session_poll":
                 sid = str(args.get("session_id", ""))
                 session = self.sessions.get_session(sid)
                 if session is None:
                     return _jsonrpc_result(req_id, _tool_error(f"Session '{sid}' not found"))
-                after_seq = int(args.get("after_seq") or 0)
-                wait_seconds = min(max(0.0, float(args.get("wait_seconds") or 0.0)), 60.0)
+                try:
+                    after_seq = int(args.get("after_seq") or 0)
+                    raw_wait = float(args.get("wait_seconds") or 0.0)
+                    if not math.isfinite(raw_wait):
+                        raise ValueError("wait_seconds must be finite")
+                    wait_seconds = min(max(0.0, raw_wait), 60.0)
+                    tail_chars = max(
+                        0, int(args.get("tail_chars") if args.get("tail_chars") is not None else 2000)
+                    )
+                    offset_raw = args.get("offset")
+                    limit_raw = args.get("limit")
+                    offset = max(0, int(offset_raw)) if offset_raw is not None else 0
+                    limit = max(0, int(limit_raw)) if limit_raw is not None else None
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid numeric parameter in session_poll: {exc}") from exc
                 wait_for_exit = bool(args.get("wait_for_exit", False))
+                view = str(args.get("view") or "full").strip().lower()
+                if view not in ("full", "progress", "delta"):
+                    return _jsonrpc_result(
+                        req_id,
+                        _tool_error(f"Invalid view {view!r}; expected 'full', 'progress', or 'delta'"),
+                    )
                 include_events = bool(args.get("include_events", True))
-                offset_raw = args.get("offset")
-                limit_raw = args.get("limit")
-                offset = max(0, int(offset_raw)) if offset_raw is not None else 0
-                limit = max(0, int(limit_raw)) if limit_raw is not None else None
 
                 if wait_seconds > 0 and session.status in (
                     "queued",
@@ -1636,24 +2254,58 @@ class MCPHandler:
                     "orphaned_running",
                 ):
                     deadline = time.monotonic() + wait_seconds
+                    keepalive_sec = max(0.2, float(self.config.sse_keepalive_seconds))
+                    hb_sec = min(keepalive_sec, max(0.05, min(0.5, wait_seconds)))
+                    last_keepalive_mono = time.monotonic()
                     async for ev in session.subscribe_with_heartbeat(
                         after_seq=after_seq,
-                        heartbeat_seconds=min(self.config.sse_keepalive_seconds, max(1.0, wait_seconds)),
+                        heartbeat_seconds=hb_sec,
                     ):
+                        now = time.monotonic()
                         if ev is None:
-                            if emit_event is not None:
+                            if emit_event is not None and (now - last_keepalive_mono) >= keepalive_sec:
+                                last_keepalive_mono = now
                                 await emit_event(None)
                         elif not wait_for_exit:
                             # Allow a tiny coalescing window so immediate burst lines arrive together
-                            await asyncio.sleep(0.05)
+                            coalesce = min(0.05, max(0.0, deadline - now))
+                            if coalesce > 0:
+                                await asyncio.sleep(coalesce)
                             break
-                        if time.monotonic() >= deadline:
+                        if now >= deadline:
                             break
+
+                if view == "progress":
+                    meta_summary = session.to_summary(include_output=False, after_seq=after_seq)
+                    progress_data: Dict[str, Any] = {
+                        **meta_summary,
+                        "view": "progress",
+                        "progress": session.get_progress(after_seq=after_seq),
+                        "stdout_tail": session.get_stdout_tail(tail_chars),
+                        "stderr_tail": session.get_stderr_tail(min(1000, tail_chars)),
+                    }
+                    if session.status not in ("queued", "starting", "running", "orphaned_running"):
+                        progress_data["final_output"] = session.get_final_output()
+                    return _jsonrpc_result(req_id, _tool_success(progress_data))
+
+                if view == "delta":
+                    summary = session.to_summary(include_output=False, after_seq=after_seq)
+                    out_delta, err_delta = session.get_delta_output(after_seq=after_seq)
+                    summary["view"] = "delta"
+                    summary["stdout"] = out_delta
+                    summary["stderr"] = err_delta
+                    summary["progress"] = session.get_progress(after_seq=after_seq)
+                    if include_events:
+                        summary["events"] = session.get_events(after_seq=after_seq)
+                    if session.status not in ("queued", "starting", "running", "orphaned_running"):
+                        summary["final_output"] = session.get_final_output()
+                    return _jsonrpc_result(req_id, _tool_success(summary))
 
                 summary = session.to_summary(include_output=True, after_seq=after_seq)
                 if not include_events:
                     summary.pop("events", None)
                 if offset > 0 or limit is not None:
+                    summary.pop("final_output", None)
                     full_stdout = str(summary.get("stdout") or "")
                     full_stderr = str(summary.get("stderr") or "")
                     total_out = len(full_stdout)
@@ -1821,6 +2473,7 @@ class MCPHandler:
                     "agy_auth": self.sessions.get_agy_auth_info(),
                     "agy_plugins": self.policy.get_agy_plugins_info(),
                     "docker": self.sessions.get_docker_info(),
+                    "streaming": self.sessions.get_stream_info(),
                     "codex_auth_configured": self.sessions.has_codex_auth(),
                     "codex_plugins": self.policy.get_codex_plugins_info(),
                     "claude_auth": self.sessions.get_claude_auth_info(),
@@ -1857,6 +2510,7 @@ class MCPHandler:
                     "agent_default_timeout_seconds": self.config.agent_default_timeout_seconds,
                     "max_timeout_seconds": self.config.max_timeout_seconds,
                     "agy_queue_timeout_seconds": self.config.agy_queue_timeout_seconds,
+                    "streaming": self.sessions.get_stream_info(),
                     "sandbox_state_dir": self.config.sandbox_state_dir,
                     "agent_runtime_home_root": self.config.agent_runtime_home_root,
                     "plugin_state_dir": redact_diagnostic_text(

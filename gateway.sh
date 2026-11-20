@@ -33,6 +33,7 @@ CODEX_PLUGINS_FILE="${GATEWAY_CODEX_PLUGINS_FILE:-${CLIENT_CONFIG_DIR}/codex-plu
 CLAUDE_PLUGINS_FILE="${GATEWAY_CLAUDE_PLUGINS_FILE:-${CLIENT_CONFIG_DIR}/claude-plugins.json}"
 DOCKER_MODE_FILE="${CLIENT_CONFIG_DIR}/docker.mode"
 DOCKER_PROXY_SOCKET="${CLIENT_CONFIG_DIR}/docker-proxy.sock"
+STREAM_MODE_FILE="${GATEWAY_STREAM_MODE_FILE:-${CLIENT_CONFIG_DIR}/stream.mode}"
 TUNNEL_HEALTH_URL="http://127.0.0.1:18766"
 
 is_tunnel_configured() {
@@ -184,6 +185,12 @@ if "claude_plugin_dirs" not in d:
     changed = True
 if not d.get("claude_plugins_file"):
     d["claude_plugins_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "claude-plugins.json")
+    changed = True
+if not d.get("stream_default_mode"):
+    d["stream_default_mode"] = "summary"
+    changed = True
+if not d.get("stream_mode_file"):
+    d["stream_mode_file"] = str(pathlib.Path.home() / ".config" / "dots-gateway" / "stream.mode")
     changed = True
 if d.get("sandbox_lock_timeout_seconds") is None:
     d["sandbox_lock_timeout_seconds"] = 5.0
@@ -619,6 +626,7 @@ PY
   echo "  Codex Plugins    : $(codex_plugins_summary)"
   echo "  Claude Plugins   : $(claude_plugins_summary)"
   echo "  Docker Access    : $(docker_access_summary)"
+  echo "  Stream Output    : $(stream_mode_summary)"
 
   if is_tunnel_configured; then
     local t_state t_pid t_ready t_id
@@ -1625,6 +1633,123 @@ cmd_docker() {
       ;;
     *)
       echo "ERROR: 未知的 docker 子命令 '${subcmd}' (可选: on | off | toggle | status | test)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+resolve_stream_mode_path() {
+  if [[ -n "${GATEWAY_STREAM_MODE_FILE:-}" ]]; then
+    STREAM_MODE_FILE="${GATEWAY_STREAM_MODE_FILE}"
+    return
+  fi
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    local cfg_sf
+    cfg_sf="$(python3 - "${CONFIG_FILE}" <<'PY' 2>/dev/null || true
+import json, pathlib, sys
+d = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+v = str(d.get("stream_mode_file") or "").strip()
+if v:
+    print(str(pathlib.Path(v).expanduser()))
+PY
+)"
+    if [[ -n "${cfg_sf}" ]]; then
+      STREAM_MODE_FILE="${cfg_sf}"
+    fi
+  fi
+}
+
+current_stream_mode() {
+  resolve_stream_mode_path
+  local raw=""
+  if [[ -f "${STREAM_MODE_FILE}" ]]; then
+    raw="$(grep -Ev '^[[:space:]]*(#|$)' "${STREAM_MODE_FILE}" 2>/dev/null | head -n1 | sed -E 's/#.*$//' | tr '[:upper:]' '[:lower:]' | xargs || true)"
+  fi
+  case "${raw}" in
+    0|false|no|off|none|disable|disabled) echo "off" ;;
+    1|true|yes|on|enable|enabled|summary|progress) echo "summary" ;;
+    raw|full|verbose|all) echo "raw" ;;
+    *)
+      python3 - "${CONFIG_FILE}" "${GATEWAY_DIR}" <<'PY' 2>/dev/null || echo "summary"
+import json, pathlib, sys
+cfg_p = pathlib.Path(sys.argv[1])
+gw_dir = sys.argv[2]
+if gw_dir not in sys.path:
+    sys.path.insert(0, gw_dir)
+from gateway.config import normalize_stream_mode
+val = "summary"
+if cfg_p.is_file():
+    d = json.loads(cfg_p.read_text(encoding="utf-8"))
+    val = normalize_stream_mode(d.get("stream_default_mode"), default="summary") or "summary"
+print(val)
+PY
+      ;;
+  esac
+}
+
+stream_mode_summary() {
+  resolve_stream_mode_path
+  local mode src
+  mode="$(current_stream_mode)"
+  if [[ -f "${STREAM_MODE_FILE}" ]]; then
+    src="${STREAM_MODE_FILE}"
+  else
+    src="default/config"
+  fi
+  echo "${mode} (source=${src}; per-call override supported)"
+}
+
+write_stream_mode() {
+  local mode="$1"
+  resolve_stream_mode_path
+  mkdir -p "$(dirname "${STREAM_MODE_FILE}")"
+  chmod 700 "$(dirname "${STREAM_MODE_FILE}")" 2>/dev/null || true
+  local tmp_f="${STREAM_MODE_FILE}.tmp.$$"
+  {
+    printf "# Gateway default streaming output mode (managed by 'dots-gateway stream', hot-reloaded per call)\n"
+    printf "# Valid values: summary | raw | off\n"
+    printf "%s\n" "${mode}"
+  } > "${tmp_f}"
+  chmod 600 "${tmp_f}"
+  mv -f "${tmp_f}" "${STREAM_MODE_FILE}"
+}
+
+cmd_stream() {
+  resolve_stream_mode_path
+  local subcmd="${1:-status}"
+  case "${subcmd}" in
+    on|enable|summary)
+      write_stream_mode summary
+      echo "✅ 网关流式输出已设为 summary (默认摘要模式) — 新任务即时生效，无需重启。"
+      echo "   单次调用仍可通过 stream=false / stream_mode='off'|'raw' 覆盖。"
+      ;;
+    raw|full|verbose)
+      write_stream_mode raw
+      echo "✅ 网关流式输出已设为 raw (全量原始流) — 新任务即时生效，无需重启。"
+      echo "   单次调用仍可通过 stream=false / stream_mode='off'|'summary' 覆盖。"
+      ;;
+    off|disable)
+      write_stream_mode off
+      echo "✅ 网关默认流式输出已关闭 (off) — 新任务即时生效，无需重启。"
+      echo "   单次调用仍可通过 stream=true / stream_mode='summary'|'raw' 临时开启。"
+      ;;
+    toggle)
+      if [[ "$(current_stream_mode)" == "off" ]]; then
+        cmd_stream summary
+      else
+        cmd_stream off
+      fi
+      ;;
+    reset)
+      rm -f "${STREAM_MODE_FILE}"
+      echo "✅ 已重置热加载流式配置，回退为 config.json / 默认值 ($(current_stream_mode))。"
+      ;;
+    status)
+      echo "Stream Mode   : $(current_stream_mode)  (mode file: ${STREAM_MODE_FILE})"
+      echo "Per-Call Flag : stream=true|false or stream_mode=off|summary|raw"
+      ;;
+    *)
+      echo "ERROR: 未知的 stream 子命令 '${subcmd}' (可选: summary | on | raw | off | toggle | reset | status)" >&2
       exit 1
       ;;
   esac
@@ -3142,6 +3267,7 @@ Dots Gateway & Secure MCP Tunnel 运维管理命令行 (${PROG_NAME})
   claude-model [cmd]   免重启切换网关 Claude Code 默认模型: set <MODEL_ID> | reset | status
   claude-plugins [cmd] 免重启管理隔离只读 Claude Code 插件与 Hook 沙箱: status | add <DIR> | on | off | remove | clear | doctor
   docker [cmd]         免重启开关沙箱 Docker 访问 (策略过滤代理): on | off | toggle | status | test
+  stream [cmd]         免重启切换默认流式输出模式: summary (默认) | raw | off | toggle | reset | status
   start                启动网关服务 (及已配置的 Tunnel 服务) 并执行健康检查
   stop                 停止网关与 Tunnel 后台服务
   restart              平滑排空活跃会话后重启网关与 Tunnel 服务 (支持 --wait / --force，别名: reload)
@@ -3153,6 +3279,7 @@ Dots Gateway & Secure MCP Tunnel 运维管理命令行 (${PROG_NAME})
 
 常用示例:
   ${PROG_NAME} tunnel-setup           # 绑定 OpenAI tunnel_... 与 Runtime Key 并启动官方隧道
+  ${PROG_NAME} stream status          # 查看当前默认流式输出模式 (summary/raw/off)
   ${PROG_NAME} agy-plugins status     # 查看 AGY 只读插件隔离发现、Hook 沙箱与挂载状态
   ${PROG_NAME} codex-plugins status   # 查看 Codex 只读插件隔离发现、信任哈希与 Hook 沙箱状态
   ${PROG_NAME} claude-plugins status  # 查看 Claude Code 只读插件隔离发现与 Hook 沙箱状态
@@ -3205,6 +3332,9 @@ case "${ACTION}" in
     ;;
   docker|docker-access)
     cmd_docker "$@"
+    ;;
+  stream|streaming)
+    cmd_stream "$@"
     ;;
   start)
     cmd_start
